@@ -27,12 +27,13 @@ All DevOps-related configuration for the entire Storytime ecosystem lives here.
 Clone the repository:
 
 ```bash
-git clone <devops-repo-url>
+git clone https://github.com/Bolt-Silverfox/storytime-devops
 cd storytime-devops
+```
 
 
 
-Install basic prerequisites for DevOps (you likely already have most):
+## Install basic prerequisites for DevOps (you likely already have most)
 
 - Git
 - Docker
@@ -41,6 +42,7 @@ Install basic prerequisites for DevOps (you likely already have most):
 - Bash shell (for automation scripts)
 
 ##  Project Structure
+```bash
 infra/
   └── terraform/
       ├── modules/
@@ -70,3 +72,4 @@ scripts/
   ├── build.sh
   ├── deploy.sh
   └── setup-dev-env.sh
+````
