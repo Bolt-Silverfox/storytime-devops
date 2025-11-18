@@ -1,0 +1,4 @@
+secrets/
+*.pem
+*.key
+.vault_pass
