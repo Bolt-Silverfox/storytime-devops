@@ -1,0 +1,14 @@
+# This file stores the encrypted SSH deployment key
+# Encrypt with: ansible-vault encrypt group_vars/all/vault.yml
+# Edit with: ansible-vault edit group_vars/all/vault.yml
+
+vault_deployment_key: |
+  -----BEGIN OPENSSH PRIVATE KEY-----
+  # REPLACE THIS WITH YOUR ACTUAL DEPLOYMENT KEY CONTENT
+  # After replacing, encrypt this file using:
+  # ansible-vault encrypt group_vars/all/vault.yml
+  -----END OPENSSH PRIVATE KEY-----
+
+# AWS Credentials for CloudWatch (if using IAM user instead of instance role)
+vault_aws_access_key_id: ""
+vault_aws_secret_access_key: ""

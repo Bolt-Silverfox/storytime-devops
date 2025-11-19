@@ -1,0 +1,23 @@
+# Staging environment specific variables
+env_name: staging
+domain_suffix: staging.zhu-clan.emerj.net
+
+# Domains
+frontend_domain: "{{ domain_suffix }}"
+backend_domain: "api.{{ domain_suffix }}"
+
+# Git branches
+frontend_branch: develop
+backend_branch: develop
+
+# Debug settings
+node_env: development
+debug: true
+
+# CloudWatch log groups
+cloudwatch_log_group_frontend: "/ec2/staging/{{ project_name }}/frontend"
+cloudwatch_log_group_backend: "/ec2/staging/{{ project_name }}/backend"
+cloudwatch_log_group_nginx: "/ec2/staging/{{ project_name }}/nginx"
+
+# PM2 ecosystem file name
+pm2_ecosystem_name: "ecosystem.staging.config.js"

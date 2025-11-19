@@ -1,0 +1,26 @@
+# Common variables for all environments
+project_name: zhu-clan
+organization: storytime
+
+# Repository URLs - Private repositories accessed via SSH deploy key
+frontend_repo: "git@github.com:Bolt-Silverfox/storytime-waitlist-fe.git"
+backend_repo: "git@github.com:Bolt-Silverfox/storytime-waitlist-be.git"
+
+# Application technology stack
+frontend_framework: "vite-react-ts"  # Vite + React + TypeScript
+backend_framework: "nestjs"           # NestJS framework
+package_manager: "pnpm"               # Using pnpm instead of npm
+
+# Application paths
+app_base_path: "/var/www"
+frontend_path: "{{ app_base_path }}/{{ project_name }}-frontend-{{ env_name }}"
+backend_path: "{{ app_base_path }}/{{ project_name }}-backend-{{ env_name }}"
+
+# Backend application settings
+backend_port: 4000
+
+# AWS Region for CloudWatch
+aws_region: us-east-2  # Change to your region if different
+
+# Nginx user
+nginx_user: www-data
