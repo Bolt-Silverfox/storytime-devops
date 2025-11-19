@@ -1,0 +1,66 @@
+---
+# Nginx role - Install and configure Nginx with SSL
+
+- name: Install Nginx
+  apt:
+    name: nginx
+    state: present
+    update_cache: yes
+
+- name: Ensure Nginx is started and enabled
+  systemd:
+    name: nginx
+    state: started
+    enabled: yes
+
+- name: Remove default Nginx site
+  file:
+    path: /etc/nginx/sites-enabled/default
+    state: absent
+
+- name: Create Nginx log directory
+  file:
+    path: /var/log/nginx/{{ project_name }}-{{ env_name }}
+    state: directory
+    owner: "{{ nginx_user }}"
+    group: adm
+    mode: '0755'
+
+- name: Deploy frontend Nginx configuration (HTTP only - for initial certbot)
+  template:
+    src: frontend-http.conf.j2
+    dest: "/etc/nginx/sites-available/{{ project_name }}-frontend-{{ env_name }}"
+    owner: root
+    group: root
+    mode: '0644'
+
+- name: Deploy backend Nginx configuration (HTTP only - for initial certbot)
+  template:
+    src: backend-http.conf.j2
+    dest: "/etc/nginx/sites-available/{{ project_name }}-backend-{{ env_name }}"
+    owner: root
+    group: root
+    mode: '0644'
+
+- name: Enable frontend site
+  file:
+    src: "/etc/nginx/sites-available/{{ project_name }}-frontend-{{ env_name }}"
+    dest: "/etc/nginx/sites-enabled/{{ project_name }}-frontend-{{ env_name }}"
+    state: link
+
+- name: Enable backend site
+  file:
+    src: "/etc/nginx/sites-available/{{ project_name }}-backend-{{ env_name }}"
+    dest: "/etc/nginx/sites-enabled/{{ project_name }}-backend-{{ env_name }}"
+    state: link
+
+- name: Test Nginx configuration
+  command: nginx -t
+  register: nginx_test
+  changed_when: false
+
+- name: Reload Nginx
+  systemd:
+    name: nginx
+    state: reloaded
+  when: nginx_test.rc == 0
