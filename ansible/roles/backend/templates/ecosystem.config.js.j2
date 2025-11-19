@@ -1,0 +1,21 @@
+module.exports = {
+  apps: [{
+    name: '{{ project_name }}-backend-{{ env_name }}',
+    script: '{{ backend_path }}/dist/main.js',  // NestJS default entry point
+    cwd: '{{ backend_path }}',
+    instances: 1,
+    autorestart: true,
+    watch: false,
+    max_memory_restart: '1G',
+    env: {
+      NODE_ENV: '{{ node_env }}',
+      PORT: {{ backend_port }}
+    },
+    error_file: '{{ backend_path }}/logs/err.log',
+    out_file: '{{ backend_path }}/logs/out.log',
+    log_file: '{{ backend_path }}/logs/combined.log',
+    time: true,
+    merge_logs: true,
+    log_date_format: 'YYYY-MM-DD HH:mm:ss Z'
+  }]
+};

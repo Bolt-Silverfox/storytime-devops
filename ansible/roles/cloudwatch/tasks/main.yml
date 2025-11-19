@@ -1,0 +1,63 @@
+---
+# CloudWatch role - Install and configure AWS CloudWatch Agent
+
+- name: Download CloudWatch agent
+  get_url:
+    url: https://s3.amazonaws.com/amazoncloudwatch-agent/ubuntu/amd64/latest/amazon-cloudwatch-agent.deb
+    dest: /tmp/amazon-cloudwatch-agent.deb
+    mode: '0644'
+
+- name: Install CloudWatch agent
+  apt:
+    deb: /tmp/amazon-cloudwatch-agent.deb
+    state: present
+
+- name: Create CloudWatch agent config directory
+  file:
+    path: /opt/aws/amazon-cloudwatch-agent/etc
+    state: directory
+    mode: '0755'
+
+- name: Deploy CloudWatch agent configuration
+  template:
+    src: cloudwatch-config.json.j2
+    dest: /opt/aws/amazon-cloudwatch-agent/etc/config.json
+    mode: '0644'
+  notify: restart cloudwatch agent
+
+- name: Create PM2 log directory if not exists
+  file:
+    path: "{{ backend_path }}/logs"
+    state: directory
+    owner: "{{ ansible_user }}"
+    group: "{{ ansible_user }}"
+    mode: '0755'
+
+- name: Ensure CloudWatch agent service is running
+  systemd:
+    name: amazon-cloudwatch-agent
+    state: started
+    enabled: yes
+
+- name: Configure CloudWatch agent with config file
+  command: >
+    /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl
+    -a fetch-config
+    -m ec2
+    -s
+    -c file:/opt/aws/amazon-cloudwatch-agent/etc/config.json
+  register: cw_configure
+  changed_when: "'Configuration validation succeeded' in cw_configure.stdout"
+
+- name: Display CloudWatch agent status
+  command: >
+    /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl
+    -a query
+    -m ec2
+    -c default
+  register: cw_status
+  changed_when: false
+
+- name: Show CloudWatch agent status
+  debug:
+    msg: "{{ cw_status.stdout }}"

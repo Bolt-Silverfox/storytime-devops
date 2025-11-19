@@ -1,0 +1,84 @@
+---
+# Backend deployment role
+
+- name: Ensure backend directory exists
+  file:
+    path: "{{ backend_path }}"
+    state: directory
+    owner: "{{ ansible_user }}"
+    group: "{{ ansible_user }}"
+    mode: '0755'
+
+- name: Clone backend repository
+  git:
+    repo: "{{ backend_repo }}"
+    dest: "{{ backend_path }}"
+    version: "{{ backend_branch }}"
+    force: yes
+    key_file: "/home/{{ ansible_user }}/.ssh/deployment_key"
+    accept_hostkey: yes
+  become_user: "{{ ansible_user }}"
+
+- name: Copy backend environment file
+  copy:
+    src: "../secrets/{{ env_name }}-backend.env"
+    dest: "{{ backend_path }}/.env"
+    owner: "{{ ansible_user }}"
+    group: "{{ ansible_user }}"
+    mode: '0600'
+
+- name: Install backend dependencies with pnpm
+  shell: pnpm install
+  args:
+    chdir: "{{ backend_path }}"
+  become_user: "{{ ansible_user }}"
+  environment:
+    NODE_ENV: "{{ node_env }}"
+
+- name: Build NestJS backend
+  shell: pnpm run build
+  args:
+    chdir: "{{ backend_path }}"
+  become_user: "{{ ansible_user }}"
+  environment:
+    NODE_ENV: production
+
+- name: Run database migrations (Prisma)
+  shell: pnpm exec prisma migrate deploy
+  args:
+    chdir: "{{ backend_path }}"
+  become_user: "{{ ansible_user }}"
+  ignore_errors: yes
+  when: "lookup('file', backend_path + '/package.json', errors='ignore') is search('prisma')"
+
+- name: Create PM2 ecosystem file
+  template:
+    src: ecosystem.config.js.j2
+    dest: "{{ backend_path }}/ecosystem.config.js"
+    owner: "{{ ansible_user }}"
+    group: "{{ ansible_user }}"
+    mode: '0644'
+
+- name: Stop existing PM2 process
+  shell: pm2 delete {{ project_name }}-backend-{{ env_name }}
+  become_user: "{{ ansible_user }}"
+  ignore_errors: true
+
+- name: Start backend with PM2
+  shell: pm2 start ecosystem.config.js
+  args:
+    chdir: "{{ backend_path }}"
+  become_user: "{{ ansible_user }}"
+
+- name: Save PM2 configuration
+  shell: pm2 save
+  become_user: "{{ ansible_user }}"
+
+- name: Display backend status
+  shell: pm2 list
+  become_user: "{{ ansible_user }}"
+  register: pm2_status
+
+- name: Show PM2 status
+  debug:
+    msg: "{{ pm2_status.stdout_lines }}"
