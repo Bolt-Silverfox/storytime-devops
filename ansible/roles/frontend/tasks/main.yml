@@ -1,0 +1,67 @@
+---
+# Frontend deployment role
+
+- name: Ensure frontend directory exists
+  file:
+    path: "{{ frontend_path }}"
+    state: directory
+    owner: "{{ ansible_user }}"
+    group: "{{ ansible_user }}"
+    mode: '0755'
+
+- name: Clone frontend repository
+  git:
+    repo: "{{ frontend_repo }}"
+    dest: "{{ frontend_path }}"
+    version: "{{ frontend_branch }}"
+    force: yes
+    key_file: "/home/{{ ansible_user }}/.ssh/deployment_key"
+    accept_hostkey: yes
+  become_user: "{{ ansible_user }}"
+
+- name: Copy frontend environment file
+  copy:
+    src: "../secrets/{{ env_name }}-frontend.env"
+    dest: "{{ frontend_path }}/.env"
+    owner: "{{ ansible_user }}"
+    group: "{{ ansible_user }}"
+    mode: '0600'
+
+- name: Install frontend dependencies with pnpm
+  shell: pnpm install
+  args:
+    chdir: "{{ frontend_path }}"
+  become_user: "{{ ansible_user }}"
+  environment:
+    NODE_ENV: production
+
+- name: Build TypeScript/React frontend (Vite)
+  shell: pnpm run build
+  args:
+    chdir: "{{ frontend_path }}"
+  become_user: "{{ ansible_user }}"
+  environment:
+    NODE_ENV: production
+  register: frontend_build
+
+- name: Display build output
+  debug:
+    msg: "Frontend build completed: {{ frontend_build.stdout_lines[-5:] if frontend_build.stdout_lines else 'No output' }}"
+
+- name: Ensure dist/build directory permissions
+  file:
+    path: "{{ frontend_path }}/dist"
+    state: directory
+    owner: "{{ nginx_user }}"
+    group: "{{ nginx_user }}"
+    recurse: yes
+  when: "'dist' in lookup('pipe', 'ls ' + frontend_path, errors='ignore')"
+
+- name: Alternative - Ensure build directory permissions (for CRA)
+  file:
+    path: "{{ frontend_path }}/build"
+    state: directory
+    owner: "{{ nginx_user }}"
+    group: "{{ nginx_user }}"
+    recurse: yes
+  when: "'build' in lookup('pipe', 'ls ' + frontend_path, errors='ignore')"
