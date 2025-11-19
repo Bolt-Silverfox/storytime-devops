@@ -1,0 +1,90 @@
+{
+  "agent": {
+    "metrics_collection_interval": 60,
+    "run_as_user": "root"
+  },
+  "logs": {
+    "logs_collected": {
+      "files": {
+        "collect_list": [
+          {
+            "file_path": "{{ backend_path }}/logs/combined.log",
+            "log_group_name": "{{ cloudwatch_log_group_backend }}",
+            "log_stream_name": "{instance_id}-app",
+            "timezone": "UTC"
+          },
+          {
+            "file_path": "{{ backend_path }}/logs/err.log",
+            "log_group_name": "{{ cloudwatch_log_group_backend }}",
+            "log_stream_name": "{instance_id}-error",
+            "timezone": "UTC"
+          },
+          {
+            "file_path": "/var/log/nginx/{{ project_name }}-{{ env_name }}/frontend-access.log",
+            "log_group_name": "{{ cloudwatch_log_group_nginx }}",
+            "log_stream_name": "{instance_id}-frontend-access",
+            "timezone": "UTC"
+          },
+          {
+            "file_path": "/var/log/nginx/{{ project_name }}-{{ env_name }}/frontend-error.log",
+            "log_group_name": "{{ cloudwatch_log_group_nginx }}",
+            "log_stream_name": "{instance_id}-frontend-error",
+            "timezone": "UTC"
+          },
+          {
+            "file_path": "/var/log/nginx/{{ project_name }}-{{ env_name }}/backend-access.log",
+            "log_group_name": "{{ cloudwatch_log_group_nginx }}",
+            "log_stream_name": "{instance_id}-backend-access",
+            "timezone": "UTC"
+          },
+          {
+            "file_path": "/var/log/nginx/{{ project_name }}-{{ env_name }}/backend-error.log",
+            "log_group_name": "{{ cloudwatch_log_group_nginx }}",
+            "log_stream_name": "{instance_id}-backend-error",
+            "timezone": "UTC"
+          }
+        ]
+      }
+    },
+    "log_stream_name": "{instance_id}"
+  },
+  "metrics": {
+    "namespace": "{{ project_name }}/{{ env_name }}",
+    "metrics_collected": {
+      "cpu": {
+        "measurement": [
+          {
+            "name": "cpu_usage_idle",
+            "rename": "CPU_IDLE",
+            "unit": "Percent"
+          }
+        ],
+        "metrics_collection_interval": 60,
+        "totalcpu": false
+      },
+      "disk": {
+        "measurement": [
+          {
+            "name": "used_percent",
+            "rename": "DISK_USED",
+            "unit": "Percent"
+          }
+        ],
+        "metrics_collection_interval": 60,
+        "resources": [
+          "/"
+        ]
+      },
+      "mem": {
+        "measurement": [
+          {
+            "name": "mem_used_percent",
+            "rename": "MEM_USED",
+            "unit": "Percent"
+          }
+        ],
+        "metrics_collection_interval": 60
+      }
+    }
+  }
+}

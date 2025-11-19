@@ -1,0 +1,86 @@
+---
+# SSL role - Install Certbot and obtain SSL certificates
+
+- name: Install Certbot and Nginx plugin
+  apt:
+    name:
+      - certbot
+      - python3-certbot-nginx
+    state: present
+    update_cache: yes
+
+- name: Check if frontend SSL certificate exists
+  stat:
+    path: "/etc/letsencrypt/live/{{ frontend_domain }}/fullchain.pem"
+  register: frontend_cert
+
+- name: Check if backend SSL certificate exists
+  stat:
+    path: "/etc/letsencrypt/live/{{ backend_domain }}/fullchain.pem"
+  register: backend_cert
+
+- name: Obtain SSL certificate for frontend domain
+  command: >
+    certbot certonly --nginx
+    --non-interactive
+    --agree-tos
+    --email admin@{{ domain_suffix }}
+    -d {{ frontend_domain }}
+  when: not frontend_cert.stat.exists
+
+- name: Obtain SSL certificate for backend domain
+  command: >
+    certbot certonly --nginx
+    --non-interactive
+    --agree-tos
+    --email admin@{{ domain_suffix }}
+    -d {{ backend_domain }}
+  when: not backend_cert.stat.exists
+
+- name: Update frontend Nginx config to use SSL
+  template:
+    src: frontend-https.conf.j2
+    dest: "/etc/nginx/sites-available/{{ project_name }}-frontend-{{ env_name }}"
+    owner: root
+    group: root
+    mode: '0644'
+  when: frontend_cert.stat.exists or not frontend_cert.stat.exists
+
+- name: Update backend Nginx config to use SSL
+  template:
+    src: backend-https.conf.j2
+    dest: "/etc/nginx/sites-available/{{ project_name }}-backend-{{ env_name }}"
+    owner: root
+    group: root
+    mode: '0644'
+  when: backend_cert.stat.exists or not backend_cert.stat.exists
+
+- name: Test Nginx configuration
+  command: nginx -t
+  register: nginx_test
+  changed_when: false
+
+- name: Reload Nginx with SSL configuration
+  systemd:
+    name: nginx
+    state: reloaded
+  when: nginx_test.rc == 0
+
+- name: Setup automatic certificate renewal
+  cron:
+    name: "Renew SSL certificates"
+    minute: "0"
+    hour: "0,12"
+    job: "certbot renew --quiet --post-hook 'systemctl reload nginx'"
+    user: root
+    state: present
+
+- name: Test certificate renewal
+  command: certbot renew --dry-run
+  register: renewal_test
+  changed_when: false
+  ignore_errors: yes
+
+- name: Display renewal test result
+  debug:
+    msg: "Certificate renewal test: {{ 'PASSED' if renewal_test.rc == 0 else 'FAILED' }}"
