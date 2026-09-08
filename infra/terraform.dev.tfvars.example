@@ -1,0 +1,117 @@
+# terraform.dev.tfvars — development environment.
+#
+#   terraform workspace select dev
+#   terraform plan -var-file=terraform.dev.tfvars
+#
+# Copy to terraform.dev.tfvars (gitignored) and fill in secret_values.
+
+environment   = "dev"
+aws_region    = "eu-west-1"
+vpc_cidr      = "10.40.0.0/16"
+instance_type = "t3.medium"
+
+# Dev tolerates losing queued jobs when the box is replaced, so a local redis
+# container is the right trade-off here. See var.redis_mode.
+redis_mode = "container"
+
+# Look the existing shared database up read-only, so its endpoint is visible in
+# outputs while dev still points at it. Terraform does not manage it.
+shared_db_identifier = "emerj-shared-db"
+create_database      = false # flip to true only when the dev split is planned
+
+# ---------------------------------------------------------------------------
+# Services.
+#
+# container_port / host_port intentionally keep the port numbers the current PM2
+# processes use, so each entry maps 1:1 onto something in the capture output and
+# the migration is auditable. With one instance per environment they no longer
+# NEED to be distinct across environments — but keeping them makes the before/after
+# obvious. hostnames are the vhosts these services answer on today.
+# ---------------------------------------------------------------------------
+services = {
+  # storytime-api-development (PM2, port 3500)
+  "api" = {
+    container_port = 3500
+    host_port      = 3500
+    hostnames      = ["dev.api.storytimeapp.me"]
+    # The API streams story-generation and TTS progress over SSE.
+    sse           = true
+    max_body_size = "25m"
+    read_timeout  = "3600s"
+    health_path   = "/health"
+    image_tag     = "latest" # prefer an immutable commit SHA once CI is wired up
+    memory_mb     = 1024
+  }
+
+  # storytime-fe-dev (PM2, port 3674)
+  "web" = {
+    container_port = 3674
+    host_port      = 3674
+    hostnames      = ["dev.storytimeapp.me", "dev.web.storytimeapp.me"]
+    memory_mb      = 768
+  }
+
+  # storytime-superadmin-dev (PM2, port 3505)
+  "admin" = {
+    container_port = 3505
+    host_port      = 3505
+    hostnames      = ["dev.admin.storytimeapp.me"]
+    memory_mb      = 512
+  }
+
+  # storytime-waitlist-api-development
+  # PORT UNKNOWN: the PM2 process defaults to 3000 and the real listening port was
+  # never recorded. Confirm from the capture output (`ss -tlnp`) before applying.
+  "waitlist-api" = {
+    container_port = 3000
+    host_port      = 3400
+    hostnames      = []
+    enabled        = false # left off until the port is confirmed
+  }
+
+  # storytime-waitlist-development (PM2, port 3300)
+  "waitlist-web" = {
+    container_port = 3300
+    host_port      = 3300
+    hostnames      = ["dev.waitlist.storytimeapp.me"]
+    memory_mb      = 512
+  }
+}
+
+# Non-secret config, written to SSM as String parameters under
+# /storytime-dev/<service>/<KEY>.
+config_plain = {
+  "api" = {
+    NODE_ENV = "development"
+    PORT     = "3500"
+  }
+  "web" = {
+    PORT = "3674"
+  }
+}
+
+# NAMES of the secrets each service needs. Committable on purpose: this is the
+# shape of the configuration, and reviewing it is how you notice a missing key.
+# Populate from capture/captures/<host>/<timestamp>/env-keys/ — which emits names
+# only, never values.
+secret_keys = {
+  "api" = [
+    # "DATABASE_URL",
+    # "JWT_SECRET",
+    # "REDIS_URL",
+    # ...
+  ]
+}
+
+# Values for the names above. NEVER COMMIT THESE — terraform.dev.tfvars is
+# gitignored. Prefer TF_VAR_ environment variables for anything long-lived.
+secret_values = {
+  # "api" = {
+  #   DATABASE_URL = "postgres://..."
+  # }
+}
+
+# DNS stays at Namecheap until a deliberate cutover.
+cloudflare_enabled     = false
+restrict_to_cloudflare = false
+enable_origin_tls      = false

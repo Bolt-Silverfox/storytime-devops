@@ -1,0 +1,32 @@
+# terraform.shared.tfvars — the BOOTSTRAP workspace.
+#
+# Owns only the resources that are account-global and must exist exactly once:
+# the ECR repositories (shared so an image is built once and promoted by tag) and
+# the GitHub OIDC provider + CI deploy role.
+#
+#   terraform workspace new shared
+#   terraform plan  -var-file=terraform.shared.tfvars
+#
+# Apply this FIRST. Runtime environments read the ECR repositories through a data
+# source and their plans will fail until the repositories exist.
+
+environment     = "shared"
+aws_region      = "eu-west-1"
+create_instance = false
+
+manage_shared_ecr = true
+manage_github_oidc = true
+
+# One repository per service. The keys here define which repositories exist; the
+# runtime workspaces pick from them.
+services = {
+  "api"          = { container_port = 3000, host_port = 3000 }
+  "web"          = { container_port = 3000, host_port = 3001 }
+  "admin"        = { container_port = 3000, host_port = 3002 }
+  "waitlist-api" = { container_port = 3000, host_port = 3003 }
+  "waitlist-web" = { container_port = 3000, host_port = 3004 }
+}
+
+# NOTE: in this workspace the ports above are inert — create_instance = false, so
+# nothing is launched. They only satisfy the type constraint on var.services,
+# which doubles as the list of repositories to create.

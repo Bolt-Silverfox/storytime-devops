@@ -1,0 +1,114 @@
+# terraform.prod.tfvars — production.
+#
+#   terraform workspace select prod
+#   terraform plan -var-file=terraform.prod.tfvars
+#
+# Read the whole file before applying. Two things in here are deliberate CHANGES
+# to today's topology, not codifications of it, and both need sign-off:
+#
+#  1. WAITLIST PRODUCTION AND THE APEX MARKETING SITE MOVE HERE.
+#     Today they run on 52.18.195.224 — the same box as dev, staging and blue.
+#     A dev deploy can therefore take down the public marketing site and the
+#     waitlist. Putting them in the prod workspace fixes that, but it is a
+#     migration with a DNS cutover, so they are `enabled = false` below until
+#     someone schedules it.
+#
+#  2. `api` runs replicas instead of PM2 cluster mode. Today prod runs
+#     storytime-api-production in cluster mode with max(2, cpus-1) workers. Set
+#     replicas to match the instance you choose; the proxy round-robins across
+#     them. This is not automatic — pick the number on purpose.
+
+environment   = "prod"
+aws_region    = "eu-west-1"
+vpc_cidr      = "10.43.0.0/16"
+instance_type = "t3.large"
+
+root_volume_size = 60
+
+# Production queues carry unsent emails, pending push notifications and
+# in-flight TTS batches. Losing them when the box is replaced is real user-visible
+# work lost, so prod does NOT use a local redis container.
+redis_mode             = "elasticache"
+redis_node_type        = "cache.t4g.small"
+redis_maxmemory_policy = "noeviction"
+
+# Prod still points at the shared database until the split happens. This is the
+# single largest outstanding risk in the platform: a dev migration lands in the
+# same instance that serves production.
+shared_db_identifier = "emerj-shared-db"
+create_database      = false # see README -> "Splitting the shared database"
+
+services = {
+  # storytime-api-production (PM2 cluster mode, max(2, cpus-1) workers)
+  "api" = {
+    container_port = 3000
+    host_port      = 3000
+    hostnames      = ["api.storytimeapp.me"]
+    replicas       = 2 # match to the instance size; PM2 cluster-mode equivalent
+    sse            = true
+    max_body_size  = "25m"
+    read_timeout   = "3600s"
+    health_path    = "/health"
+    memory_mb      = 1536
+  }
+
+  # storytime-fe-prod (PM2, port 3000)
+  "web" = {
+    container_port = 3000
+    host_port      = 3100
+    hostnames      = ["web.storytimeapp.me"]
+    memory_mb      = 1024
+  }
+
+  # storytime-superadmin-prod (PM2, port 3505)
+  "admin" = {
+    container_port = 3505
+    host_port      = 3505
+    hostnames      = ["admin.storytimeapp.me"]
+    memory_mb      = 512
+  }
+
+  # ---- currently on the SHARED dev box; enable only with a planned cutover ----
+
+  # storytime-waitlist-production (PM2, port 4500)
+  "waitlist-web" = {
+    container_port = 4500
+    host_port      = 4500
+    hostnames      = ["waitlist.storytimeapp.me"]
+    enabled        = false
+    memory_mb      = 512
+  }
+
+  # storytime-waitlist-api-production
+  # PORT UNKNOWN (PM2 default 3000; real port never recorded). Confirm from the
+  # capture output before enabling.
+  "waitlist-api" = {
+    container_port = 3000
+    host_port      = 4600
+    hostnames      = []
+    enabled        = false
+  }
+}
+
+config_plain = {
+  "api" = {
+    NODE_ENV = "production"
+    PORT     = "3000"
+  }
+}
+
+secret_keys = {
+  # Populate from the capture output. Names only.
+}
+
+secret_values = {
+  # NEVER COMMIT. Supply via TF_VAR_secret_values or this gitignored file.
+}
+
+# Production is the environment where locking the origin to Cloudflare and
+# terminating TLS on the box (Full (strict)) matter most. Both stay off until the
+# DNS cutover from Namecheap happens.
+cloudflare_enabled     = false
+cloudflare_proxied     = true
+restrict_to_cloudflare = false
+enable_origin_tls      = false

@@ -1,0 +1,12 @@
+# Raw captures are NOT committed by default.
+#
+# capture-host.sh masks configuration values, but the free-form artefacts
+# (nginx -T, crontabs) are filtered heuristically, not provably. Committing a
+# capture must therefore stay a deliberate, reviewed act rather than a side
+# effect of `git add -A`.
+#
+# To commit one after reviewing it:
+#     git add -f capture/captures/<host>-<timestamp>
+#
+# Do not relax this rule by ignoring a narrower path or adding a negation.
+captures/
