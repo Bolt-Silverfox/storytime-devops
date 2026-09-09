@@ -28,15 +28,52 @@ import sys
 # ---------------------------------------------------------------------------
 
 # Assignments whose NAME suggests a secret: mask the value, keep the name.
+#
+# NOTE ON WORD BOUNDARIES: this deliberately does NOT use \b around the keywords.
+# `_` is a word character, so `\bsecret\b` does not match inside `JWT_SECRET`,
+# `SECRET_KEY` or `REDIS_PASSWORD` — which is to say it missed most real
+# environment-variable names. Substring matching over-matches occasionally
+# (`author` contains `auth`), and that is the correct direction for a redactor:
+# a needlessly masked value costs a re-read from the box, a missed one costs a
+# credential in a public git history.
 SECRETISH_NAME = re.compile(
     r"""(?ix)
-    \b(
         pass(word|wd)? | secret | token | api[_-]?key | apikey | private[_-]?key
-      | access[_-]?key | client[_-]?secret | auth | credential | bearer
-      | dsn | sentry | webhook | signing | salt | cookie[_-]?secret
-    )\b
+      | access[_-]?key | client[_-]?secret | credential | bearer
+      | dsn | sentry | webhook | signing | salt | passphrase | auth
     """
 )
+
+# Directive names that CONTAIN a secret-ish substring but are not secrets, and
+# whose values must survive intact. `proxy_pass` is the single most important
+# directive in the vhosts this filter exists to capture — masking its upstream
+# would defeat the purpose of the capture. Keep this list tight and explicit.
+SAFE_DIRECTIVE = re.compile(
+    r"""(?ix) ^(?:
+        (?:proxy|fastcgi|uwsgi|scgi|grpc|memcached)_pass
+      | auth_basic(?:_user_file)?
+      | auth_request(?:_set)?
+      | auth_delay
+      | auth_jwt_key_file
+      | satisfy
+    )$"""
+)
+
+# Any identifier on a line, including nginx `$variables`.
+IDENTIFIER = re.compile(r"[A-Za-z_$][A-Za-z0-9_.\-]*")
+
+# KEY=value / KEY: value anywhere on a line, so that `env REDIS_PASSWORD=x` is
+# examined on REDIS_PASSWORD rather than on the leading `env` keyword.
+KV_ANY = re.compile(r"([A-Za-z_$][A-Za-z0-9_.\-]*)(\s*[:=]\s*)([^\s;#,]+)")
+
+
+def _is_secretish(name: str) -> bool:
+    return bool(SECRETISH_NAME.search(name)) and not SAFE_DIRECTIVE.match(name)
+
+
+def _line_mentions_secret(line: str) -> bool:
+    return any(_is_secretish(tok) for tok in IDENTIFIER.findall(line))
+
 
 # name = value / name: value / name value  (nginx directives use whitespace)
 ASSIGNMENT = re.compile(
@@ -52,6 +89,30 @@ URL_CREDS = re.compile(r"(?i)\b([a-z][a-z0-9+.\-]*://)([^\s:@/]+)(:[^\s@/]*)?@")
 
 # Long opaque blobs that are almost certainly key material.
 LONG_TOKEN = re.compile(r"\b[A-Za-z0-9_\-]{40,}\b")
+
+# High-confidence provider credential shapes, masked regardless of length. The
+# length heuristic alone misses plenty of real credentials: an AWS access key id
+# is exactly 20 characters, so `AKIA...` sailed straight through it.
+KNOWN_SECRET = re.compile(
+    r"""(?x)
+      \b(?:AKIA|ASIA|ABIA|ACCA)[0-9A-Z]{16}\b            # AWS access key id
+    | \bgh[pousr]_[A-Za-z0-9]{16,}\b                     # GitHub token
+    | \bgithub_pat_[A-Za-z0-9_]{20,}\b
+    | \b(?:sk|rk|pk)_(?:live|test)_[A-Za-z0-9]{10,}\b     # Stripe-style
+    | \bsk-(?:ant-|proj-)?[A-Za-z0-9_\-]{16,}\b          # OpenAI / Anthropic
+    | \bxox[baprs]-[A-Za-z0-9-]{10,}\b                   # Slack
+    | \bAIza[0-9A-Za-z_\-]{30,}\b                        # Google API key
+    | \bSG\.[A-Za-z0-9_\-]{16,}\b                        # SendGrid
+    | \bglpat-[A-Za-z0-9_\-]{16,}\b                      # GitLab
+    | \bnpm_[A-Za-z0-9]{30,}\b
+    """
+)
+
+# Any quoted string on a line that ALSO mentions something secret-ish. This is
+# what catches idioms the name=value grammar cannot see, e.g. nginx's
+#   set $upstream_token "…";
+# where the assignment's apparent "name" is the directive `set`, not the token.
+QUOTED = re.compile(r"\"[^\"]*\"|'[^']*'")
 JWT = re.compile(r"\beyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\b")
 PEM_BEGIN = re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")
 
@@ -72,10 +133,27 @@ def mask_text(line: str) -> str:
         return "<redacted: PRIVATE KEY BLOCK>"
 
     line = JWT.sub("<redacted:jwt>", line)
+    line = KNOWN_SECRET.sub("<redacted:credential>", line)
     line = URL_CREDS.sub(lambda m: f"{m.group(1)}<redacted:user>:<redacted:pass>@", line)
 
+    # KEY=value / KEY: value, judged on the KEY. Runs before the whitespace-separated
+    # grammar below, which would otherwise treat a leading keyword (`env`, `set`,
+    # `fastcgi_param`) as the name and never look at the real one.
+    line = KV_ANY.sub(
+        lambda m: f"{m.group(1)}{m.group(2)}<redacted>" if _is_secretish(m.group(1)) else m.group(0),
+        line,
+    )
+
+    # If the line mentions a secret-ish identifier ANYWHERE, mask every quoted
+    # string on it. This catches idioms the grammars cannot see, such as nginx's
+    # `set $upstream_token "…";` where the apparent name is the directive `set`.
+    # Over-masking is the correct direction for a safety net: a mangled directive
+    # you have to re-read from the box beats a credential in a public git history.
+    if _line_mentions_secret(line):
+        line = QUOTED.sub("<redacted>", line)
+
     def _assign(m: "re.Match[str]") -> str:
-        if SECRETISH_NAME.search(m.group("name")):
+        if _is_secretish(m.group("name")):
             return f"{m.group('name')}{m.group('sep')}<redacted>"
         return m.group(0)
 
