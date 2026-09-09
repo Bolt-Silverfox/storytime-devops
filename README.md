@@ -113,7 +113,10 @@ nightly `pg_dump --format=custom` to a versioned, encrypted, TLS-only S3 bucket,
 independent DLM EBS snapshots, plus a weekly job that restores the newest dump into a
 throwaway container and counts the tables. Failure surfaces as a stale S3 heartbeat,
 readable without touching the box. This is children's personal data under GDPR;
-[do not remove the backups](infra/README.md#backups).
+[do not remove the backups](infra/README.md#backups). The same care applies in the
+other direction: the migration runbook stages a plaintext dump in that bucket and
+then really deletes it with `scripts/purge-s3-object-versions.sh`, because the
+bucket is versioned and `aws s3 rm` there only writes a delete marker.
 
 **The box is disposable and migrating is routine.** Images in ECR, config in SSM,
 dumps in S3 — losing the instance costs the time to re-apply and restore. Nothing a

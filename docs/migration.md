@@ -258,8 +258,11 @@ aws s3api head-object --bucket "$NEW_BUCKET" --key postgres/restore-in/source.du
 ```
 
 > The instance role covers `postgres/*`, so `postgres/restore-in/` is readable by the
-> new box with no policy change. It is also inside the lifecycle rule's prefix, so the
-> staged copy expires on its own rather than lingering.
+> new box with no policy change. It is also inside the lifecycle rule's prefix, so a
+> forgotten copy does eventually expire — **but "eventually" is up to 7 days for a
+> plaintext dump of children's data, and the bucket is versioned, so it is not a
+> substitute for deleting it.** See the purge step at the end of this section, and do
+> not skip it.
 
 Then, on the new box:
 
@@ -315,13 +318,47 @@ docker exec postgres psql -U "$DB_USER" -d "$DB_NAME" -c \
 `pg_restore` reporting errors about roles or extensions it could not create is
 normal with `--no-owner --no-privileges`. Errors about *tables* are not.
 
-When you are satisfied, remove the staged copy — it is a full plaintext dump:
+When you are satisfied, **destroy the staged copy properly**. This is a full
+plaintext dump of children's personal data sitting in the backup bucket.
+
+> ### `aws s3 rm` does not delete it
+>
+> The backup bucket is **versioned** (`infra/backups.tf` — deliberately, so an
+> overwritten or maliciously deleted dump is recoverable). On a versioned bucket
+> `aws s3 rm` writes a **delete marker**: the object disappears from `aws s3 ls`
+> and stays fully readable by version id. In this bucket the staged dump would
+> then survive for up to **7 days**, until `noncurrent_version_expiration` reaches
+> it — while the runbook claimed it was gone.
+>
+> Delete every version *and* every delete marker, and verify:
 
 ```bash
-aws s3 rm "s3://$NEW_BUCKET/postgres/restore-in/source.dump"
+# From your workstation, with operator credentials — the instance role has no
+# s3:DeleteObject, let alone s3:DeleteObjectVersion.
+scripts/purge-s3-object-versions.sh "$NEW_BUCKET" postgres/restore-in/source.dump
 ```
 
-(The instance role has no `s3:DeleteObject`, so run this from your workstation.)
+**Check:** it prints `purge ok: ... none remaining` and exits 0. It exits **1**,
+loudly, if anything survived — permissions, object lock or MFA-delete would each
+leave the dump recoverable, and a cleanup step that silently leaves versions
+behind is the same class of bug as a backup that silently fails.
+
+Confirm independently if you want to see it for yourself:
+
+```bash
+aws s3api list-object-versions --bucket "$NEW_BUCKET" \
+  --prefix postgres/restore-in/ \
+  --query '{versions: Versions[].VersionId, markers: DeleteMarkers[].VersionId}'
+```
+
+**Check:** both lists are `null`/empty.
+
+**If you cannot purge** — no `s3:DeleteObjectVersion`, or the bucket has object
+lock — then say so out loud in the migration record rather than assuming it is
+handled: **a plaintext dump remains recoverable in `$NEW_BUCKET` for up to 7 days
+(the `noncurrent_version_expiration` window), after which the lifecycle rule
+removes it.** That is a GDPR-relevant retention fact, not an implementation
+detail.
 
 ## 6. Verify the new stack before it owns any traffic
 
