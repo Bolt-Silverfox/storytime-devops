@@ -172,6 +172,16 @@ env_default() {
   grep -q "^$key=" "$file" 2>/dev/null || printf '%s=%s\n' "$key" "$value" >> "$file"
 }
 
+# Each extra_env pair is emitted SINGLE-quoted below, with any embedded single
+# quote closed-escaped-reopened ('"'"'), because these values are shell code the
+# moment they are written into this script. Double quotes were wrong twice over:
+# a value containing $ was expanded at run time as root (PRICE='price-$HOME-end'
+# silently became a path), and a value containing " ended the argument and ran
+# the rest of the line — `a"; touch /tmp/pwned; "b` produced a syntactically
+# VALID script that executed the injected command. That is reachable in practice,
+# not theoretical: docs/migration.md has a human transcribing real values out of
+# a legacy host's .env (via the capture) and into tfvars. Secrets go through SSM
+# and never appear here, but config_plain values do.
 run_service() {
   local service="$1" container="$2" image="$3" host_port="$4" container_port="$5" memory_mb="$6"
   shift 6
@@ -218,7 +228,7 @@ run_service() {
 
 %{ for c in containers ~}
 if [ -z "$ONLY" ] || [ "$ONLY" = "${c.service}" ] || [ "$ONLY" = "${c.container_name}" ]; then
-  run_service "${c.service}" "${c.container_name}" "${c.image}" "${c.host_port}" "${c.container_port}" "${c.memory_mb}" %{ for k, v in c.extra_env }-e "${k}=${v}" %{ endfor ~}
+  run_service "${c.service}" "${c.container_name}" "${c.image}" "${c.host_port}" "${c.container_port}" "${c.memory_mb}" %{ for k, v in c.extra_env }-e '${replace("${k}=${v}", "'", "'\"'\"'")}' %{ endfor ~}
 
 fi
 %{ endfor ~}

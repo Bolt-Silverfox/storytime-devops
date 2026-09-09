@@ -64,7 +64,22 @@ IDENTIFIER = re.compile(r"[A-Za-z_$][A-Za-z0-9_.\-]*")
 
 # KEY=value / KEY: value anywhere on a line, so that `env REDIS_PASSWORD=x` is
 # examined on REDIS_PASSWORD rather than on the leading `env` keyword.
-KV_ANY = re.compile(r"([A-Za-z_$][A-Za-z0-9_.\-]*)(\s*[:=]\s*)([^\s;#,]+)")
+#
+# The value alternation must try a QUOTED string first, exactly as ASSIGNMENT
+# does. With only `[^\s;#,]+` the value stopped at the first space, so a
+# multi-word quoted secret was only partly masked and the rest of it stayed on
+# the line: `JWT_SECRET = "hunter2 with spaces"` became
+# `JWT_SECRET = <redacted> with spaces"`, and a passphrase came through as
+# `PGPASSWORD=<redacted> secret <redacted> phrase'`. That violates this module's
+# one hard rule — never emit a configuration value — and it is not recovered
+# later, because the quoted-string sweep below can no longer see a balanced pair.
+KV_ANY = re.compile(
+    r"""(?x)
+    ([A-Za-z_$][A-Za-z0-9_.\-]*)
+    (\s*[:=]\s*)
+    ("[^"]*"|'[^']*'|[^\s;#,]+)
+    """
+)
 
 
 def _is_secretish(name: str) -> bool:

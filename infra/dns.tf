@@ -21,6 +21,15 @@
 #
 #   `terraform output dns_records_required` prints exactly the rows to enter.
 #
+# DRIFT DETECTION, because "edited by hand" otherwise means "never verified
+# again": `scripts/check-dns.sh` compares this output against what the zone
+# actually serves, from two independent public resolvers, and exits non-zero on a
+# mismatch. It needs no Namecheap credential and no provider. The runbook's `dig`
+# checks are one-shot at cutover; this is the one that catches a record edited
+# months later, a typo in one host out of six, or an EIP reallocated while the
+# zone still names the old address. It exits 2 — never 0 — if it could not
+# perform the check.
+#
 # ---------------------------------------------------------------------------
 # THE CUTOVER LEVER IS THE ELASTIC IP, NOT THE DNS RECORD.
 #

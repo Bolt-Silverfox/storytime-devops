@@ -765,6 +765,9 @@ Things that genuinely cannot be settled from here:
    whitelisting the caller's IP, which a laptop or a runner does not have stably.
    The records are a documented manual step; `terraform output
    dns_records_required` prints exactly what to type. See [`dns.tf`](dns.tf).
+   Afterwards, `scripts/check-dns.sh` verifies the zone actually matches that
+   output (two resolvers, no credentials) and is safe to re-run at any time —
+   it is the drift detection that hand-edited DNS otherwise never gets.
 
    The consequence to be honest about: **TLS is now entirely Caddy's job**, so a
    failed certificate is a full outage rather than a degraded edge. That is why
