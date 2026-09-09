@@ -35,8 +35,11 @@ jobs:
       - name: shellcheck
         run: |
           set -uo pipefail
-          # shellcheck is preinstalled on ubuntu-latest runners, so there is no
-          # third-party action to pin or trust here.
+          # The ShellCheck binary is preinstalled on ubuntu-latest runners, so
+          # there is no third-party action to pin or trust here.
+          # (Do not start a comment in a run: block with the lowercase tool name
+          # followed by a space — ShellCheck parses that as a directive and
+          # errors with SC1072/SC1073, which actionlint surfaces as a failure.)
           shellcheck --version
           # Selection notes:
           #  * *.tftpl is Terraform-templated shell: its interpolations are not
