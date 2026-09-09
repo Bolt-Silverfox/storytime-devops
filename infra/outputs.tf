@@ -57,10 +57,19 @@ output "backup_health_check" {
 }
 
 output "restore_verification_check" {
-  description = "Run this to see when a dump was last actually restored and its tables counted. If this is null or stale, the backups are unproven."
-  value = try(
-    "aws s3 cp s3://${aws_s3_bucket.backups[0].bucket}/_status/last-restore-verify.json - | cat",
-    null
+  description = <<-EOT
+    Run this to see when a dump was last actually restored and its tables counted.
+    A STALE timestamp means the backups are unproven.
+
+    Null means verification is not installed (enable_restore_verification = false)
+    — which is a different thing from "installed but failing", and the two must not
+    look alike. Without the gate this printed a command that 404s, making a
+    deliberately disabled job indistinguishable from a broken one.
+  EOT
+  value = (
+    var.enable_restore_verification
+    ? try("aws s3 cp s3://${aws_s3_bucket.backups[0].bucket}/_status/last-restore-verify.json - | cat", null)
+    : null
   )
 }
 

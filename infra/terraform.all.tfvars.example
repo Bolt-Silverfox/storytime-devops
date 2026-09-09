@@ -19,9 +19,15 @@ root_volume_size = 30
 use_managed_database = false      # true -> RDS instead (~+$12.41/mo)
 redis_mode           = "container" # BullMQ queues + cache + guest sessions
 
-# REQUIRED. Do not put a real value in this file — use the environment:
+# REQUIRED — and deliberately NOT assigned here.
+#
+# Terraform ranks a -var-file above an environment variable, so an explicit
+# `db_password = ""` in this file would OUTRANK (and silently discard) your
+# exported value, and the plan would then fail on the "db_password is required"
+# guard for no visible reason. Supply it from the environment:
+#
 #   export TF_VAR_db_password='...'
-db_password = ""
+
 
 # ---------------------------------------------------------------------------
 # MEMORY BUDGET — guards.tf fails the plan if this does not fit.

@@ -181,12 +181,26 @@ Two layers, because they fail differently:
 |---|---|---|
 | What | `pg_dump --format=custom` to S3, nightly | DLM whole-volume snapshot, daily |
 | Driven by | systemd timer on the box (`storytime-pg-backup.timer`) | AWS, needs nothing from the box |
-| Survives | losing the instance, volume, AZ or region | a corrupted/truncated dump, a compromised backup script |
+| Survives | losing the instance, the volume, or the AZ | a corrupted/truncated dump, a compromised backup script |
 | Vulnerable to | a dump that succeeds but is garbage | losing the region |
 | Retention | `backup_retention_days` (30) + 7 days of noncurrent versions | `ebs_snapshot_retain_count` (7) |
 
 `--format=custom` rather than plain SQL so `pg_restore` can do selective and
 parallel restores, and because it compresses.
+
+> **Neither layer survives losing the region.** Both the dump bucket and the EBS
+> snapshots live in `var.aws_region`, and this configuration sets up **no
+> cross-region replication**. An earlier version of this table claimed layer 1
+> covered regional loss; it does not, and overclaiming backup coverage is exactly
+> the false confidence these backups exist to avoid.
+>
+> If you want cross-region durability, add an `aws_s3_bucket_replication_configuration`
+> to a bucket in a second region (plus a replication IAM role, and versioning on
+> both — versioning is already enabled here). That is deliberately **not** done:
+> it costs cross-region transfer plus a second bucket's storage, and moving
+> children's personal data into another region is the same data-residency decision
+> discussed under [Region](#region-and-data-residency). It needs a human call, not
+> a default.
 
 The bucket is created by Terraform: **versioned, SSE-encrypted, public-access
 blocked, TLS-only** (a bucket policy denying `aws:SecureTransport=false`), with a
@@ -235,23 +249,47 @@ follow-up, and until it exists someone has to look.
 
 Documented and scripted, because a backup nobody has restored is not a backup.
 
+Run this **on the box** (`aws ssm start-session --target <instance_id>`):
+
 ```bash
-# Newest dump (keys are date-ordered, so lexicographic == chronological)
-BUCKET=$(terraform output -raw backup_bucket)
-KEY=$(aws s3 ls "s3://$BUCKET/postgres/" --recursive | awk '{print $4}' \
+set -euo pipefail
+
+STACK=<name_prefix>-<environment>          # e.g. storytime-all
+BUCKET=<backup bucket>                     # terraform output -raw backup_bucket
+
+# The dump is plaintext children's personal data while it is on disk. Register
+# cleanup BEFORE creating it, so an interruption cannot leave a copy behind, and
+# make the two deletions independent — chaining them with && means a failure in
+# the first skips the second.
+cleanup() {
+  docker exec postgres rm -f /tmp/restore.dump >/dev/null 2>&1 || true
+  if [ -f /var/tmp/restore.dump ]; then shred -u /var/tmp/restore.dump || rm -f /var/tmp/restore.dump; fi
+}
+trap cleanup EXIT INT TERM HUP
+
+# Use the CONFIGURED identity, not a guess: db_name/db_username are variables, so
+# hardcoding `storytime` restores into the wrong database (or fails) on any stack
+# that changed them.
+DB_USER=$(aws ssm get-parameter --name "/$STACK/_db/USERNAME" --query 'Parameter.Value' --output text)
+DB_NAME=$(aws ssm get-parameter --name "/$STACK/_db/NAME"     --query 'Parameter.Value' --output text)
+
+# Newest dump. Keys are date-ordered, so lexicographic == chronological.
+KEY=$(aws s3 ls "s3://$BUCKET/postgres/$STACK/" --recursive | awk '{print $4}' \
         | grep '\.dump$' | sort | tail -1)
+[ -n "$KEY" ] || { echo "no dump found" >&2; exit 1; }
 aws s3 cp "s3://$BUCKET/$KEY" /var/tmp/restore.dump
 
-# Into the running container. --clean --if-exists makes it repeatable.
+# --clean --if-exists makes this repeatable; without them a second attempt fails
+# on objects that already exist.
 docker cp /var/tmp/restore.dump postgres:/tmp/restore.dump
 docker exec postgres pg_restore \
-  --username=storytime --dbname=storytime \
+  --username="$DB_USER" --dbname="$DB_NAME" \
   --clean --if-exists --no-owner --no-privileges --jobs 2 \
   /tmp/restore.dump
-
-# The dump is plaintext children's data — remove it from both filesystems.
-docker exec postgres rm -f /tmp/restore.dump && shred -u /var/tmp/restore.dump
 ```
+
+Errors about roles or extensions are normal with `--no-owner --no-privileges`.
+Errors about *tables* are not.
 
 Full procedure with verification steps: [`docs/migration.md`](../docs/migration.md)
 step 5.

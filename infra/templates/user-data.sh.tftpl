@@ -148,7 +148,16 @@ write_env_file() {
       return 1
     }
 
-  printf '%s' "$page" | python3 /usr/local/lib/storytime-ssm-to-envfile.py "$out"
+  # Check this explicitly. `write_env_file` is invoked in an OR-list
+  # (`write_env_file ... || return 1`), which SUPPRESSES errexit inside the
+  # function — so a failing pipeline here would not stop it, and the `if` below
+  # would then mask the status and return success. Because the helper appends
+  # incrementally, that meant `docker run` could consume a PARTIAL env file:
+  # a container started with half its configuration, and no error anywhere.
+  if ! printf '%s' "$page" | python3 /usr/local/lib/storytime-ssm-to-envfile.py "$out"; then
+    echo "FATAL: could not parse the SSM response for $service into an env-file" >&2
+    return 1
+  fi
 
   if [ ! -s "$out" ]; then
     echo "WARN: no SSM parameters found under /$PREFIX/$service/ -- starting $service with no configuration" >&2
@@ -232,6 +241,21 @@ chmod 750 /usr/local/bin/redeploy.sh
 # backups real.
 #
 # Published on LOOPBACK ONLY — never reachable off the instance.
+# Read the password into the environment FIRST, with an explicit failure check.
+# Two reasons this is not done inline in the `docker run` arguments:
+#   1. A command substitution's failure does not fail `docker run`, so a broken
+#      SSM read would have started Postgres with an EMPTY password while the
+#      bootstrap carried on.
+#   2. An inline substitution puts the password in the process's argv, where it is
+#      visible in `ps` to any local user for the life of the command. Passing
+#      `-e POSTGRES_PASSWORD` with no value tells Docker to take it from this
+#      script's environment instead, so it never appears on a command line.
+PG_PASSWORD=$(aws ssm get-parameter --region "${aws_region}" --with-decryption \
+  --name "/${prefix}/_db/PASSWORD" --query 'Parameter.Value' --output text) \
+  || { echo "FATAL: could not read the database password from SSM" >&2; exit 1; }
+[ -n "$PG_PASSWORD" ] || { echo "FATAL: the database password in SSM is empty" >&2; exit 1; }
+export PG_PASSWORD POSTGRES_PASSWORD="$PG_PASSWORD"
+
 docker volume inspect storytime-pgdata >/dev/null 2>&1 || docker volume create storytime-pgdata
 retry docker pull "${postgres_image}"
 if [ -z "$(docker ps -aq -f name='^postgres$')" ]; then
@@ -242,8 +266,7 @@ if [ -z "$(docker ps -aq -f name='^postgres$')" ]; then
     --log-driver json-file --log-opt max-size=20m --log-opt max-file=2 \
     -e POSTGRES_DB="${db_name}" \
     -e POSTGRES_USER="${db_username}" \
-    -e POSTGRES_PASSWORD="$(aws ssm get-parameter --region "${aws_region}" --with-decryption \
-        --name "/${prefix}/_db/PASSWORD" --query 'Parameter.Value' --output text)" \
+    -e POSTGRES_PASSWORD \
     -e PGDATA=/var/lib/postgresql/data/pgdata \
     "${postgres_image}"
 else
@@ -254,13 +277,22 @@ else
   echo "postgres container already present — left as-is (a major-version change must be a deliberate, dumped-and-restored migration)"
 fi
 
-# Wait for it to accept connections before anything tries to migrate against it.
-for i in $(seq 1 30); do
+# Wait for it to accept connections before anything tries to talk to it. A
+# timeout here is FATAL: continuing would start every application container
+# against a database that is not there, and each would fail its own way. The
+# equivalent loop in pg-restore-verify.sh already fails on timeout; match it.
+pg_ready=0
+for i in $(seq 1 60); do
   if docker exec postgres pg_isready -U "${db_username}" -d "${db_name}" >/dev/null 2>&1; then
-    echo "postgres ready after $${i}s"; break
+    echo "postgres ready after $${i}s"; pg_ready=1; break
   fi
   sleep 1
 done
+if [ "$pg_ready" != "1" ]; then
+  echo "FATAL: postgres did not accept connections within 60s — refusing to start application containers against a database that is not up" >&2
+  docker logs --tail 50 postgres 2>&1 || true
+  exit 1
+fi
 %{ else ~}
 # use_managed_database = true: Postgres is an RDS instance. Nothing runs here; the
 # app reads its connection string from SSM.
@@ -601,10 +633,14 @@ aws s3 cp "s3://$BUCKET/$KEY" "$WORK/db.dump" --only-show-errors \
   || fail "could not download s3://$BUCKET/$KEY"
 
 # Throwaway instance: no published port, no volume, a password used only here.
-VERIFY_PW=$(head -c 24 /dev/urandom | base64 | tr -d '/+=')
+# Random, ephemeral, and never used for anything but this throwaway container —
+# but passed through the environment rather than argv for the same reason as the
+# real one above: a password on a command line is visible in `ps`.
+POSTGRES_PASSWORD=$(head -c 24 /dev/urandom | base64 | tr -d '/+=')
+export POSTGRES_PASSWORD
 docker run -d --name "$CONTAINER" \
   --memory 512m --memory-swap 512m \
-  -e POSTGRES_PASSWORD="$VERIFY_PW" -e POSTGRES_DB=verify \
+  -e POSTGRES_PASSWORD -e POSTGRES_DB=verify \
   "$IMAGE" >/dev/null || fail "could not start the throwaway container"
 
 for i in $(seq 1 60); do

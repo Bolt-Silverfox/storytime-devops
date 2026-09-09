@@ -168,6 +168,12 @@ resource "aws_instance" "app" {
     aws_s3_bucket_lifecycle_configuration.backups,
     aws_s3_bucket_public_access_block.backups,
     aws_s3_bucket_policy.backups,
+    # Without this edge the first nightly dump could land before the default
+    # AES256 rule exists. The upload passes --sse AES256 explicitly too, so this
+    # is belt-and-braces — but the bucket's own default should be in place first.
+    # aws_s3_bucket_versioning is deliberately absent: the lifecycle
+    # configuration already depends on it, so the edge is transitive.
+    aws_s3_bucket_server_side_encryption_configuration.backups,
   ]
 }
 

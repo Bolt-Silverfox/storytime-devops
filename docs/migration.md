@@ -174,52 +174,104 @@ the side, or the next apply will not know about them.
 
 ## 5. Restore the data into the new stack
 
+**The new box cannot read the old stack's bucket, by design.** Its instance role is
+scoped to its own bucket and prefix, so `aws s3 cp s3://<old-bucket>/...` on the new
+box returns `AccessDenied`.
+
+Rather than widen that role, **stage the dump between buckets from your own
+workstation**, using your operator credentials. The new box then reads from its own
+bucket, which it is already permitted to do, and no IAM change is made or has to be
+remembered and revoked afterwards.
+
+```bash
+# --- On your workstation, with credentials for both buckets ---
+OLD_BUCKET=<old stack's backup bucket>
+NEW_BUCKET=$(terraform output -raw backup_bucket)      # in the new workspace
+OLD_STACK=<old name_prefix>-<old environment>          # e.g. storytime-all
+
+# Newest dump. Keys are date-ordered, so lexicographic == chronological.
+KEY=$(aws s3 ls "s3://$OLD_BUCKET/postgres/$OLD_STACK/" --recursive \
+        | awk '{print $4}' | grep '\.dump$' | sort | tail -1)
+echo "$KEY"
+[ -n "$KEY" ] || { echo "no dump found in the old bucket" >&2; exit 1; }
+
+# Server-side copy into the new stack's own prefix. Never lands on your laptop.
+aws s3 cp "s3://$OLD_BUCKET/$KEY" "s3://$NEW_BUCKET/postgres/restore-in/source.dump" \
+  --sse AES256
+```
+
+**Check:** the object exists and is the expected size.
+
+```bash
+aws s3api head-object --bucket "$NEW_BUCKET" --key postgres/restore-in/source.dump \
+  --query ContentLength --output text
+```
+
+> The instance role covers `postgres/*`, so `postgres/restore-in/` is readable by the
+> new box with no policy change. It is also inside the lifecycle rule's prefix, so the
+> staged copy expires on its own rather than lingering.
+
+Then, on the new box:
+
 ```bash
 NEW_INSTANCE=$(terraform output -raw instance_id)
-OLD_BUCKET=<old stack's backup bucket>
-
 aws ssm start-session --target "$NEW_INSTANCE"
 ```
 
-On the new box:
-
 ```bash
-# Newest dump from the OLD stack's bucket. Keys are date-ordered, so
-# lexicographic order is chronological.
-KEY=$(aws s3 ls "s3://$OLD_BUCKET/postgres/" --recursive | awk '{print $4}' \
-        | grep '\.dump$' | sort | tail -1)
-echo "$KEY"
+set -euo pipefail
 
-aws s3 cp "s3://$OLD_BUCKET/$KEY" /var/tmp/restore.dump
+# Define these INSIDE the session — a variable exported on your workstation does
+# not exist here.
+STACK=<new name_prefix>-<new environment>     # e.g. storytime-all-v2
+BUCKET=<new backup bucket>
 
-# Into the running container. --clean --if-exists makes this repeatable; without
-# them a second attempt fails on objects that already exist.
+# The dump is plaintext children's personal data while it is on disk. Register
+# cleanup BEFORE creating it, so an interruption cannot leave a copy behind, and
+# keep the two deletions independent — chaining with && lets a failure in the
+# first skip the second.
+cleanup() {
+  docker exec postgres rm -f /tmp/restore.dump >/dev/null 2>&1 || true
+  if [ -f /var/tmp/restore.dump ]; then shred -u /var/tmp/restore.dump || rm -f /var/tmp/restore.dump; fi
+}
+trap cleanup EXIT INT TERM HUP
+
+# Use the CONFIGURED identity rather than assuming `storytime`: db_name and
+# db_username are variables, so a guess restores into the wrong database or fails.
+DB_USER=$(aws ssm get-parameter --name "/$STACK/_db/USERNAME" --query 'Parameter.Value' --output text)
+DB_NAME=$(aws ssm get-parameter --name "/$STACK/_db/NAME"     --query 'Parameter.Value' --output text)
+
+aws s3 cp "s3://$BUCKET/postgres/restore-in/source.dump" /var/tmp/restore.dump
+
+# --clean --if-exists makes this repeatable; without them a second attempt fails
+# on objects that already exist.
 docker cp /var/tmp/restore.dump postgres:/tmp/restore.dump
 docker exec postgres pg_restore \
-  --username="$(aws ssm get-parameter --name "$NEW/_db/USERNAME" --query 'Parameter.Value' --output text)" \
-  --dbname="$(aws ssm get-parameter --name "$NEW/_db/NAME" --query 'Parameter.Value' --output text)" \
+  --username="$DB_USER" --dbname="$DB_NAME" \
   --clean --if-exists --no-owner --no-privileges --jobs 2 \
   /tmp/restore.dump
-
-# The dump is plaintext children's data. Remove it from both filesystems.
-docker exec postgres rm -f /tmp/restore.dump
-shred -u /var/tmp/restore.dump
 ```
 
 **Check:** table count and a couple of row counts match the source.
 
 ```bash
-docker exec postgres psql -U <user> -d <db> -c \
+docker exec postgres psql -U "$DB_USER" -d "$DB_NAME" -c \
   "SELECT count(*) FROM information_schema.tables
     WHERE table_schema NOT IN ('pg_catalog','information_schema');"
-docker exec postgres psql -U <user> -d <db> -c \
+docker exec postgres psql -U "$DB_USER" -d "$DB_NAME" -c \
   "SELECT 'users', count(*) FROM users UNION ALL SELECT 'stories', count(*) FROM stories;"
 ```
 
 `pg_restore` reporting errors about roles or extensions it could not create is
 normal with `--no-owner --no-privileges`. Errors about *tables* are not.
 
----
+When you are satisfied, remove the staged copy — it is a full plaintext dump:
+
+```bash
+aws s3 rm "s3://$NEW_BUCKET/postgres/restore-in/source.dump"
+```
+
+(The instance role has no `s3:DeleteObject`, so run this from your workstation.)
 
 ## 6. Verify the new stack through its temporary hostname
 
@@ -248,48 +300,71 @@ Then exercise the paths that break in interesting ways:
 
 This is the whole point of putting DNS in Terraform with a low TTL.
 
-Move the real hostnames from the old stack's tfvars to the new one:
+> ### One hostname, one owner. Never two.
+>
+> Cloudflare permits **multiple A records for the same name**, and Terraform
+> workspaces do not coordinate with each other. So if you add the real hostname to
+> `all-v2` *before* removing it from `all`, both records exist and Cloudflare
+> **round-robins traffic between the two origins** — half of it to a stack you have
+> not finished verifying, with a split-brain database underneath.
+>
+> That is far worse than a few seconds of NXDOMAIN. So: **remove, then add**, with
+> both plans computed in advance so the two applies are back to back.
+
+Edit the tfvars first — remove the real hostnames from `terraform.all.tfvars`, and add
+them to `terraform.all-v2.tfvars` — then compute **both** plans before applying
+either:
 
 ```bash
-# In terraform.all-v2.tfvars: give the new stack the REAL hostnames.
-# In terraform.all.tfvars:    remove them from the old stack.
+terraform workspace select all
+terraform plan -var-file=terraform.all.tfvars     -out=release.tfplan
+terraform show release.tfplan            # expect: cloudflare_record DESTROY only
 
 terraform workspace select all-v2
-terraform plan -var-file=terraform.all-v2.tfvars -out=cut.tfplan
-terraform show cut.tfplan          # expect: cloudflare_record changes ONLY
-terraform apply cut.tfplan
-
-terraform workspace select all
-terraform plan -var-file=terraform.all.tfvars -out=release.tfplan
-terraform show release.tfplan      # expect: cloudflare_record DESTROY only
-terraform apply release.tfplan
+terraform plan -var-file=terraform.all-v2.tfvars  -out=cut.tfplan
+terraform show cut.tfplan                # expect: cloudflare_record CREATE only
 ```
 
-**Check:** the second plan destroys **only** `cloudflare_record` resources. If it
-proposes destroying the instance, the EIP, or the backup bucket, **stop** — you
-still need the old box for rollback.
+**Check before applying anything:** `release.tfplan` destroys **only**
+`cloudflare_record` resources. If it proposes destroying the instance, the EIP or the
+backup bucket, **stop** — you still need the old box for rollback.
 
-**Do the DNS change during a quiet period, and watch:**
+Then apply them back to back, release first:
+
+```bash
+terraform workspace select all   && terraform apply release.tfplan
+terraform workspace select all-v2 && terraform apply cut.tfplan
+```
+
+**Do this during a quiet period**, and watch:
 
 ```bash
 dig +short api.<zone>
 curl -fsS https://api.<zone>/health
 ```
 
-With `cloudflare_proxied = true` the edge address does not change at all; only the
-origin behind it does, so propagation is effectively instant. Unproxied,
+Expect a gap of a few seconds between the two applies during which the name does not
+resolve. With `cloudflare_proxied = true` the edge address does not change — only the
+origin behind it — so propagation is effectively instant; unproxied,
 `cloudflare_dns_ttl` (default 60s) bounds it.
-
----
 
 ## 8. Rollback
 
 **Rollback is flipping the record back.** That is the only reason the old box is
 still running, and it is why step 7 must never destroy it.
 
+Same single-owner rule, in reverse — remove from `all-v2` first, then restore to
+`all`, or you recreate the split-brain you just avoided:
+
 ```bash
+# 1. Release the hostnames from the new stack.
+terraform workspace select all-v2
+#    remove the real hostnames from terraform.all-v2.tfvars
+terraform apply -var-file=terraform.all-v2.tfvars
+
+# 2. Return them to the old stack.
 terraform workspace select all
-# restore the hostnames in terraform.all.tfvars
+#    restore the real hostnames in terraform.all.tfvars
 terraform apply -var-file=terraform.all.tfvars
 ```
 

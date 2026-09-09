@@ -30,8 +30,10 @@
 locals {
   backup_bucket = var.backup_bucket_name != "" ? var.backup_bucket_name : "${local.prefix}-backups"
 
-  # Everything the instance may write lives under this one prefix, and the IAM
-  # policy in iam.tf is scoped to exactly it.
+  # The instance may write under exactly two prefixes, and the IAM policy in
+  # iam.tf is scoped to both: `<backup_prefix>/` for the dumps themselves, and
+  # `_status/` for the success and restore-verification heartbeats. Nothing else
+  # in the bucket is writable by the box, and DeleteObject is not granted at all.
   backup_prefix = "postgres"
 }
 

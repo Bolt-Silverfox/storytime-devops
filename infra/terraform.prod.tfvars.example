@@ -36,8 +36,11 @@ redis_maxmemory_policy = "noeviction"
 use_managed_database = true
 db_instance_class    = "db.t4g.micro"
 
-# Required. Keep it out of this file: export TF_VAR_db_password='...'
-db_password = ""
+# Required — and deliberately NOT assigned here: a -var-file value outranks the
+# environment, so assigning "" would discard your export and fail the guard.
+#
+#   export TF_VAR_db_password='...'
+
 
 # The legacy shared instance, looked up READ-ONLY during the migration so its
 # endpoint appears in outputs. Terraform never modifies it. "" to skip.

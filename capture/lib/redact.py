@@ -198,17 +198,25 @@ def filter_env_keys(text: str) -> str:
 # platform. The structure is the valuable part, so keep it and mask every value.
 # ---------------------------------------------------------------------------
 
-# Keys inside pm2_env that are pm2's own bookkeeping, not app config, and are
-# safe (and useful) to keep verbatim.
+# Keys inside an environment container that are PM2's OWN BOOKKEEPING — not
+# application configuration — and are both safe and useful to keep verbatim.
+# `30-pm2/summary.txt` is built from exec_mode, instances, status, restart_time
+# and pm_cwd, so masking these would empty the most useful artefact in the capture.
+#
+# DELIBERATELY NOT LISTED: the inherited shell environment — PATH, PWD, HOME,
+# SHELL, USER, LOGNAME, LANG, TERM, SHLVL, NODE_APP_INSTANCE, PM2_HOME and `_`.
+# Those are environment variables, which is exactly the class this filter exists to
+# mask, and `_` in particular holds the last command line — which can be an invocation
+# carrying a token as an argument. They are now masked like anything else; only their
+# NAMES survive, which is all the capture needs.
 PM2_SAFE_KEYS = {
-    "name", "namespace", "version", "versioning", "exec_mode", "exec_interpreter",
+    "name", "namespace", "version", "exec_mode", "exec_interpreter",
     "instances", "pm_id", "pm_uptime", "created_at", "restart_time",
     "unstable_restarts", "status", "pm_cwd", "cwd", "pm_exec_path",
-    "pm_out_log_path", "pm_err_log_path", "pm_pid_path", "node_args",
+    "pm_out_log_path", "pm_err_log_path", "pm_pid_path",
     "max_memory_restart", "autorestart", "watch", "merge_logs", "vizion",
     "instance_var", "km_link", "unique_id", "windowsHide", "treekill",
-    "kill_retry_time", "NODE_APP_INSTANCE", "PM2_HOME", "PWD", "HOME", "SHELL",
-    "USER", "LOGNAME", "PATH", "LANG", "TERM", "SHLVL", "_",
+    "kill_retry_time",
 }
 
 # Any key that is (or namespaces) an environment map. PM2 ecosystem files use

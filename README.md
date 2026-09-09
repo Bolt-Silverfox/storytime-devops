@@ -22,7 +22,7 @@ docs/        current state, and the migration runbook
 | Path | Purpose |
 |---|---|
 | [`capture/`](capture/) | A **read-only** script that dumps the undocumented live state of a host into a timestamped directory. **Names only, never secret values.** Start here. |
-| [`infra/`](infra/) | The Terraform stack, modelled on the FateRound pattern: one EC2 per environment running containers from ECR, config in SSM, no SSH. |
+| [`infra/`](infra/) | The Terraform stack, modelled on the FateRound pattern: **one shared EC2 box initially** (dev + staging + prod on it, ~$24/mo), split into per-environment boxes later. Containers from ECR, config in SSM, no SSH. |
 | [`docs/current-state.md`](docs/current-state.md) | The verified inventory of the two live boxes: hosts, ports, the shared database, the Node version conflict, and what is in no repo at all. |
 | [`docs/migration.md`](docs/migration.md) | The ordered runbook for moving onto (or between) stacks — with commands, per-step checks, and the rollback. |
 
@@ -151,6 +151,9 @@ The full list, with the decisions each one is waiting on, is in
 - Conventional Commits: `feat:`, `fix:`, `refactor:`, `docs:`, `chore:`.
 - Branch prefixes: `feat/`, `fix/`, `refactor/`, `docs/`, `chore/`.
 - Default branch: `main`.
-- Secrets never enter this repository. Not in tfvars, not in a capture, not in a
-  vault file with a placeholder key. `secret_keys` (names) is committed;
-  `secret_values` is not.
+- **Secrets never enter a tracked file.** Not in a committed tfvars, not in a
+  capture, not in a vault file with a placeholder key. `secret_keys` (names only)
+  *is* committed; `secret_values` is not.
+  The two supported ways to supply values are a **gitignored**
+  `infra/terraform.<env>.tfvars` and `TF_VAR_` environment variables — both are
+  fine, and `guards.tf` rejects the plan if neither provides a value.
