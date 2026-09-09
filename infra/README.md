@@ -562,7 +562,6 @@ All of these fail at **plan** time, before anything is created:
 - **ACME behind a restricted origin** — `tls_mode = "acme"` requires
   `web_ingress_cidrs` to include `0.0.0.0/0`; Let's Encrypt validates from
   unannounced addresses, so an allowlist cannot be written for it.
-- **`associate_eip` with no instance** — an association with nothing to attach to.
 - **A secret name with no value** — an empty value would blank a live SSM parameter.
 - **`db_password` missing** — required for both database backends.
 
@@ -573,7 +572,12 @@ At apply/runtime:
   out-of-band rotation or an AWS auto-minor upgrade never becomes a diff an apply
   would "correct" against a live database.
 - **The backup bucket is not `force_destroy`** — `terraform destroy` cannot take the
-  backup history with it. The instance role has **no `s3:DeleteObject`**.
+  backup history with it. Note what that means in practice: while any object version
+  remains, S3 answers `DeleteBucket` with `BucketNotEmpty`, so a destroy **stops on
+  the bucket and reports an error** rather than quietly skipping it. That is the
+  intended guard; emptying the history is a separate, deliberate act
+  ([`docs/migration.md`](../docs/migration.md) step 9). The instance role has **no
+  `s3:DeleteObject`**.
 - **ECR is not `force_delete`** (FateRound's is) — a destroy there would take the
   images every environment is running.
 - **The Caddy binary is pinned and SHA-512 verified** against the digest committed in

@@ -69,9 +69,11 @@ accounts** (`aws ec2 enable-address-transfer` in the source account, then
 The address itself changes accounts, so the legacy IPs keep serving traffic
 throughout and no DNS record ever changes.
 
-**It has to be initiated by whoever controls the SOURCE account** — the one that
-owns `52.18.195.224` and `18.203.158.141`. **Identifying that account owner is an
-open action**, tracked in `infra/README.md` → Open decisions. Until someone can run
+**It has to be initiated by whoever controls the SOURCE account** — the one that owns
+the Elastic IPs the legacy hosts currently answer on (see
+[`current-state.md`](current-state.md); the addresses are deliberately not repeated in
+this public repository). **Identifying that account owner is an open action**, tracked
+in `infra/README.md` → Open decisions. Until someone can run
 `enable-address-transfer` there, plan for step 7A.
 
 
@@ -606,10 +608,28 @@ terraform plan -var-file=terraform.all-v2.tfvars   # expect: no changes
 Until that import, the address is real but unmanaged — which is survivable, and
 is still better than releasing it, but do not leave it that way.
 
-**The backup bucket is not `force_destroy`, so `destroy` leaves it and its
-contents behind.** That is intentional: emptying the backup history must be a
-separate, deliberate act, never a side effect. Delete it by hand, later, once you
-are certain — and prefer keeping it.
+**The backup bucket is not `force_destroy`, so the destroy will STOP on it.** While
+any object version or delete marker remains, S3 answers `DeleteBucket` with
+`BucketNotEmpty`, so Terraform reports an error and the bucket — with the backup
+history in it — survives. That is intentional, and it is the point: emptying the
+backup history must be a separate, deliberate act, never a side effect of a destroy.
+
+So expect a partial destroy, and read it as success rather than a fault. Everything
+else is gone; the bucket is not. If you genuinely want it gone, empty it by hand
+afterwards, deliberately, and prefer not to:
+
+```bash
+# Deletes EVERY version of EVERY object, including the entire backup history.
+# There is no undo. `scripts/purge-s3-object-versions.sh` is per-key on purpose and
+# will not do this for you.
+aws s3api list-object-versions --bucket "$BUCKET" \
+  --query '{Objects: Versions[].{Key:Key,VersionId:VersionId}}' > /tmp/vers.json
+# ...then delete-objects in batches of 1000, and repeat for DeleteMarkers, then:
+aws s3api delete-bucket --bucket "$BUCKET"
+```
+
+Better alternative for a stack you are decommissioning: leave the bucket, and let
+`backup_retention_days` expire the contents on its own schedule.
 
 Finally, rename the new workspace to the plain name if you want to (there is no
 `terraform workspace rename`; it means a state move, so most teams just keep

@@ -9,8 +9,27 @@ output "instance_id" {
 }
 
 output "instance_public_ip" {
-  description = "The Elastic IP this stack serves on, whether it allocated it or adopted an existing one. This is the address the Namecheap A records point at."
-  value       = local.eip_public_ip
+  description = <<-EOT
+    The Elastic IP THIS STACK ACTUALLY HOLDS — the address the Namecheap A records
+    point at.
+
+    NULL when associate_eip = false, which is deliberate: the allocation is then
+    either unattached or still held by the instance this stack is replacing, so
+    reporting it here would be wrong exactly when a pre-cutover verification pass
+    is relying on it. Use instance_direct_ip to reach the box in that state, and
+    eip_allocation_id to see which address is waiting to be moved.
+  EOT
+  value       = local.service_address
+}
+
+output "instance_direct_ip" {
+  description = "The instance's own auto-assigned public IPv4. This is how you verify a replacement stack BEFORE it takes the Elastic IP (associate_eip = false). Once the EIP is associated, AWS releases the auto-assigned address and this reports the Elastic IP instead."
+  value       = local.instance_direct_ip
+}
+
+output "eip_address" {
+  description = "The Elastic IP address this stack allocated or adopted, whether or not this stack currently holds it. Reported separately from instance_public_ip so a pre-cutover plan can show which address is about to move without claiming to serve it."
+  value       = local.eip_address
 }
 
 output "eip_allocation_id" {

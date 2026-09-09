@@ -232,15 +232,31 @@ resource "aws_eip_association" "app" {
 }
 
 locals {
+  # The address itself, regardless of who currently holds it. This is the lever's
+  # handle, so it is always reported: a cutover and a rollback both need it.
   eip_allocation_id = (
     var.eip_allocation_id != ""
     ? var.eip_allocation_id
     : try(aws_eip.app[0].id, null)
   )
 
-  eip_public_ip = (
+  eip_address = (
     var.eip_allocation_id != ""
     ? try(data.aws_eip.adopted[0].public_ip, null)
     : try(aws_eip.app[0].public_ip, null)
   )
+
+  # THIS STACK'S SERVICE ADDRESS — null unless this stack actually holds it.
+  #
+  # With associate_eip = false there is no association, and the allocation is
+  # either unattached (freshly created) or still attached to the PREVIOUS
+  # instance (adopted). Reporting it as this stack's address then would be a lie
+  # in the one situation where being wrong is expensive: a pre-cutover
+  # verification pass, where it would send someone to type an A record — or to
+  # curl a health check — against a box that is not this one.
+  service_address = var.associate_eip ? local.eip_address : null
+
+  # Where to reach a stack that has not taken the address yet: the auto-assigned
+  # public IPv4 the instance boots with.
+  instance_direct_ip = try(aws_instance.app[0].public_ip, null)
 }

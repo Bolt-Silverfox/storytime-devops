@@ -52,12 +52,21 @@ locals {
 
   # The rows a human types into Namecheap. Surfaced as an output so the manual
   # step is exact rather than remembered.
-  dns_records_required = [
-    for h in local.all_hostnames : {
-      type  = "A"
-      host  = h
-      value = local.eip_public_ip
-      ttl   = var.namecheap_dns_ttl
-    }
-  ]
+  #
+  # EMPTY while associate_eip = false. A stack that does not hold the address has
+  # no business telling anyone to point DNS at it — that is precisely the
+  # pre-cutover state, and printing a record there would aim live traffic at an
+  # unattached address or at the instance this one is replacing.
+  dns_records_required = (
+    local.service_address == null
+    ? []
+    : [
+      for h in local.all_hostnames : {
+        type  = "A"
+        host  = h
+        value = local.service_address
+        ttl   = var.namecheap_dns_ttl
+      }
+    ]
+  )
 }

@@ -159,10 +159,14 @@ or modified.
   Terraform resource for the A records and no DNS provider in the stack. The rows to
   type in come from `terraform output dns_records_required`. Cloudflare was
   considered and rejected. See [`infra/dns.tf`](infra/dns.tf).
-- **TLS is now single-point.** With no edge proxy, Caddy's Let's Encrypt certificate
-  is the only thing between the public internet and cleartext — a certificate failure
-  is an outage. What to check is in
-  [`infra/README.md` → When TLS breaks](infra/README.md#when-tls-breaks).
+- **TLS is now single-point.** With no edge proxy, whatever certificate Caddy holds is
+  the only thing between the public internet and cleartext, so a certificate failure is
+  an outage. Per mode: `tls_mode = "acme"` (the default) means Let's Encrypt issuance
+  and renewal on the box — recovery is
+  [`infra/README.md` → When TLS breaks](infra/README.md#when-tls-breaks);
+  `tls_mode = "static"` means **you** replace the certificate in SSM before it expires,
+  and nothing renews it for you; `tls_mode = "none"` means there is no certificate to
+  recover, and `guards.tf` refuses it for a prod-bearing stack.
 - **The log viewer** (`logs.py`, a CGI behind nginx + fcgiwrap). No service entry
   yet.
 - **CI workflows** to build and push images. Not written.
