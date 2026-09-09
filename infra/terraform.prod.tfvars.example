@@ -119,7 +119,7 @@ secret_values = {
 # unless allow_plaintext_origin says so explicitly. Children's personal data does
 # not travel in cleartext by omission.
 tls_mode               = "acme"
-acme_email             = "REPLACE_WITH_A_MONITORED_ALIAS"
+acme_email             = "" # <-- REQUIRED, e.g. "ops@storytimeapp.me" (a MONITORED alias)
 allow_plaintext_origin = false
 
 # The A records for the hostnames above must already point at this stack's

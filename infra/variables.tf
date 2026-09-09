@@ -222,9 +222,13 @@ variable "ecr_repository_prefix" {
 variable "manage_shared_ecr" {
   description = <<-EOT
     Create the ECR repositories. ECR repos are shared across environments so an
-    image is built ONCE and promoted dev -> staging -> prod by tag. Exactly one
-    workspace (the `shared` one) must set this true; every other workspace reads
-    the repos through a data source, so apply `shared` first.
+    image is built ONCE and promoted dev -> staging -> prod by tag.
+
+    EXACTLY ONE workspace may set this true — the `shared` one in a shared +
+    per-environment layout, or the `all` one in the default single-stack layout.
+    Every other workspace reads the repos through a data source, so the owning
+    workspace is applied first. Two owners means the second apply fails with
+    RepositoryAlreadyExistsException.
   EOT
   type        = bool
   default     = false
@@ -739,6 +743,17 @@ variable "acme_email" {
   EOT
   type        = string
   default     = ""
+
+  validation {
+    # Empty is allowed here and rejected by the guard in guards.tf only when
+    # tls_mode = "acme" — that keeps the "you must choose" failure in one place.
+    # What this catches is the OTHER failure: a non-empty PLACEHOLDER. The guard
+    # only tests for emptiness, so "REPLACE_WITH_A_MONITORED_ALIAS" used to pass
+    # the plan and fail later at Let's Encrypt account registration, by which
+    # point prod is serving no HTTPS at all. Fail at plan time instead.
+    condition     = var.acme_email == "" || can(regex("^[^@[:space:]]+@[^@[:space:]]+\\.[^@[:space:]]+$", var.acme_email))
+    error_message = "acme_email must be a valid email address, or empty. Placeholders are rejected here rather than at Let's Encrypt account registration."
+  }
 }
 
 variable "acme_ca_directory" {

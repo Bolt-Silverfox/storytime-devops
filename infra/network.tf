@@ -40,8 +40,10 @@ resource "aws_subnet" "public" {
   cidr_block        = cidrsubnet(var.vpc_cidr, 8, 0)
   availability_zone = data.aws_availability_zones.available.names[0]
 
-  # The instance gets a launch-time public IP (user-data needs egress before the
-  # EIP attaches); the EIP then provides the stable address.
+  # Subnet default is OFF: nothing gets a public IP merely by landing here. The
+  # app instance opts in individually via associate_public_ip_address = true in
+  # compute.tf, because user-data needs egress before the EIP attaches; the EIP
+  # then provides the stable address. Do not "simplify" by flipping this to true.
   map_public_ip_on_launch = false
 
   tags = { Name = "${local.prefix}-public" }

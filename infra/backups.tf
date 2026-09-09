@@ -11,9 +11,11 @@
 # TWO INDEPENDENT LAYERS, because they fail differently:
 #
 #   1. Nightly logical dump  — `pg_dump --format=custom` to the S3 bucket below.
-#      Survives losing the instance, the volume, the AZ and the region. Allows
-#      selective and parallel `pg_restore`. Vulnerable to a dump that succeeds
-#      while producing garbage, which is why restore verification exists.
+#      Survives losing the instance, the volume and the AZ. Allows selective and
+#      parallel `pg_restore`. Vulnerable to a dump that succeeds while producing
+#      garbage, which is why restore verification exists. NOT a defence against
+#      losing the REGION: the bucket below is single-region and this stack
+#      configures no cross-region replication. See README -> "Backups".
 #
 #   2. EBS snapshots via DLM  — block-level, whole-volume, taken by AWS with no
 #      cooperation from anything running on the box. Survives a corrupted or

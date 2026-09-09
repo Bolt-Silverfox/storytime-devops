@@ -261,10 +261,13 @@ aws s3api head-object --bucket "$NEW_BUCKET" --key postgres/restore-in/source.du
 
 > The instance role covers `postgres/*`, so `postgres/restore-in/` is readable by the
 > new box with no policy change. It is also inside the lifecycle rule's prefix, so a
-> forgotten copy does eventually expire — **but "eventually" is up to 7 days for a
-> plaintext dump of children's data, and the bucket is versioned, so it is not a
-> substitute for deleting it.** See the purge step at the end of this section, and do
-> not skip it.
+> forgotten copy does eventually expire — **but "eventually" is `backup_retention_days`
+> (30 by default), not 7.** The 7-day figure is `noncurrent_version_expiration`, which
+> only starts counting once the object has been made noncurrent by a delete or an
+> overwrite; a copy nobody touches stays the CURRENT version and lives the full
+> retention period. For a plaintext dump of children's data, on a versioned bucket,
+> that is not a substitute for deleting it. See the purge step at the end of this
+> section, and do not skip it.
 
 Then, on the new box:
 

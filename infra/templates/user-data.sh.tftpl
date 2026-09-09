@@ -305,6 +305,12 @@ fi
 # Local redis container. Published on LOOPBACK ONLY so it is never reachable off
 # the box, and appendonly so a container restart does not drop queued BullMQ jobs.
 # A box REPLACEMENT still loses them — that is the documented cost of this mode.
+#
+# --maxmemory is set to 80% of the cgroup limit and is NOT optional: Redis applies
+# --maxmemory-policy only when a ceiling exists, so without it the `noeviction`
+# contract in redis.tf is inert and the container is OOM-killed by the kernel
+# instead of Redis rejecting writes. The 20% headroom is for the copy-on-write
+# fork during an AOF rewrite, which is accounted against the same cgroup.
 docker volume inspect storytime-redis >/dev/null 2>&1 || docker volume create storytime-redis
 docker rm -f redis >/dev/null 2>&1 || true
 retry docker pull "${redis_image}"
@@ -314,7 +320,9 @@ docker run -d --name redis --network storytime --restart always \
   --memory "${redis_memory_mb}m" --memory-swap "${redis_memory_mb}m" \
   --log-driver json-file --log-opt max-size=20m --log-opt max-file=2 \
   "${redis_image}" \
-  redis-server --appendonly yes --maxmemory-policy ${redis_policy}
+  redis-server --appendonly yes \
+    --maxmemory ${floor(redis_memory_mb * 0.8)}mb \
+    --maxmemory-policy ${redis_policy}
 %{ else ~}
 # redis_mode = "${redis_mode}": no redis container on this box. The app reads its
 # connection string from SSM.

@@ -37,13 +37,32 @@
 # robin behind the proxy.
 # ---------------------------------------------------------------------------
 
+# The AMI architecture is DERIVED from instance_type, not hardcoded. locals.tf
+# offers Graviton sizes (t4g.*, m7g.*) in the RAM table and variables.tf requires
+# an arm64 Caddy checksum, so an arm64 instance_type has to actually work. With a
+# hardcoded x86_64 filter it passed every plan-time guard and then failed at
+# RunInstances with an architecture mismatch — the most expensive place to find out.
+#
+# AWS spells Graviton as a "g" in the family's capability letters (t4g, m7g, m7gd,
+# c6gn, x2gd); "a1" is the pre-naming-convention Graviton1 family, hence the
+# explicit case. Anything else — t3, m6i, m5, c5 — is x86_64.
+locals {
+  instance_family = split(".", var.instance_type)[0]
+
+  instance_arch = (
+    local.instance_family == "a1" || can(regex("^[a-z]+[0-9]+[a-z]*g", local.instance_family))
+    ? "arm64"
+    : "x86_64"
+  )
+}
+
 data "aws_ami" "al2023" {
   most_recent = true
   owners      = ["amazon"]
 
   filter {
     name   = "name"
-    values = ["al2023-ami-2023.*-x86_64"]
+    values = ["al2023-ami-2023.*-${local.instance_arch}"]
   }
 
   filter {

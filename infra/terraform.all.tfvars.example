@@ -175,6 +175,11 @@ restore_verify_min_tables   = 5
 # during the migration. Terraform never modifies it.
 shared_db_identifier = "" # e.g. the legacy shared RDS identifier, or "" to skip
 
+# The `all` stack owns the ECR repositories, because in this layout it is the only
+# stack there is. MUTUALLY EXCLUSIVE with the `shared` workspace, which sets the
+# same variable true in terraform.shared.tfvars.example: exactly one workspace may
+# create the repositories, and applying both makes the second fail with
+# RepositoryAlreadyExistsException. Pick the `all` layout OR `shared` + per-env.
 manage_shared_ecr = true
 # MUST STAY FALSE in account 772316781095: the FateRound stack already created
 # the token.actions.githubusercontent.com OIDC provider there, and AWS allows one

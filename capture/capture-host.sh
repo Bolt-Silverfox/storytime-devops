@@ -488,7 +488,15 @@ run 80-scheduled/systemd-enabled.txt bash -c 'systemctl list-unit-files --state=
 # follows reality rather than a guessed path layout.
 # =============================================================================
 if [ "$LIST_ONLY" = "1" ]; then
+  # Templates, not literals: the real paths depend on the pm2 working directories
+  # discovered at run time. Every probe below is listed, including the four
+  # per-app ones — --list-commands claims to print EVERY command, and an operator
+  # auditing that claim must see the ones that run git, cd and python3.
   echo "90-apps/env-keys/<app>.keys.txt              <each pm2 cwd>/.env* | redact.py env-keys"
+  echo "90-apps/env-keys/<app>.stat.txt              stat -c '%n mode=%A owner=%U:%G size=%s mtime=%y' <each .env file>"
+  echo "90-apps/<app>.git.txt                        cd <pm2 cwd> && git rev-parse --abbrev-ref HEAD; git log -1; git status --porcelain"
+  echo "90-apps/<app>.ecosystem.txt                  ls -l <pm2 cwd>/ecosystem*.js <pm2 cwd>/ecosystem*.cjs"
+  echo "90-apps/<app>.node-version.txt               cat <pm2 cwd>/.nvmrc; python3 -c 'json.load(package.json)[\"engines\"]'"
 else
   APP_DIRS=""
   if [ -f "$OUT/30-pm2/jlist.redacted.json" ] && have python3; then
