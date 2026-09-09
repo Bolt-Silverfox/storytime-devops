@@ -58,10 +58,23 @@ fi
 
 # Tracked files only → node_modules and build output are excluded for free, and
 # we inspect exactly what is (or is about to be) committed.
-if [ "$mode" = "staged" ]; then
-  mapfile -t files < <(git diff --cached --name-only --diff-filter=ACM)
-else
-  mapfile -t files < <(git ls-files)
+# NOTE: no `mapfile` — it is bash 4+, and stock macOS still ships bash 3.2, where
+# the hook would abort (and under `set -u` the later "${files[@]}" expansion of an
+# unset array aborts too). A plain read loop is portable.
+files=()
+while IFS= read -r _line; do
+  files+=("$_line")
+done < <(if [ "$mode" = "staged" ]; then
+           git diff --cached --name-only --diff-filter=ACM
+         else
+           git ls-files
+         fi)
+
+# Guard the empty case explicitly: on bash < 4.4, "${files[@]}" on an empty array
+# is an "unbound variable" error under `set -u`.
+if [ "${#files[@]}" -eq 0 ]; then
+  echo "scan-injection: clean — no $([ "$mode" = staged ] && echo 'staged' || echo 'tracked') files to scan."
+  exit 0
 fi
 
 # Text files worth scanning: code + config + data. Broad on purpose (no filename list).
@@ -118,10 +131,22 @@ is_binary_asset() {
   esac
 }
 
+# macOS has no sha256sum; it ships `shasum`. Without this the allowlist silently
+# never matches on a Mac, so a reviewed false positive keeps blocking commits.
+sha256_of() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" 2>/dev/null | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" 2>/dev/null | awk '{print $1}'
+  else
+    return 1
+  fi
+}
+
 is_allowed() {
   [ -f "$ALLOW_FILE" ] || return 1
   local h
-  h=$(sha256sum "$1" 2>/dev/null | awk '{print $1}')
+  h=$(sha256_of "$1") || return 1
   [ -n "$h" ] && grep -qE "^${h}[[:space:]]" "$ALLOW_FILE"
 }
 
@@ -137,11 +162,19 @@ for f in "${files[@]}"; do
   # malicious signature ON the long line. The worm's payload line is packed with
   # _0x… hex identifiers and =require(, so it is caught; a shadcn icon's long
   # SVG line is not. JSON/data is inert and excluded from this rule entirely.
-  if is_executable_code "$f" \
-     && awk -v m="$MAX_LINE" 'length($0) > m' "$f" \
-        | grep -qaE "_0x[0-9a-fA-F]{4,}|=[[:space:]]*require\(|String\.fromCharCode\(|eval\(|atob\(|Function\("; then
-    bad+="${f}: overlong obfuscated code line (blob payload)\n"
-    continue
+  # `grep -c`, NOT `grep -q`: with `pipefail`, grep -q closes the pipe on its
+  # first match, awk dies of SIGPIPE (141), and pipefail then makes the whole
+  # pipeline non-zero — so a REAL detection is silently discarded as a miss.
+  # Verified: on a large file with an early match the -q form returns 141.
+  # (Dropping just the -q does not help — GNU grep optimises `>/dev/null` the
+  # same way.) grep -c has to read every line to count, so it never early-exits.
+  if is_executable_code "$f"; then
+    long_hits=$(awk -v m="$MAX_LINE" 'length($0) > m' "$f" \
+      | grep -caE "_0x[0-9a-fA-F]{4,}|=[[:space:]]*require\(|String\.fromCharCode\(|eval\(|atob\(|Function\(" || true)
+    if [ "${long_hits:-0}" -gt 0 ]; then
+      bad+="${f}: overlong obfuscated code line (blob payload)\n"
+      continue
+    fi
   fi
 
   # (2) Require-hijack / char-code obfuscation hallmarks anywhere (line length

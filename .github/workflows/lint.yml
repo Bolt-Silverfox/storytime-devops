@@ -52,12 +52,19 @@ jobs:
           #    not be edited here (that would fail the malware-scan drift guard),
           #    so linting it here could only produce findings that are
           #    unfixable-in-this-repo. It is linted at its source instead.
+          # Extension globs alone miss shell scripts with no extension, e.g.
+          # .githooks/pre-commit. Select by extension OR by shell shebang, so a
+          # hook added later is covered automatically instead of silently skipped.
           files=()
           while IFS= read -r f; do
             [ -s "$f" ] || continue
             [ "$f" = "scripts/scan-injection.sh" ] && continue
+            case "$f" in
+              *.sh|*.bash) ;;
+              *) head -n 1 -- "$f" | grep -Eq '^#!.*[ /](ba|da|k)?sh([[:space:]]|$)' || continue ;;
+            esac
             files+=("$f")
-          done < <(git ls-files '*.sh' '*.bash')
+          done < <(git ls-files)
           if [ "${#files[@]}" -eq 0 ]; then
             echo "No shell scripts tracked — nothing to check."
             exit 0
