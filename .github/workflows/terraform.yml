@@ -41,7 +41,16 @@ jobs:
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
         with:
-          terraform_version: 1.9.8
+          # MUST satisfy infra/versions.tf `required_version`, which the pending
+          # Terraform restructure sets to ">= 1.11.0". Verified rather than
+          # assumed: with the previous 1.9.8 pin, `terraform init` on that tree
+          # fails with "Unsupported Terraform Core version ... does not support
+          # Terraform version 1.9.8", so this gate would have gone red the moment
+          # the restructure merged — while staying green on its own branch, where
+          # the only tracked Terraform is the placeholder that has no constraint.
+          # 1.16.1 validates both trees (placeholder and real stack) and keeps
+          # tflint clean on the real stack.
+          terraform_version: 1.16.1
           # No cloud/Terraform Cloud token wrapper — this gate needs no credentials.
           terraform_wrapper: false
 
