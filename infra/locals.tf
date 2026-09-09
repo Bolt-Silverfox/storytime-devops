@@ -92,6 +92,20 @@ locals {
     } if length(svc.hostnames) > 0
   ]
 
+  # Host ports, UNDEDUPED, so guards.tf can detect an overlap between services.
+  # A collision is invisible in services[*].host_port alone: replicas occupy
+  # CONSECUTIVE ports from their service's host_port, so { a: 3000, replicas 3 }
+  # and { b: 3001 } both claim 3001. Docker then refuses to bind the second
+  # container, user-data runs once under `set -euo pipefail`, and the bootstrap
+  # dies leaving a box with no containers — the same failure mode guards.tf
+  # already prevents for duplicate hostnames.
+  declared_host_ports = [for c in local.containers : c.host_port]
+
+  duplicate_host_ports = distinct([
+    for p in local.declared_host_ports : p
+    if length([for x in local.declared_host_ports : x if x == p]) > 1
+  ])
+
   # All hostnames this stack answers for, deduped, for DNS records.
   all_hostnames = distinct(flatten([for r in local.routes : r.hostnames]))
 

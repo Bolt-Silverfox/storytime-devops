@@ -253,7 +253,7 @@ def _mask_scalar(value):
     return "<set>"
 
 
-def _mask_env_value(node):
+def _mask_env_value(node, preserve_pm2_metadata: bool = False):
     """Mask a value found INSIDE an environment container.
 
     Fail-closed: every nested structure is masked too, rather than recursed into
@@ -261,17 +261,28 @@ def _mask_env_value(node):
     definition, and `versioning` / `axm_options` style sub-objects can embed a
     token in a repository URL. Keys are always preserved — the NAMES are the
     entire point of the capture; only values are replaced.
+
+    PM2_SAFE_KEYS is honoured ONLY at the top level of `pm2_env`, which is where
+    PM2's own bookkeeping actually lives. Applying it at every depth leaked real
+    configuration whenever an application happened to reuse one of those names:
+    `"env_production": {"name": "..."}` emitted its value verbatim, because `name`
+    is allowlisted. Nested env maps are pure application config, so nothing in
+    them is exempt.
     """
     if isinstance(node, dict):
-        return {k: (v if k in PM2_SAFE_KEYS and not isinstance(v, (dict, list)) else _mask_env_value(v))
-                for k, v in node.items()}
+        return {
+            k: (
+                v
+                if preserve_pm2_metadata
+                and k in PM2_SAFE_KEYS
+                and not isinstance(v, (dict, list))
+                else _mask_env_value(v)
+            )
+            for k, v in node.items()
+        }
     if isinstance(node, list):
         return [_mask_env_value(v) for v in node]
     return _mask_scalar(node)
-
-
-def _mask_env_dict(d: dict) -> dict:
-    return _mask_env_value(d)
 
 
 def _walk(node):
@@ -279,7 +290,10 @@ def _walk(node):
         out = {}
         for k, v in node.items():
             if ENV_CONTAINER_RE.match(k) and isinstance(v, (dict, list)):
-                out[k] = _mask_env_value(v)
+                # Only the process's own pm2_env/env map carries PM2 bookkeeping
+                # worth keeping (exec_mode, status, pm_cwd — 30-pm2/summary.txt is
+                # built from them). Anything nested below it is application config.
+                out[k] = _mask_env_value(v, preserve_pm2_metadata=True)
             elif ENV_CONTAINER_RE.match(k):
                 # An env key holding a scalar: mask it rather than pass it through.
                 out[k] = _mask_scalar(v)

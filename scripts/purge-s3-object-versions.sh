@@ -52,11 +52,44 @@ esac
 
 # --prefix narrows the listing server-side; the Key=='...' filter is what makes it
 # exact, so a sibling object whose name merely starts with $KEY is never touched.
+#
+# The filtering is `sed`, NOT `grep -v ... || true`. grep exits 1 when it filters
+# every line away, which is the ordinary "no versions left" case — hence the
+# `|| true`. But that `|| true` also swallowed a FAILURE of the aws call itself
+# (AccessDenied, no credentials, throttling): the listing came back empty, the
+# loop concluded there was nothing to delete, the verification below listed
+# nothing either, and the script printed "purge ok" while a plaintext dump of
+# children's personal data was still fully recoverable. That is the exact failure
+# this script exists to prevent, so an empty result and a failed lookup must be
+# distinguishable. sed exits 0 on empty input, so no suppression is needed and
+# pipefail can propagate a real failure.
 list_ids() { # $1 = Versions | DeleteMarkers
   aws s3api list-object-versions \
     --bucket "$BUCKET" --prefix "$KEY" \
     --query "$1[?Key=='$KEY'].VersionId" \
-    --output text | tr '\t' '\n' | grep -v -e '^None$' -e '^$' || true
+    --output text | tr '\t' '\n' | sed -e '/^None$/d' -e '/^$/d'
+}
+
+# list_ids into a variable, distinguishing "empty" from "could not look".
+# Returns 0 with the ids on stdout, or 1 if the listing failed.
+list_ids_checked() {
+  local out
+  if ! out=$(list_ids "$1"); then
+    return 1
+  fi
+  # Only emit a trailing newline when there is something to emit, so `wc -l`
+  # counts a single id as 1 and an empty result as 0. `printf '%s'` alone would
+  # report one id as 0 lines and make the verification below claim the object was
+  # gone — the same false "purge ok" this change exists to remove.
+  [ -n "$out" ] && printf '%s\n' "$out"
+  return 0
+}
+
+# Count, propagating a listing failure instead of reporting zero.
+count_ids() {
+  local out
+  out=$(list_ids_checked "$1") || return 1
+  printf '%s' "$out" | grep -c . || true
 }
 
 deleted=0
@@ -70,8 +103,14 @@ purged_all=false
 # value of this script is the verification report at the end, and dying on the
 # first AccessDenied would skip it and leave the operator guessing whether the
 # dump is gone. Failures are counted and surfaced there instead.
+listing_failed=false
 for _attempt in $(seq 1 20); do
-  ids=$( (list_ids Versions; list_ids DeleteMarkers) | sort -u)
+  if ! vers=$(list_ids_checked Versions) || ! marks=$(list_ids_checked DeleteMarkers); then
+    echo "WARN: could not list object versions (permissions? credentials? throttling?)" >&2
+    listing_failed=true
+    break
+  fi
+  ids=$(printf '%s\n%s\n' "$vers" "$marks" | sed -e '/^$/d' | sort -u)
   if [ -z "$ids" ]; then
     purged_all=true
     break
@@ -96,10 +135,17 @@ done
 
 # VERIFY, INDEPENDENTLY. Not optional: the whole point is that the previous
 # procedure trusted a command which had deleted nothing.
-remaining_versions=$(list_ids Versions | wc -l | tr -d ' ')
-remaining_markers=$(list_ids DeleteMarkers | wc -l | tr -d ' ')
+# A failure to VERIFY is itself a failure: report it, never treat it as zero.
+verify_failed=false
+if ! remaining_versions=$(count_ids Versions); then
+  verify_failed=true; remaining_versions="unknown"
+fi
+if ! remaining_markers=$(count_ids DeleteMarkers); then
+  verify_failed=true; remaining_markers="unknown"
+fi
 
-if [ "$purged_all" != "true" ] || [ "$remaining_versions" != "0" ] || [ "$remaining_markers" != "0" ]; then
+if [ "$listing_failed" = "true" ] || [ "$verify_failed" = "true" ] \
+   || [ "$purged_all" != "true" ] || [ "$remaining_versions" != "0" ] || [ "$remaining_markers" != "0" ]; then
   echo "FATAL: purge INCOMPLETE for s3://$BUCKET/$KEY" >&2
   echo "  versions left:       $remaining_versions" >&2
   echo "  delete markers left: $remaining_markers" >&2

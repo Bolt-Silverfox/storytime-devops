@@ -114,12 +114,19 @@ while IFS=$'\t' read -r host want; do
     got="${got% }"
     cname=$(printf '%s\n' "$raw" | grep -E '\.$' | head -1)
 
+    # A CNAME is drift even when it happens to resolve to the right address.
+    # dig returns the CNAME AND the address it resolves to, so testing $got first
+    # would silently accept a zone where the expected A record has been replaced
+    # by a CNAME — which is a different record than Terraform declares, breaks the
+    # EIP-remap cutover model (the address stops being the lever), and cannot even
+    # be expressed at a zone apex.
+    if [ -n "$cname" ]; then
+      drift+="  $host via $resolver: expected A $want, found CNAME -> $cname${got:+ (currently resolving to $got)}"$'\n'
+      continue
+    fi
+
     if [ -z "$got" ]; then
-      if [ -n "$cname" ]; then
-        drift+="  $host via $resolver: expected A $want, found only CNAME -> $cname"$'\n'
-      else
-        drift+="  $host via $resolver: expected A $want, resolved to NOTHING (record missing or NXDOMAIN)"$'\n'
-      fi
+      drift+="  $host via $resolver: expected A $want, resolved to NOTHING (record missing or NXDOMAIN)"$'\n'
       continue
     fi
 

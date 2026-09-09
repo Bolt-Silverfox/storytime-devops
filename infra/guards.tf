@@ -109,6 +109,15 @@ resource "terraform_data" "guards" {
     }
 
     precondition {
+      # Replicas take consecutive host ports, so two services whose ranges overlap
+      # claim the same port. Docker refuses the second bind, and because user-data
+      # runs once under `set -euo pipefail` the bootstrap dies with no containers
+      # started. Caught in the plan, exactly like the duplicate-hostname case.
+      condition     = length(local.duplicate_host_ports) == 0
+      error_message = "Host port collision across services: ${join(", ", [for p in local.duplicate_host_ports : tostring(p)])}. Replicas occupy CONSECUTIVE host ports starting at services[*].host_port, so the ranges must not overlap."
+    }
+
+    precondition {
       # PORT is applied as a DEFAULT in the container (it no longer overrides SSM),
       # so a config_plain PORT that disagrees with container_port would leave the
       # app listening somewhere the reverse proxy is not pointing.

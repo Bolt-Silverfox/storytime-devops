@@ -101,8 +101,19 @@ warn() {
 # which shreds the contents. `shred` when available (it overwrites before
 # unlinking), `rm -rf` otherwise.
 # ---------------------------------------------------------------------------
-SCRATCH=$(mktemp -d "${TMPDIR:-/tmp}/storytime-capture.XXXXXX")
-chmod 700 "$SCRATCH"
+# Fail CLOSED. `set -e` is deliberately off (probes are expected to fail), so a
+# failing mktemp would otherwise leave SCRATCH empty and every later
+# "$SCRATCH/raw.XXXXXX" would resolve to "/raw.XXXXXX" — raw, unredacted probe
+# output written outside the directory the trap shreds, as root. Refuse to start.
+if ! SCRATCH=$(mktemp -d "${TMPDIR:-/tmp}/storytime-capture.XXXXXX") || [ -z "$SCRATCH" ] || [ ! -d "$SCRATCH" ]; then
+  echo "FATAL: could not create a private scratch directory; refusing to run probes that hold raw secrets." >&2
+  exit 1
+fi
+if ! chmod 700 "$SCRATCH"; then
+  rm -rf "$SCRATCH"
+  echo "FATAL: could not restrict permissions on $SCRATCH; refusing to run probes that hold raw secrets." >&2
+  exit 1
+fi
 
 scrub_scratch() {
   [ -d "$SCRATCH" ] || return 0
@@ -432,16 +443,34 @@ if have redis-cli; then
       echo
     done'
 
-  # Key-prefix histogram: shows which environments share this instance, without
-  # printing key names (which embed user and kid identifiers).
+  # Key-prefix histogram: shows which environments and subsystems share this
+  # instance. It must NOT print identifiers, and printing the first TWO segments
+  # did: `session:<userId>` and `kid:<kidId>` are two-segment keys, so the second
+  # segment WAS the identifier, and an unsegmented key was printed whole — which
+  # is the opposite of what the old comment here claimed.
+  #
+  # So: FIRST segment only, and only when it looks like a deliberate static
+  # namespace (a short lowercase-ish word). Anything else — a bare id used as a
+  # key, a uuid, a hash — is counted under <opaque> rather than shown. That keeps
+  # the signal this artefact exists for ("which apps/environments share this
+  # Redis") while emitting no user or kid identifier at all.
+  #
+  # NOTE this deviates from the review suggestion of an explicit static-prefix
+  # allowlist: the whole point of a capture is discovering an unknown legacy host,
+  # so its namespaces are not knowable in advance. A shape test generalises;
+  # a fixed list would bucket every real prefix as unknown.
   run 60-redis/key-prefix-histogram.txt bash -c '
     dbcount=$(redis-cli config get databases 2>/dev/null | tail -1); dbcount=${dbcount:-16}
     for db in $(seq 0 $((dbcount - 1))); do
       keys=$(redis-cli -n "$db" dbsize 2>/dev/null)
       [ "${keys:-0}" = "0" ] && continue
-      echo "=== logical DB $db (dbsize=$keys) — first two path segments only ==="
+      echo "=== logical DB $db (dbsize=$keys) — first segment only, non-namespace keys as <opaque> ==="
       redis-cli -n "$db" --scan --count 500 2>/dev/null \
-        | awk -F: "{ if (NF>=2) print \$1\":\"\$2; else print \$1 }" \
+        | awk -F: "{
+            seg = \$1
+            if (seg ~ /^[A-Za-z][A-Za-z_-]{0,23}$/) print seg
+            else print \"<opaque>\"
+          }" \
         | sort | uniq -c | sort -rn | head -25
       echo
     done'

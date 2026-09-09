@@ -95,8 +95,17 @@ resource "aws_elasticache_replication_group" "main" {
 
 locals {
   # Where the app should point. With redis_mode = "container" the redis container
-  # shares the host network namespace via a published port on loopback, so the
-  # app containers reach it at 127.0.0.1:6379.
+  # joins the SAME user-defined bridge network (`storytime`) as every app
+  # container, so apps reach it by container name at redis:6379 — exactly the
+  # mechanism already used for Postgres, where ssm-config.tf sets _db/HOST to
+  # "postgres".
+  #
+  # NOT 127.0.0.1: user-data starts redis with `--network storytime -p
+  # 127.0.0.1:6379:6379`, and it does NOT share the host network namespace. That
+  # published port serves clients on the HOST only; inside an app container
+  # 127.0.0.1 is that container's own loopback, so redis://127.0.0.1:6379 cannot
+  # connect. Since this value is surfaced for the operator to copy into REDIS_URL,
+  # the old string pointed every BullMQ queue and the cache at a dead endpoint.
   #
   # NOTE: this is surfaced as an OUTPUT for the operator to place into
   # config_plain/secret_values. It is deliberately not injected automatically:
@@ -105,6 +114,6 @@ locals {
   redis_endpoint = (
     var.redis_mode == "elasticache" && var.create_instance
     ? try("rediss://${aws_elasticache_replication_group.main[0].primary_endpoint_address}:6379", "")
-    : var.redis_mode == "container" ? "redis://127.0.0.1:6379" : ""
+    : var.redis_mode == "container" ? "redis://redis:6379" : ""
   )
 }

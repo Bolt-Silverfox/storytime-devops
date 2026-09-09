@@ -290,6 +290,14 @@ trap cleanup EXIT INT TERM HUP
 DB_USER=$(aws ssm get-parameter --name "/$STACK/_db/USERNAME" --query 'Parameter.Value' --output text)
 DB_NAME=$(aws ssm get-parameter --name "/$STACK/_db/NAME"     --query 'Parameter.Value' --output text)
 
+# Stop every database CLIENT first. `pg_restore --clean` DROPs objects, and the
+# app containers started earlier (plus their BullMQ workers) reconnect and write
+# continuously — so a live restore either fails on dependent locks or half-applies
+# and leaves a mixed database. Postgres itself must stay up: it is the restore
+# target. Only the app containers stop.
+APPS=$(docker ps --format '{{.Names}}' | grep -v -E '^(postgres|redis)$' || true)
+[ -n "$APPS" ] && docker stop $APPS
+
 # Newest dump. Keys are date-ordered, so lexicographic == chronological.
 KEY=$(aws s3 ls "s3://$BUCKET/postgres/$STACK/" --recursive | awk '{print $4}' \
         | grep '\.dump$' | sort | tail -1)
@@ -303,6 +311,9 @@ docker exec postgres pg_restore \
   --username="$DB_USER" --dbname="$DB_NAME" \
   --clean --if-exists --no-owner --no-privileges --jobs 2 \
   /tmp/restore.dump
+
+# Restart the apps only now that the restore and its row counts have been checked.
+[ -n "${APPS:-}" ] && docker start $APPS
 ```
 
 Errors about roles or extensions are normal with `--no-owner --no-privileges`.

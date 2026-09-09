@@ -474,7 +474,20 @@ systemctl enable storytime-reconcile.service
 # because if the box is gone you cannot read its journal. `systemctl status` and
 # an `OnFailure` unit cover the case where the box is alive.
 # ===========================================================================
-retry dnf install -y postgresql16 || retry dnf install -y postgresql15 || retry dnf install -y postgresql
+# No older-client fallback. The server is Postgres 16 in BOTH backends
+# (postgres_image defaults to postgres:16.4-alpine, db_engine_version to 16.4),
+# and a client's major version must be >= the server's: pg_dump refuses a newer
+# server outright, and pg_restore cannot read a newer custom-format archive. So a
+# postgresql15 fallback would not degrade gracefully — it would fail EVERY
+# nightly backup, and in container mode it would fail inside `pg_restore --list`
+# and report "truncated or corrupt", naming the wrong cause entirely. Fail here
+# instead, at bootstrap, where the reason is visible.
+# (If the server major version ever becomes a variable, derive this package name
+# from it rather than pinning 16 here.)
+retry dnf install -y postgresql16 || {
+  echo "FATAL: could not install the postgresql16 client. An older pg_dump/pg_restore cannot back up or read a Postgres 16 server, so every backup would fail." >&2
+  exit 1
+}
 
 cat > /usr/local/bin/pg-backup.sh <<'PGBACKUP'
 #!/usr/bin/env bash
