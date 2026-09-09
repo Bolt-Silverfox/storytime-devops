@@ -496,7 +496,7 @@ if [ "$LIST_ONLY" = "1" ]; then
   echo "90-apps/env-keys/<app>.stat.txt              stat -c '%n mode=%A owner=%U:%G size=%s mtime=%y' <each .env file>"
   echo "90-apps/<app>.git.txt                        cd <pm2 cwd> && git rev-parse --abbrev-ref HEAD; git log -1; git status --porcelain"
   echo "90-apps/<app>.ecosystem.txt                  ls -l <pm2 cwd>/ecosystem*.js <pm2 cwd>/ecosystem*.cjs"
-  echo "90-apps/<app>.node-version.txt               cat <pm2 cwd>/.nvmrc; python3 -c 'json.load(package.json)[\"engines\"]'"
+  echo "90-apps/<app>.node-version.txt               cat <pm2 cwd>/.nvmrc; python3 -c \"import json;print(json.load(open('<pm2 cwd>/package.json')).get('engines'))\""
 else
   APP_DIRS=""
   if [ -f "$OUT/30-pm2/jlist.redacted.json" ] && have python3; then

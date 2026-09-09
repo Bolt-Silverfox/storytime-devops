@@ -617,19 +617,50 @@ any object version or delete marker remains, S3 answers `DeleteBucket` with
 history in it — survives. That is intentional, and it is the point: emptying the
 backup history must be a separate, deliberate act, never a side effect of a destroy.
 
-So expect a partial destroy, and read it as success rather than a fault. Everything
-else is gone; the bucket is not. If you genuinely want it gone, empty it by hand
-afterwards, deliberately, and prefer not to:
+So expect a partial destroy — but **do not read "it errored" as "only the bucket is
+left"**. Terraform stops scheduling new work when a deletion fails, so an unrelated
+failure (a security group still in use, a dependency violation) produces the same
+red output while leaving real infrastructure running — an instance that still holds
+children's personal data, still costing money, that you now believe is gone. Verify
+before you believe it:
 
 ```bash
-# Deletes EVERY version of EVERY object, including the entire backup history.
-# There is no undo. `scripts/purge-s3-object-versions.sh` is per-key on purpose and
-# will not do this for you.
-aws s3api list-object-versions --bucket "$BUCKET" \
-  --query '{Objects: Versions[].{Key:Key,VersionId:VersionId}}' > /tmp/vers.json
-# ...then delete-objects in batches of 1000, and repeat for DeleteMarkers, then:
-aws s3api delete-bucket --bucket "$BUCKET"
+# 1. The ONLY error must be BucketNotEmpty on the backup bucket.
+terraform destroy -var-file=terraform.all.tfvars 2>&1 | tee /tmp/destroy.log
+grep -E 'Error:' /tmp/destroy.log        # expect exactly one, and expect BucketNotEmpty
+
+# 2. State must contain nothing but the bucket (and whatever it needs).
+terraform state list
 ```
+
+If `terraform state list` still shows an instance, a VPC or a database, the destroy
+did NOT complete: fix the reported error and run it again until the bucket is the
+only thing left. Decommissioning is finished when step 2 is true, not when step 1
+goes red.
+
+If you genuinely want the bucket gone too, empty it by hand afterward, deliberately.
+This is **deliberately not provided as a runnable block**: it deletes the entire
+backup history irreversibly, and `scripts/purge-s3-object-versions.sh` is per-key on
+purpose precisely so that no script in this repo can do it for you. The outline —
+which you must implement, and test on a throwaway bucket first — is:
+
+1. `aws s3api list-object-versions --bucket "$BUCKET"` and page through the results
+   (`--max-keys` / `NextKeyMarker` / `NextVersionIdMarker`; a bucket with a real
+   backup history will not fit in one response).
+2. `aws s3api delete-objects` in batches of **at most 1000**, for `Versions[]`.
+3. Repeat both steps for `DeleteMarkers[]` — a bucket with markers left is still
+   not empty, which is the usual reason `delete-bucket` keeps failing.
+4. Confirm BOTH collections are empty before going further:
+
+   ```bash
+   # JMESPath has no arithmetic operators, so ask for the two counts as a list
+   # rather than trying to add them in --query.
+   aws s3api list-object-versions --bucket "$BUCKET" \
+     --query '[length(Versions[] || `[]`), length(DeleteMarkers[] || `[]`)]'
+   # must print [0, 0] — a non-zero SECOND element is the delete-marker case
+   ```
+
+5. Only then: `aws s3api delete-bucket --bucket "$BUCKET"`.
 
 Better alternative for a stack you are decommissioning: leave the bucket, and let
 `backup_retention_days` expire the contents on its own schedule.
