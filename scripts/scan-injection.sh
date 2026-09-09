@@ -224,6 +224,23 @@ for f in "${files[@]}"; do
     *) continue ;;
   esac
 
+  # Escape-obfuscation guard, and it must come FIRST. JSON property names and
+  # string values may carry \uXXXX escapes, and VS Code decodes them before use:
+  # {"runOptions":{"run\u004fn":"folder\u004fpen"}} is a live folderOpen task
+  # that no literal grep below can see. In JSON the ONLY way to write an ASCII
+  # alphanumeric other than literally is \uXXXX, so rejecting \u in these files
+  # closes the entire evasion class without needing a JSONC parser (which this
+  # script cannot assume — it also runs as a pre-commit hook). Legitimate VS Code
+  # config has no reason to \u-escape ASCII; note this does NOT match "\\" , so
+  # Windows paths like "C:\\tools" are unaffected.
+  if grep -qE '\\u[0-9a-fA-F]{4}' "$f"; then
+    # NOTE: findings are emitted with printf '%b', so the message must not
+    # contain a literal backslash-u — printf would try to expand it as a unicode
+    # escape and warn "missing unicode digit". Spell it out in words instead.
+    bad+="${f}: JSON unicode escape (backslash-u) in a VS Code config — unescape it so it can be reviewed literally (escapes can hide runOn/folderOpen from this scan)\n"
+    continue
+  fi
+
   if grep -qE '"runOn"[[:space:]]*:[[:space:]]*"folderOpen"' "$f"; then
     detail="auto-running task (runOn: folderOpen)"
     if grep -qE '"hide"[[:space:]]*:[[:space:]]*true' "$f"; then
