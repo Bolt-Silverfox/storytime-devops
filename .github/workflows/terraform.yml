@@ -1,0 +1,122 @@
+name: terraform
+
+# Read-only Terraform gate: formatting, config validity, and lint.
+#
+# STRICTLY READ-ONLY, ON PURPOSE. It never runs `terraform apply`, never runs
+# `terraform plan` against real state, and requests no cloud credentials — a
+# pull_request-triggered workflow runs the PR author's code, so anything that
+# writes or deploys from a PR is a remote-code-execution path into the
+# environment. (storytime-logging's deploy.yml rsyncs any PR's code to a live
+# box; that is the hole this must not reproduce.) `init` runs with
+# -backend=false so no remote state is ever touched or configured.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # A re-run on the same ref should supersede the older run; these jobs are
+  # read-only so cancelling one cannot leave anything half-applied.
+  group: terraform-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  terraform:
+    name: fmt + validate + tflint
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: 1.9.8
+          # No cloud/Terraform Cloud token wrapper — this gate needs no credentials.
+          terraform_wrapper: false
+
+      - name: terraform fmt -check
+        run: |
+          set -uo pipefail
+          if ! terraform fmt -check -recursive -no-color .; then
+            echo "::error::Terraform files are not canonically formatted. Run 'terraform fmt -recursive .' and commit the result."
+            exit 1
+          fi
+          echo "Formatting OK."
+
+      - name: terraform validate
+        run: |
+          set -uo pipefail
+          # Discover root modules instead of hardcoding a path. The Terraform in
+          # this repo is being restructured (infra/terraform -> infra), so a
+          # hardcoded directory would silently validate nothing after the move.
+          # Any directory holding at least one .tf file is validated.
+          mapfile -t dirs < <(git ls-files '*.tf' | xargs -r -n1 dirname | sort -u)
+          if [ "${#dirs[@]}" -eq 0 ]; then
+            echo "::error::No .tf files tracked in this repo — this gate would validate nothing. Remove it or fix the discovery."
+            exit 1
+          fi
+          rc=0
+          for d in "${dirs[@]}"; do
+            echo "--- $d ---"
+            # -backend=false: never configure or contact remote state.
+            if ! terraform -chdir="$d" init -backend=false -input=false -no-color; then
+              echo "::error file=$d::terraform init failed"
+              rc=1
+              continue
+            fi
+            if ! terraform -chdir="$d" validate -no-color; then
+              echo "::error file=$d::terraform validate failed"
+              rc=1
+            fi
+          done
+          exit "$rc"
+
+      - name: Setup tflint
+        uses: terraform-linters/setup-tflint@1cf010d3c7aef302051ccdb68c14c5dc2efa34ef # v6.3.1
+        with:
+          tflint_version: v0.53.0
+
+      # ADVISORY (non-blocking) FOR NOW — flip to blocking once the Terraform
+      # restructure lands. Reason, verified by running tflint 0.53.0 on both
+      # trees rather than assuming:
+      #   * on main today, the only tracked Terraform is the placeholder
+      #     infra/terraform/main.tf — a single comment line left behind by
+      #     devops_structure.sh. tflint correctly reports
+      #     terraform_required_version on it, so a blocking gate would be red
+      #     from the moment it merges, for a file nobody intends to keep.
+      #   * that placeholder is deleted by the pending infra restructure, whose
+      #     real stack (infra/*.tf) already passes tflint with ZERO issues.
+      # Fixing the placeholder here instead would mean editing a file that the
+      # restructure deletes — a modify/delete conflict — so it is deliberately
+      # left alone. fmt and validate above stay BLOCKING and are green on both
+      # trees; only this step is advisory, and only until the placeholder goes.
+      - name: tflint (advisory)
+        run: |
+          set -uo pipefail
+          mapfile -t dirs < <(git ls-files '*.tf' | xargs -r -n1 dirname | sort -u)
+          rc=0
+          for d in "${dirs[@]}"; do
+            echo "--- $d ---"
+            tflint --chdir="$d" --no-color || rc=1
+          done
+          if [ "$rc" -ne 0 ]; then
+            echo "::warning::tflint reported issues (advisory — see the step log). This step is intentionally non-blocking until the Terraform restructure removes the infra/terraform placeholder; make it blocking then."
+            {
+              echo "### tflint: issues reported (advisory)"
+              echo "Non-blocking for now — see the comment in .github/workflows/terraform.yml."
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "tflint clean."
+          fi
+          exit 0
