@@ -1,0 +1,105 @@
+name: lint
+
+# shellcheck + actionlint. This repo is shell, Terraform, Python and Markdown,
+# so these are the gates that actually apply — see the PR description for what
+# was deliberately NOT ported from storytime_be (all of it Node-shaped).
+#
+# Read-only: no credentials, no writes, nothing deployed.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lint-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  shellcheck:
+    name: shellcheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: shellcheck
+        run: |
+          set -uo pipefail
+          # The ShellCheck binary is preinstalled on ubuntu-latest runners, so
+          # there is no third-party action to pin or trust here.
+          # (Do not start a comment in a run: block with the lowercase tool name
+          # followed by a space — ShellCheck parses that as a directive and
+          # errors with SC1072/SC1073, which actionlint surfaces as a failure.)
+          shellcheck --version
+          # Selection notes:
+          #  * *.tftpl is Terraform-templated shell: its interpolations are not
+          #    valid shell, so shellcheck cannot parse it and would only emit noise.
+          #  * empty placeholder scripts are skipped — a 0-byte file has no shell
+          #    to check, and shellcheck reports SC2148 (no shebang) on it.
+          #  * scripts/scan-injection.sh is EXCLUDED because it is a vendored,
+          #    byte-for-byte copy of the canonical detector in
+          #    Bolt-Silverfox/storytime-ci, locked by SCAN_SCRIPT_SHA256. It must
+          #    not be edited here (that would fail the malware-scan drift guard),
+          #    so linting it here could only produce findings that are
+          #    unfixable-in-this-repo. It is linted at its source instead.
+          # Extension globs alone miss shell scripts with no extension, e.g.
+          # .githooks/pre-commit. Select by extension OR by shell shebang, so a
+          # hook added later is covered automatically instead of silently skipped.
+          files=()
+          while IFS= read -r f; do
+            [ -s "$f" ] || continue
+            [ "$f" = "scripts/scan-injection.sh" ] && continue
+            case "$f" in
+              *.sh|*.bash) ;;
+              *) head -n 1 -- "$f" | grep -Eq '^#!.*[ /](ba|da|k)?sh([[:space:]]|$)' || continue ;;
+            esac
+            files+=("$f")
+          done < <(git ls-files)
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "No shell scripts tracked — nothing to check."
+            exit 0
+          fi
+          printf 'checking %s file(s):\n' "${#files[@]}"
+          printf '  %s\n' "${files[@]}"
+          # severity=warning: errors and warnings are real bugs (unquoted
+          # expansions, misused test operators); style/info is opinion and would
+          # make this gate noisy enough to get ignored.
+          shellcheck --severity=warning --external-sources --source-path=SCRIPTDIR "${files[@]}"
+
+  actionlint:
+    name: actionlint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: actionlint
+        env:
+          ACTIONLINT_VERSION: 1.7.12
+          # sha256 of actionlint_1.7.12_linux_amd64.tar.gz, recorded here rather
+          # than fetched at runtime so a swapped release asset fails the build.
+          ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+        run: |
+          set -euo pipefail
+          tarball="actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          curl -fsSL -o "$tarball" \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/${tarball}"
+          echo "${ACTIONLINT_SHA256}  ${tarball}" | sha256sum -c -
+          tar -xzf "$tarball" actionlint
+          ./actionlint -color
+          echo "actionlint clean."
