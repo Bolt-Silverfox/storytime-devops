@@ -133,30 +133,55 @@ PM2_SAFE_KEYS = {
     "USER", "LOGNAME", "PATH", "LANG", "TERM", "SHLVL", "_",
 }
 
-ENV_CONTAINER_KEYS = {"env", "pm2_env", "environment"}
+# Any key that is (or namespaces) an environment map. PM2 ecosystem files use
+# `env`, and `env_production` / `env_staging` / `env_<anything>` for
+# per-environment overrides, all of which land inside `pm2_env`. Matching only the
+# literal names missed `env_production`, which leaked every value it contained.
+# `pm2_env` is itself the process's environment map, so it must match too — and
+# matching it is what routes its nested `versioning` / `axm_options` objects
+# through the fail-closed masker rather than verbatim recursion.
+ENV_CONTAINER_RE = re.compile(r"^(pm2_)?(env|environment)(_.+)?$", re.IGNORECASE)
+
+
+def _mask_scalar(value):
+    # Non-string scalars carry no secret material (ports, flags, counts, nulls).
+    if isinstance(value, bool) or value is None or isinstance(value, (int, float)):
+        return value
+    if isinstance(value, str):
+        return "<empty>" if value == "" else "<set>"
+    return "<set>"
+
+
+def _mask_env_value(node):
+    """Mask a value found INSIDE an environment container.
+
+    Fail-closed: every nested structure is masked too, rather than recursed into
+    with `_walk`. Anything inside an env map is application configuration by
+    definition, and `versioning` / `axm_options` style sub-objects can embed a
+    token in a repository URL. Keys are always preserved — the NAMES are the
+    entire point of the capture; only values are replaced.
+    """
+    if isinstance(node, dict):
+        return {k: (v if k in PM2_SAFE_KEYS and not isinstance(v, (dict, list)) else _mask_env_value(v))
+                for k, v in node.items()}
+    if isinstance(node, list):
+        return [_mask_env_value(v) for v in node]
+    return _mask_scalar(node)
 
 
 def _mask_env_dict(d: dict) -> dict:
-    masked = {}
-    for k, v in d.items():
-        if k in PM2_SAFE_KEYS or (isinstance(v, (dict, list)) and k not in ENV_CONTAINER_KEYS):
-            masked[k] = _walk(v) if isinstance(v, (dict, list)) else v
-        elif isinstance(v, bool) or v is None or isinstance(v, (int, float)):
-            # Non-string scalars carry no secret material (ports, flags, counts).
-            masked[k] = v
-        elif isinstance(v, str):
-            masked[k] = "<empty>" if v == "" else "<set>"
-        else:
-            masked[k] = "<set>"
-    return masked
+    return _mask_env_value(d)
 
 
 def _walk(node):
     if isinstance(node, dict):
         out = {}
         for k, v in node.items():
-            if k in ENV_CONTAINER_KEYS and isinstance(v, dict):
-                out[k] = _mask_env_dict(v)
+            if ENV_CONTAINER_RE.match(k) and isinstance(v, (dict, list)):
+                out[k] = _mask_env_value(v)
+            elif ENV_CONTAINER_RE.match(k):
+                # An env key holding a scalar: mask it rather than pass it through.
+                out[k] = _mask_scalar(v)
             else:
                 out[k] = _walk(v)
         return out

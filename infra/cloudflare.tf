@@ -59,8 +59,14 @@ locals {
   )
 }
 
-# One A record per hostname this environment serves, all pointing at the Elastic
-# IP. A records (not CNAMEs) because the address is static.
+# One A record per hostname this stack serves, all pointing at the Elastic IP.
+# A records (not CNAMEs) because the address is static.
+#
+# THIS IS THE MIGRATION LEVER. Putting the records in Terraform with a low TTL is
+# what makes a cutover — and, more importantly, a ROLLBACK — a single reviewable
+# change rather than a manual edit at Namecheap that takes 30 minutes to propagate.
+# The old box is deliberately not destroyed in the same apply, so rolling back is
+# flipping the record and nothing else. See docs/migration.md.
 resource "cloudflare_record" "app" {
   for_each = var.cloudflare_enabled && var.create_instance ? toset(local.all_hostnames) : toset([])
 
@@ -69,5 +75,10 @@ resource "cloudflare_record" "app" {
   type    = "A"
   content = aws_eip.app[0].public_ip
   proxied = var.cloudflare_proxied
+
+  # A proxied record's TTL must be 1 ("automatic"); Cloudflare rejects anything
+  # else. Unproxied records get the deliberately low var.cloudflare_dns_ttl.
+  ttl = var.cloudflare_proxied ? 1 : var.cloudflare_dns_ttl
+
   comment = "Managed by Terraform — storytime ${var.environment}"
 }

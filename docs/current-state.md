@@ -6,12 +6,19 @@ Verified inventory of what exists **today**, before any of the Terraform in
 Treat this as the baseline to diff against. Where a fact is unknown it says so
 rather than guessing; `capture/capture-host.sh` exists to close those gaps.
 
+> **This repository is public.** Concrete addresses are therefore deliberately
+> omitted: hosts are `host-a` / `host-b` and the database is
+> `<shared-db-identifier>`. The real values belong in the **gitignored**
+> `capture/captures/` output, or in a private document — not here. Publishing
+> "this IP is production and this database also serves production" is a targeting
+> aid even when the addresses themselves resolve publicly.
+
 ## Hosts
 
 Two hand-built Ubuntu hosts, user `ubuntu`, **no IaC and no configuration
 management of any kind**. Both in `eu-west-1`.
 
-### `52.18.195.224` — shared multi-environment box
+### `host-a` — shared multi-environment box (eu-west-1)
 
 Runs dev **and** staging **and** blue **and** two production services at once:
 
@@ -42,7 +49,7 @@ marketing site and the production waitlist.
 
 Plus `logs.py`, a CGI behind nginx + fcgiwrap with basic auth.
 
-### `18.203.158.141` — dedicated production box
+### `host-b` — dedicated production box (eu-west-1)
 
 - `api`, `web`, `admin`
 
@@ -54,10 +61,11 @@ Plus `logs.py`, a CGI behind nginx + fcgiwrap with basic auth.
 
 ## Database
 
-**One** shared RDS Postgres instance:
+**One** shared RDS Postgres instance, `<shared-db-identifier>` (eu-west-1),
+resolving to a **public** IPv4 address:
 
 ```
-emerj-shared-db.cvq22s4q62o3.eu-west-1.rds.amazonaws.com  ->  34.253.19.2
+<shared-db-identifier>.<id>.<region>.rds.amazonaws.com  ->  <public IPv4>
 ```
 
 It serves **dev and staging and blue and prod simultaneously**, and it is

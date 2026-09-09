@@ -77,8 +77,8 @@ with open(out_path, "a") as fh:
             continue
         fh.write(key + "=" + value + "\n")
 
-# The pagination token, consumed by the caller. Empty when the page is the last.
-sys.stdout.write(data.get("NextToken") or "")
+# No pagination token is emitted: the AWS CLI auto-paginates and hands this script
+# the aggregated result, so there is nothing for the caller to follow.
 PYPARSE
 chmod 644 /usr/local/lib/storytime-ssm-to-envfile.py
 
@@ -128,25 +128,39 @@ write_env_file() {
   : > "$out"
   chmod 600 "$out"
 
-  local next_token="" page
-  while : ; do
-    if [ -n "$next_token" ]; then
-      page=$(retry aws ssm get-parameters-by-path --region "$REGION" \
-        --path "/$PREFIX/$service/" --recursive --with-decryption \
-        --max-results 10 --output json --starting-token "$next_token")
-    else
-      page=$(retry aws ssm get-parameters-by-path --region "$REGION" \
-        --path "/$PREFIX/$service/" --recursive --with-decryption \
-        --max-results 10 --output json)
-    fi
-    # Appends KEY=VALUE lines to $out and prints the pagination token (if any).
-    next_token=$(printf '%s' "$page" | python3 /usr/local/lib/storytime-ssm-to-envfile.py "$out")
-    [ -n "$next_token" ] || break
-  done
+  # NOTE: `--max-results` is NOT a valid option here. `get-parameters-by-path` is
+  # a paginated operation, so the AWS CLI replaces the API's MaxResults with
+  # `--page-size` / `--max-items` / `--starting-token`. Passing --max-results made
+  # every attempt fail, which — because this runs before `docker run` — meant no
+  # application container ever started.
+  #
+  # The CLI auto-paginates and aggregates all pages, so there is no NextToken to
+  # follow and no manual loop: `--page-size` just bounds each underlying call.
+  local page
+  page=$(retry aws ssm get-parameters-by-path \
+    --region "$REGION" \
+    --path "/$PREFIX/$service/" \
+    --recursive \
+    --with-decryption \
+    --page-size 10 \
+    --output json) || {
+      echo "FATAL: could not read SSM config for $service under /$PREFIX/$service/" >&2
+      return 1
+    }
+
+  printf '%s' "$page" | python3 /usr/local/lib/storytime-ssm-to-envfile.py "$out"
 
   if [ ! -s "$out" ]; then
     echo "WARN: no SSM parameters found under /$PREFIX/$service/ -- starting $service with no configuration" >&2
   fi
+}
+
+# Apply a default ONLY when the SSM subtree did not set the key. Docker gives an
+# explicit `-e` precedence over `--env-file`, so passing these as `-e` would make
+# a dev container run with NODE_ENV=production no matter what config_plain says.
+env_default() {
+  local file="$1" key="$2" value="$3"
+  grep -q "^$key=" "$file" 2>/dev/null || printf '%s=%s\n' "$key" "$value" >> "$file"
 }
 
 run_service() {
@@ -164,7 +178,13 @@ run_service() {
 
   local env_file
   env_file=$(mktemp "$ENV_DIR/$service.XXXXXX")
-  write_env_file "$service" "$env_file"
+  write_env_file "$service" "$env_file" || return 1
+
+  # Defaults, overridable by SSM config. PORT must agree with the port the proxy
+  # routes to, so a mismatch is rejected at plan time in guards.tf rather than
+  # silently corrected here.
+  env_default "$env_file" NODE_ENV production
+  env_default "$env_file" PORT "$container_port"
 
   local mem_args=()
   if [ "$memory_mb" != "0" ]; then
@@ -179,8 +199,6 @@ run_service() {
     --log-driver json-file --log-opt max-size=50m --log-opt max-file=3 \
     -p "127.0.0.1:$host_port:$container_port" \
     --env-file "$env_file" \
-    -e NODE_ENV=production \
-    -e PORT="$container_port" \
     "$${mem_args[@]}" \
     "$${extra_env[@]}" \
     "$image"
@@ -205,6 +223,50 @@ REDEPLOY
 chmod 750 /usr/local/bin/redeploy.sh
 
 # ---------------------------------------------------------------------------
+# Postgres (use_managed_database = ${use_managed_database})
+# ---------------------------------------------------------------------------
+%{ if !use_managed_database ~}
+# Postgres as a container, on a NAMED DOCKER VOLUME so `docker rm` cannot take the
+# data with it. This volume is the one piece of state that lives only on this box;
+# backups.tf is what makes that acceptable, and pg-backup below is what makes the
+# backups real.
+#
+# Published on LOOPBACK ONLY — never reachable off the instance.
+docker volume inspect storytime-pgdata >/dev/null 2>&1 || docker volume create storytime-pgdata
+retry docker pull "${postgres_image}"
+if [ -z "$(docker ps -aq -f name='^postgres$')" ]; then
+  docker run -d --name postgres --network storytime --restart always \
+    -p 127.0.0.1:5432:5432 \
+    -v storytime-pgdata:/var/lib/postgresql/data \
+    --memory "${postgres_memory_mb}m" --memory-swap "${postgres_memory_mb}m" \
+    --log-driver json-file --log-opt max-size=20m --log-opt max-file=2 \
+    -e POSTGRES_DB="${db_name}" \
+    -e POSTGRES_USER="${db_username}" \
+    -e POSTGRES_PASSWORD="$(aws ssm get-parameter --region "${aws_region}" --with-decryption \
+        --name "/${prefix}/_db/PASSWORD" --query 'Parameter.Value' --output text)" \
+    -e PGDATA=/var/lib/postgresql/data/pgdata \
+    "${postgres_image}"
+else
+  # Already exists: start it if stopped, but NEVER recreate it. Recreating with a
+  # different image tag against an initialised data directory is how a major
+  # version mismatch corrupts a database.
+  docker start postgres >/dev/null 2>&1 || true
+  echo "postgres container already present — left as-is (a major-version change must be a deliberate, dumped-and-restored migration)"
+fi
+
+# Wait for it to accept connections before anything tries to migrate against it.
+for i in $(seq 1 30); do
+  if docker exec postgres pg_isready -U "${db_username}" -d "${db_name}" >/dev/null 2>&1; then
+    echo "postgres ready after $${i}s"; break
+  fi
+  sleep 1
+done
+%{ else ~}
+# use_managed_database = true: Postgres is an RDS instance. Nothing runs here; the
+# app reads its connection string from SSM.
+%{ endif ~}
+
+# ---------------------------------------------------------------------------
 # Redis (var.redis_mode = "${redis_mode}")
 # ---------------------------------------------------------------------------
 %{ if redis_mode == "container" ~}
@@ -217,6 +279,7 @@ retry docker pull "${redis_image}"
 docker run -d --name redis --network storytime --restart always \
   -p 127.0.0.1:6379:6379 \
   -v storytime-redis:/data \
+  --memory "${redis_memory_mb}m" --memory-swap "${redis_memory_mb}m" \
   --log-driver json-file --log-opt max-size=20m --log-opt max-file=2 \
   "${redis_image}" \
   redis-server --appendonly yes --maxmemory-policy ${redis_policy}
@@ -229,8 +292,37 @@ docker run -d --name redis --network storytime --restart always \
 # Reverse proxy (Caddy). Config comes from Terraform, so it is reviewable in a
 # plan diff rather than living only on this disk.
 # ---------------------------------------------------------------------------
-retry curl -fsSL "https://caddyserver.com/api/download?os=linux&arch=amd64" -o /usr/bin/caddy
-chmod 0755 /usr/bin/caddy
+# Pinned release + SHA-512 verification, NOT caddyserver.com/api/download.
+# /api/download hands back an unpinned binary with nothing to check it against, so
+# a compromise upstream (or of the TLS path) installs whatever it likes as root on
+# every boot. The expected digests live in var.caddy_sha512, reviewed in the repo.
+#
+# Architecture is derived from uname -m rather than hardcoded, so switching the AMI
+# filter in compute.tf to arm64/Graviton needs no change here.
+case "$(uname -m)" in
+  x86_64)  CADDY_ARCH=amd64 ;;
+  aarch64) CADDY_ARCH=arm64 ;;
+  *)       echo "FATAL: unsupported architecture $(uname -m) for the pinned Caddy release" >&2; exit 1 ;;
+esac
+
+case "$CADDY_ARCH" in
+  amd64) CADDY_SHA512="${caddy_sha512_amd64}" ;;
+  arm64) CADDY_SHA512="${caddy_sha512_arm64}" ;;
+esac
+
+CADDY_TGZ="caddy_${caddy_version}_linux_$${CADDY_ARCH}.tar.gz"
+CADDY_TMP=$(mktemp -d)
+retry curl -fsSL --proto '=https' --tlsv1.2   "https://github.com/caddyserver/caddy/releases/download/v${caddy_version}/$${CADDY_TGZ}"   -o "$${CADDY_TMP}/$${CADDY_TGZ}"
+
+# Verify BEFORE unpacking, and abort the whole bootstrap on mismatch. An
+# unverified reverse proxy is not something to fall back to.
+echo "$${CADDY_SHA512}  $${CADDY_TMP}/$${CADDY_TGZ}" | sha512sum --check --strict   || { echo "FATAL: Caddy ${caddy_version} $${CADDY_ARCH} failed SHA-512 verification — refusing to install it" >&2; exit 1; }
+
+tar -xzf "$${CADDY_TMP}/$${CADDY_TGZ}" -C "$${CADDY_TMP}" caddy
+install -o root -g root -m 0755 "$${CADDY_TMP}/caddy" /usr/bin/caddy
+rm -rf "$${CADDY_TMP}"
+/usr/bin/caddy version
+
 mkdir -p /etc/caddy
 
 cat > /etc/caddy/Caddyfile <<'CADDYFILE'
@@ -258,7 +350,11 @@ Wants=docker.service
 
 [Service]
 ExecStart=/usr/bin/caddy run --config /etc/caddy/Caddyfile --adapter caddyfile
-ExecReload=/usr/bin/caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile --force
+# No ExecReload on purpose. `caddy reload` drives the admin API, and the Caddyfile
+# sets `admin off` — so a reload would fail, and `--force` does not bypass it.
+# Rather than open an admin socket that nothing needs, there is no reload: the
+# Caddyfile is generated by Terraform, so a routing change means an apply (which
+# replaces the instance). `systemctl restart caddy` is the manual escape hatch.
 Restart=on-failure
 RestartSec=5s
 LimitNOFILE=1048576
@@ -303,5 +399,283 @@ RECONCILE
 
 systemctl daemon-reload
 systemctl enable storytime-reconcile.service
+
+# ===========================================================================
+# BACKUPS
+#
+# The stack runs Postgres as a container to keep the bill near $24/mo, which means
+# there are no RDS automated backups and no PITR. These two jobs replace them.
+# They are not optional: this is children's personal data under GDPR.
+#
+# HOW A FAILURE SURFACES: on success the script overwrites
+# s3://<bucket>/_status/last-success.json. A failure leaves that object STALE, and
+# staleness is readable from anywhere without touching the box — which matters,
+# because if the box is gone you cannot read its journal. `systemctl status` and
+# an `OnFailure` unit cover the case where the box is alive.
+# ===========================================================================
+retry dnf install -y postgresql16 || retry dnf install -y postgresql15 || retry dnf install -y postgresql
+
+cat > /usr/local/bin/pg-backup.sh <<'PGBACKUP'
+#!/usr/bin/env bash
+# Nightly logical backup. FAILS LOUDLY: any error leaves the heartbeat stale and
+# exits non-zero so systemd records a failed unit.
+#
+# --format=custom (not plain SQL) so pg_restore can do selective and parallel
+# restores, and because it is compressed on the way out.
+set -euo pipefail
+
+REGION="${aws_region}"
+# Pin the region for every AWS call in this script. Without it the CLI falls back
+# to instance metadata, which works right up until it does not (IMDS blocked, a
+# cross-region bucket) — and a backup job is the worst place to rely on a default.
+export AWS_DEFAULT_REGION="$REGION" AWS_REGION="$REGION"
+BUCKET="${backup_bucket}"
+PREFIX="${backup_prefix}"
+DB_NAME="${db_name}"
+DB_USER="${db_username}"
+STACK="${prefix}"
+
+STAMP=$(date -u +%Y/%m/%d/%Y%m%dT%H%M%SZ)
+KEY="$PREFIX/$STACK/$STAMP.dump"
+WORK=$(mktemp -d /var/tmp/pg-backup.XXXXXX)
+DUMP="$WORK/db.dump"
+# The dump is plaintext children's data on local disk for the duration. Remove it
+# on every exit path, success or failure.
+trap 'rm -rf "$WORK"' EXIT
+
+fail() {
+  echo "BACKUP FAILED: $*" >&2
+  logger -t storytime-pg-backup -p user.err "BACKUP FAILED: $*"
+  exit 1
+}
+
+%{ if use_managed_database ~}
+# Managed backend: dump over the network. The password comes from SSM and is put
+# in PGPASSWORD rather than the command line, so it never appears in `ps`.
+PGHOST=$(aws ssm get-parameter --region "$REGION" --name "/$STACK/_db/HOST" --query 'Parameter.Value' --output text) \
+  || fail "could not read /$STACK/_db/HOST from SSM"
+PGPASSWORD=$(aws ssm get-parameter --region "$REGION" --with-decryption --name "/$STACK/_db/PASSWORD" --query 'Parameter.Value' --output text) \
+  || fail "could not read the database password from SSM"
+export PGPASSWORD
+pg_dump --host="$PGHOST" --username="$DB_USER" --dbname="$DB_NAME" \
+        --format=custom --compress=9 --no-owner --no-privileges \
+        --file="$DUMP" || fail "pg_dump exited non-zero"
+unset PGPASSWORD
+%{ else ~}
+# Container backend: exec pg_dump inside the container, so no port needs exposing
+# and no password has to travel anywhere.
+docker exec postgres pg_dump --username="$DB_USER" --dbname="$DB_NAME" \
+        --format=custom --compress=9 --no-owner --no-privileges \
+        > "$DUMP" || fail "pg_dump exited non-zero"
+%{ endif ~}
+
+# A zero-length or absurdly small dump means the dump failed while returning 0.
+# pg_dump's custom-format header alone is a few hundred bytes, so anything under
+# 1 KiB is not a database.
+SIZE=$(stat -c %s "$DUMP")
+[ "$SIZE" -ge 1024 ] || fail "dump is only $${SIZE} bytes — refusing to treat that as a backup"
+
+# Verify the archive is readable before it is trusted. `pg_restore --list` parses
+# the table of contents and fails on a truncated or corrupt file.
+pg_restore --list "$DUMP" > "$WORK/toc.txt" 2>/dev/null || fail "pg_restore --list could not read the dump (truncated or corrupt)"
+TABLES=$(grep -c 'TABLE DATA' "$WORK/toc.txt" || true)
+
+aws s3 cp "$DUMP" "s3://$BUCKET/$KEY" --sse AES256 --only-show-errors \
+  || fail "upload to s3://$BUCKET/$KEY failed"
+
+# Confirm what actually landed. A successful `aws s3 cp` is not proof the object
+# is there and non-empty.
+REMOTE_SIZE=$(aws s3api head-object --bucket "$BUCKET" --key "$KEY" --query 'ContentLength' --output text) \
+  || fail "uploaded object s3://$BUCKET/$KEY could not be read back"
+[ "$REMOTE_SIZE" = "$SIZE" ] \
+  || fail "uploaded object is $${REMOTE_SIZE} bytes but the local dump was $${SIZE} — upload was truncated"
+
+# Only now is the backup real, so only now is the heartbeat updated.
+cat > "$WORK/status.json" <<JSON
+{
+  "stack": "$STACK",
+  "last_success_utc": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+  "key": "$KEY",
+  "bytes": $SIZE,
+  "tables_in_dump": $${TABLES:-0}
+}
+JSON
+aws s3 cp "$WORK/status.json" "s3://$BUCKET/_status/last-success.json" \
+  --sse AES256 --content-type application/json --only-show-errors \
+  || fail "backup uploaded but the heartbeat could not be written — treat this as a failure"
+
+echo "backup ok: s3://$BUCKET/$KEY ($SIZE bytes, $${TABLES:-0} tables)"
+logger -t storytime-pg-backup -p user.notice "backup ok: $KEY ($SIZE bytes)"
+PGBACKUP
+chmod 750 /usr/local/bin/pg-backup.sh
+
+cat > /etc/systemd/system/storytime-pg-backup.service <<'UNIT'
+[Unit]
+Description=Storytime nightly Postgres backup to S3
+After=docker.service
+Wants=docker.service
+OnFailure=storytime-pg-backup-failed.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/pg-backup.sh
+TimeoutStartSec=3600
+Nice=10
+IOSchedulingClass=idle
+UNIT
+
+# Makes a failure loud in the journal, and gives `journalctl -u` one obvious
+# string to grep for. The stale S3 heartbeat is the out-of-band signal.
+cat > /etc/systemd/system/storytime-pg-backup-failed.service <<'UNIT'
+[Unit]
+Description=Storytime backup failure notice
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/logger -t storytime-pg-backup -p user.crit "STORYTIME BACKUP FAILED - the S3 heartbeat _status/last-success.json is now STALE. Investigate with: journalctl -u storytime-pg-backup.service -n 200"
+UNIT
+
+cat > /etc/systemd/system/storytime-pg-backup.timer <<'UNIT'
+[Unit]
+Description=Storytime nightly Postgres backup timer
+
+[Timer]
+OnCalendar=${backup_schedule_calendar}
+# A box that was down at the scheduled time still takes today's backup when it
+# comes back, instead of silently skipping a day.
+Persistent=true
+# Avoid every stack in the account hitting S3 on the same second.
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target
+UNIT
+
+systemctl daemon-reload
+systemctl enable --now storytime-pg-backup.timer
+
+%{ if enable_restore_verification ~}
+# ---------------------------------------------------------------------------
+# Restore verification.
+#
+# A backup nobody has restored is not a backup. Weekly, this pulls the NEWEST
+# dump from S3, restores it into a THROWAWAY Postgres container on no published
+# port, counts the tables, and destroys the container. It never touches the live
+# database.
+# ---------------------------------------------------------------------------
+cat > /usr/local/bin/pg-restore-verify.sh <<'PGVERIFY'
+#!/usr/bin/env bash
+set -euo pipefail
+
+REGION="${aws_region}"
+# See pg-backup.sh: never let a backup-related AWS call depend on a default region.
+export AWS_DEFAULT_REGION="$REGION" AWS_REGION="$REGION"
+BUCKET="${backup_bucket}"
+PREFIX="${backup_prefix}"
+STACK="${prefix}"
+MIN_TABLES="${restore_verify_min_tables}"
+IMAGE="${postgres_image}"
+CONTAINER="pg-verify-$$"
+
+WORK=$(mktemp -d /var/tmp/pg-verify.XXXXXX)
+cleanup() {
+  docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
+  rm -rf "$WORK"
+}
+trap cleanup EXIT
+
+fail() {
+  echo "RESTORE VERIFICATION FAILED: $*" >&2
+  logger -t storytime-pg-verify -p user.err "RESTORE VERIFICATION FAILED: $*"
+  exit 1
+}
+
+# Newest dump by key: the layout is .../YYYY/MM/DD/YYYYMMDDTHHMMSSZ.dump, so
+# lexicographic order is chronological order.
+KEY=$(aws s3 ls "s3://$BUCKET/$PREFIX/$STACK/" --recursive \
+        | awk '{print $4}' | grep '\.dump$' | sort | tail -1) \
+  || fail "could not list dumps"
+[ -n "$KEY" ] || fail "no dumps found under s3://$BUCKET/$PREFIX/$STACK/"
+
+aws s3 cp "s3://$BUCKET/$KEY" "$WORK/db.dump" --only-show-errors \
+  || fail "could not download s3://$BUCKET/$KEY"
+
+# Throwaway instance: no published port, no volume, a password used only here.
+VERIFY_PW=$(head -c 24 /dev/urandom | base64 | tr -d '/+=')
+docker run -d --name "$CONTAINER" \
+  --memory 512m --memory-swap 512m \
+  -e POSTGRES_PASSWORD="$VERIFY_PW" -e POSTGRES_DB=verify \
+  "$IMAGE" >/dev/null || fail "could not start the throwaway container"
+
+for i in $(seq 1 60); do
+  docker exec "$CONTAINER" pg_isready -U postgres -d verify >/dev/null 2>&1 && break
+  [ "$i" = "60" ] && fail "throwaway container never became ready"
+  sleep 1
+done
+
+docker cp "$WORK/db.dump" "$CONTAINER:/tmp/db.dump" || fail "could not copy the dump into the container"
+
+# --no-owner/--no-privileges because the roles from the source database do not
+# exist here; that is expected and is not a restore failure. Errors are tolerated
+# individually, then the OUTCOME is asserted below — that is the real check.
+docker exec "$CONTAINER" pg_restore --username=postgres --dbname=verify \
+  --no-owner --no-privileges /tmp/db.dump > "$WORK/restore.log" 2>&1 || true
+
+COUNT=$(docker exec "$CONTAINER" psql --username=postgres --dbname=verify -tAc \
+  "SELECT count(*) FROM information_schema.tables WHERE table_schema NOT IN ('pg_catalog','information_schema');") \
+  || fail "could not count tables after the restore"
+COUNT=$(printf '%s' "$COUNT" | tr -d '[:space:]')
+
+[ "$${COUNT:-0}" -ge "$MIN_TABLES" ] \
+  || fail "restored dump has only $${COUNT:-0} tables, expected at least $MIN_TABLES (dump: $KEY)"
+
+echo "restore verification ok: $KEY restored with $COUNT tables"
+logger -t storytime-pg-verify -p user.notice "restore verification ok: $KEY, $COUNT tables"
+
+# Record the proof next to the backups, so "when was a restore last actually
+# exercised" is answerable without shell access.
+cat > "$WORK/verify.json" <<JSON
+{
+  "stack": "$STACK",
+  "last_verified_utc": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+  "verified_key": "$KEY",
+  "tables_restored": $COUNT
+}
+JSON
+aws s3 cp "$WORK/verify.json" "s3://$BUCKET/_status/last-restore-verify.json" \
+  --sse AES256 --content-type application/json --only-show-errors || true
+PGVERIFY
+chmod 750 /usr/local/bin/pg-restore-verify.sh
+
+cat > /etc/systemd/system/storytime-pg-verify.service <<'UNIT'
+[Unit]
+Description=Storytime backup restore verification (throwaway container)
+After=docker.service
+Wants=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/pg-restore-verify.sh
+TimeoutStartSec=3600
+Nice=15
+IOSchedulingClass=idle
+UNIT
+
+cat > /etc/systemd/system/storytime-pg-verify.timer <<'UNIT'
+[Unit]
+Description=Storytime weekly backup restore verification
+
+[Timer]
+OnCalendar=Sun *-*-* 04:30:00 UTC
+Persistent=true
+RandomizedDelaySec=600
+
+[Install]
+WantedBy=timers.target
+UNIT
+
+systemctl daemon-reload
+systemctl enable --now storytime-pg-verify.timer
+%{ endif ~}
 
 echo "=== storytime bootstrap complete: ${prefix} @ $(date -Is) ==="

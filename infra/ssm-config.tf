@@ -67,3 +67,55 @@ resource "aws_ssm_parameter" "origin_key" {
   value = base64encode(var.origin_key)
   tags  = { Name = "${local.prefix}-origin-key" }
 }
+
+# ---------------------------------------------------------------------------
+# Database connection details, under a reserved `_db` service path.
+#
+# Separate from the per-application parameters because the BACKUP job needs them
+# too, and it is not one of the applications. Each app still gets its own
+# DATABASE_URL through secret_values — the shape of that string differs per app
+# (Prisma, TypeORM and node-postgres do not agree on it), so composing it here
+# would produce a stack that looks wired up and is not.
+# ---------------------------------------------------------------------------
+
+resource "aws_ssm_parameter" "db_password" {
+  count = var.create_instance ? 1 : 0
+
+  name  = "/${local.prefix}/_db/PASSWORD"
+  type  = "SecureString"
+  value = var.db_password
+  tags  = { Name = "${local.prefix}-db-password" }
+}
+
+resource "aws_ssm_parameter" "db_host" {
+  count = var.create_instance ? 1 : 0
+
+  name = "/${local.prefix}/_db/HOST"
+  type = "String"
+  # Container Postgres is reachable from the app containers by container name on
+  # the user-defined bridge network; RDS by its endpoint address.
+  value = (
+    var.use_managed_database
+    ? try(aws_db_instance.main[0].address, "pending")
+    : "postgres"
+  )
+  tags = { Name = "${local.prefix}-db-host" }
+}
+
+resource "aws_ssm_parameter" "db_name" {
+  count = var.create_instance ? 1 : 0
+
+  name  = "/${local.prefix}/_db/NAME"
+  type  = "String"
+  value = var.db_name
+  tags  = { Name = "${local.prefix}-db-name" }
+}
+
+resource "aws_ssm_parameter" "db_username" {
+  count = var.create_instance ? 1 : 0
+
+  name  = "/${local.prefix}/_db/USERNAME"
+  type  = "String"
+  value = var.db_username
+  tags  = { Name = "${local.prefix}-db-username" }
+}

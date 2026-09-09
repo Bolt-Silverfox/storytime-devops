@@ -58,6 +58,47 @@ data "aws_iam_policy_document" "app_instance" {
     resources = ["arn:aws:ssm:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:parameter/${local.prefix}/*"]
   }
 
+  # Backups: write ONLY under this stack's own prefix in its own bucket. No
+  # wildcard S3 access, no ListAllMyBuckets, no read of anyone else's prefix.
+  # ListBucket is needed so the restore/verify path can find the newest dump, and
+  # is itself constrained to the same prefix by a condition.
+  dynamic "statement" {
+    for_each = var.create_instance ? [1] : []
+    content {
+      sid = "BackupWriteOwnPrefix"
+      actions = [
+        "s3:PutObject",
+        "s3:GetObject",
+        "s3:AbortMultipartUpload",
+        "s3:ListMultipartUploadParts",
+      ]
+      resources = [
+        "${aws_s3_bucket.backups[0].arn}/${local.backup_prefix}/*",
+        "${aws_s3_bucket.backups[0].arn}/_status/*",
+      ]
+    }
+  }
+
+  dynamic "statement" {
+    for_each = var.create_instance ? [1] : []
+    content {
+      sid       = "BackupListOwnPrefix"
+      actions   = ["s3:ListBucket"]
+      resources = [aws_s3_bucket.backups[0].arn]
+      condition {
+        test     = "StringLike"
+        variable = "s3:prefix"
+        values = [
+          "${local.backup_prefix}/*",
+          "_status/*",
+        ]
+      }
+    }
+  }
+
+  # Deliberately NOT granted: s3:DeleteObject. Expiry is the bucket lifecycle
+  # rule's job, so a compromised box cannot destroy the backup history.
+
   # Decrypt SecureStrings, but only through SSM — not arbitrary KMS use.
   statement {
     sid       = "KmsDecryptViaSsm"

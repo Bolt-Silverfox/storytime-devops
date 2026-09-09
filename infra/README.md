@@ -21,9 +21,10 @@ differences are the substance of this stack rather than incidental:
 |---|---|---|
 | Apps | 1 | 6 (backend API, web, superadmin, waitlist API, waitlist web, log viewer) |
 | Environments | dev, prod | dev, staging, **blue**, prod |
-| Containers per box | 1 | several — see [Topology](#topology) |
-| Database | none (Supabase) | **one shared RDS serving all four environments at once** |
+| Containers per box | 1 | several — apps **plus Postgres and Redis** |
+| Database | none (Supabase) | **Postgres container by default**, RDS behind a variable |
 | Redis | none | **required** (BullMQ queues + cache + guest sessions) |
+| Backups | n/a (Supabase) | **built here**: nightly `pg_dump` to S3 + DLM EBS snapshots |
 | Region | `us-east-1` | **`eu-west-1`** — a compliance decision, not a preference |
 | State bucket | `fateround-tfstate` | `storytime-tfstate` (separate; no shared blast radius) |
 | Reverse proxy | optional Caddy for origin TLS | **always** — several hostnames per box |
@@ -32,27 +33,242 @@ differences are the substance of this stack rather than incidental:
 No FateRound resource is imported, referenced or modified. That repo was read for
 patterns only.
 
-## Topology
+## One box, and when to stop using one box
 
-**One instance per environment, several containers on it.** The alternative —
-one instance per service per environment — is roughly 20 EC2 instances and 20
-Elastic IPs for a platform whose entire traffic fits on two boxes today. The
-reasoning, and what the choice costs, is written out at the top of
-[`compute.tf`](compute.tf).
+**Everything runs on ONE `t3.small`**: the applications, Postgres and Redis, all as
+Docker containers behind an on-box Caddy reverse proxy, with one Elastic IP and
+Cloudflare in front.
 
-Consequences worth knowing before you apply anything:
+Storytime has **fewer than 100 monthly users**. An instance per environment came to
+about **$225/mo** and was rejected as overbuilt, correctly. This design is meant to
+scale *up* from a deliberately minimal base rather than down from a large one, so
+every knob that would grow it is a variable.
 
-- One box down takes the whole environment down. **Same as today**; this change
-  does not make availability worse, and does not fix it either.
-- Containers get per-service memory limits (`services[*].memory_mb`), which the
-  current PM2 setup does not have.
-- **`terraform apply` replaces the instance** whenever user-data changes. The
-  normal deploy path is therefore *not* Terraform: CI calls
-  `/usr/local/bin/redeploy.sh <service> <tag>` over SSM Run Command, which
-  touches one container.
-- PM2 cluster mode becomes `replicas = N` — N containers on consecutive host
-  ports, round-robin behind the proxy. Prod runs `max(2, cpus-1)` workers today;
-  pick the number explicitly, it is not derived.
+### What that honestly means
+
+- **dev, staging and prod share a host.** A bad deploy, a runaway migration, or an
+  OOM in one can affect production. There is no per-environment blast radius.
+- **It is not a recommendation to keep forever.** It is a cost trade-off that is
+  right at this user count and wrong at some larger one.
+- **No HA.** One box, one AZ. If it or its AZ has trouble, Storytime is down until
+  it recovers or is rebuilt. Rebuilding is fast and documented
+  ([`docs/migration.md`](../docs/migration.md)), but it is not automatic.
+- Mitigations that *are* in place: per-container memory limits (the current PM2
+  setup has none), and a plan-time memory budget so overcommitment fails in review
+  rather than at 03:00.
+
+### Split it out when one of these is true
+
+Concrete triggers, not vibes:
+
+| Trigger | Threshold |
+|---|---|
+| Sustained CPU | > 60% for a week, or steady-state credit balance falling on a `t3` |
+| Memory headroom | `terraform output memory_budget` headroom under ~200 MiB with everything you need enabled |
+| Prod traffic | sustained > ~5 req/s, or p95 latency degrading under normal load |
+| An incident | any dev/staging action causes a production incident — split immediately, this is the real trigger |
+| Compliance | an auditor asks for environment isolation, which a shared host cannot demonstrate |
+
+Splitting is deliberately cheap: create a workspace, set
+`environment = "prod"`, give it only the prod services, flip the Cloudflare
+records. That is the whole procedure, and it is
+[`docs/migration.md`](../docs/migration.md).
+
+### Sizing and the memory budget
+
+`t3.small` is 2 GiB, and Postgres and Redis live on the same box:
+
+```
+t3.small total                     2048 MiB
+- host reserve (OS/docker/SSM)      -400
+- postgres container                -512
+- redis container                   -192
+--------------------------------------------
+available for application containers 944 MiB
+```
+
+Which is **two** small Node containers, not eighteen. `guards.tf` enforces this at
+plan time and prints the arithmetic, so enabling a third service on a `t3.small`
+fails in review:
+
+```
+Memory budget exceeded for t3.small (2048 MiB).
+Committed: 2576 MiB = app containers 1472 + postgres 512 + redis 192 + host reserve 400
+```
+
+Raise `instance_type` to `t3.medium` (4 GiB) or `t3.large` (8 GiB) to enable more.
+Every service must set `memory_mb`: an uncapped container on a shared box can OOM
+the whole platform, so the plan rejects `memory_mb = 0`.
+
+PM2 cluster mode becomes `replicas = N` — N containers on consecutive host ports,
+round-robin behind the proxy.
+
+## Cost
+
+eu-west-1 list prices, on-demand:
+
+| Item | Monthly |
+|---|---|
+| `t3.small` (2 vCPU, 2 GiB) — the default | **$16.64** |
+| 30 GB gp3 root volume, encrypted | ~$2.70 |
+| Public IPv4 (the Elastic IP, while attached) | **$3.65** |
+| ECR / SSM / S3 backups / data transfer at this scale | ~$1 |
+| **Default total** | **~$24/mo** |
+
+What each variable costs if you change it:
+
+| Change | Delta |
+|---|---|
+| `instance_type = "t3.medium"` (4 GiB) | +$16.65 → ~$41 |
+| `instance_type = "t3.large"` (8 GiB) | +$49.94 → ~$74 |
+| `use_managed_database = true`, `db.t4g.micro` | +$12.41 |
+| `use_managed_database = true`, `db.t4g.small` | +$25.55 |
+| `use_managed_database = true`, `db.t4g.medium` | +$50.37 |
+| `redis_mode = "elasticache"`, `cache.t4g.micro` | +~$12 |
+| One more environment on its own box | +~$24 |
+
+**Public IPv4 is billed per address, ~$3.65/mo, attached or not.** That is small
+until it is not: an audit of the sibling AWS account turned up **~$29/mo of
+orphaned load balancer and unattached IPv4**. This stack allocates exactly one EIP
+and nothing else with a public address, and there is no ALB and no NAT gateway
+(which would add ~$16 and ~$32/mo respectively). Sweep for strays periodically:
+
+```bash
+aws ec2 describe-addresses --query 'Addresses[?AssociationId==`null`].[PublicIp,AllocationId]' --output table
+aws elbv2 describe-load-balancers --query 'LoadBalancers[].[LoadBalancerName,State.Code]' --output table
+```
+
+## Migrating is a routine operation
+
+The box is **disposable**: images in ECR, config in SSM, database dumps in S3, DNS
+in Cloudflare. Losing the instance entirely costs the time to re-apply and restore.
+
+Nothing a migration would have to hunt down is hardcoded — region, AZ, instance
+type, hostnames and environment name are all variables, there are **no literal IP
+addresses anywhere**, and the AMI comes from `data.aws_ami` with
+`ignore_changes = [ami]` rather than a pinned id that would silently rot.
+
+**Cloudflare is the cutover lever.** The legacy estate's fatal flaw is DNS
+hand-edited at Namecheap with a 1800s TTL and no proxy layer, so there is no way to
+shift traffic or roll back quickly. Here the record is in Terraform with
+`cloudflare_dns_ttl` defaulting to 60s, and cutover is: **apply the new stack →
+restore the latest dump → verify → flip the record → keep the old box until
+confident.** Rollback is flipping the record back, which is why the old box must
+not be destroyed in the same apply.
+
+**The one known gap:** with `use_managed_database = false` the Postgres data
+directory is a Docker volume on the instance's EBS volume, so it is the single piece
+of state that lives only on the box. Recovery point is the nightly dump. That is the
+accepted price of not paying for RDS at this scale, and it is why the next section
+is not optional.
+
+Full ordered procedure with commands and per-step checks:
+[`docs/migration.md`](../docs/migration.md).
+
+## Backups
+
+**Read this before changing anything in `backups.tf`.**
+
+This stack deliberately runs Postgres as a container rather than RDS to keep the
+bill near $24/mo. That means **no RDS automated backups and no point-in-time
+recovery**, so they are re-created here. Without them, self-hosting **children's
+personal data under GDPR** on a single EBS volume would be reckless. The backups are
+what make the cost trade defensible. Do not remove them as an optimisation.
+
+Two layers, because they fail differently:
+
+| | Layer 1 — logical dump | Layer 2 — EBS snapshot |
+|---|---|---|
+| What | `pg_dump --format=custom` to S3, nightly | DLM whole-volume snapshot, daily |
+| Driven by | systemd timer on the box (`storytime-pg-backup.timer`) | AWS, needs nothing from the box |
+| Survives | losing the instance, volume, AZ or region | a corrupted/truncated dump, a compromised backup script |
+| Vulnerable to | a dump that succeeds but is garbage | losing the region |
+| Retention | `backup_retention_days` (30) + 7 days of noncurrent versions | `ebs_snapshot_retain_count` (7) |
+
+`--format=custom` rather than plain SQL so `pg_restore` can do selective and
+parallel restores, and because it compresses.
+
+The bucket is created by Terraform: **versioned, SSE-encrypted, public-access
+blocked, TLS-only** (a bucket policy denying `aws:SecureTransport=false`), with a
+lifecycle rule that expires dumps and aborts incomplete multipart uploads. It is
+**not** `force_destroy`, so `terraform destroy` cannot take the backup history with
+it.
+
+The instance role can **write only under this stack's own prefix** in this one
+bucket, and is deliberately **not granted `s3:DeleteObject`** — expiry is the
+lifecycle rule's job, so a compromised box cannot destroy the history.
+
+### The dump fails loudly
+
+`pg-backup.sh` refuses to call a backup successful unless every one of these holds:
+
+1. `pg_dump` exits zero;
+2. the local dump is at least 1 KiB (a custom-format header alone is a few hundred
+   bytes, so anything smaller is not a database);
+3. `pg_restore --list` can parse it — which catches a truncated or corrupt archive
+   that `pg_dump` returned 0 for;
+4. the upload succeeds, **and** `head-object` reports a size equal to the local
+   dump, catching a truncated upload.
+
+Only then does it write the heartbeat.
+
+### How a failure surfaces
+
+**A stale heartbeat.** `_status/last-success.json` is overwritten only after all
+four checks pass, so failure looks like a timestamp that stopped moving — readable
+from anywhere, without shell access. That matters: if the box is gone you cannot
+read its journal.
+
+```bash
+aws s3 cp "s3://$(terraform output -raw backup_bucket)/_status/last-success.json" - | cat
+```
+
+`last_success_utc` older than ~24 hours means the backups are broken. On the box,
+`systemctl status storytime-pg-backup.timer` and
+`journalctl -u storytime-pg-backup.service` have the detail, and an `OnFailure` unit
+logs at `crit`.
+
+**Wiring that heartbeat to something that pages a human is not done** — it is a
+follow-up, and until it exists someone has to look.
+
+### Restore
+
+Documented and scripted, because a backup nobody has restored is not a backup.
+
+```bash
+# Newest dump (keys are date-ordered, so lexicographic == chronological)
+BUCKET=$(terraform output -raw backup_bucket)
+KEY=$(aws s3 ls "s3://$BUCKET/postgres/" --recursive | awk '{print $4}' \
+        | grep '\.dump$' | sort | tail -1)
+aws s3 cp "s3://$BUCKET/$KEY" /var/tmp/restore.dump
+
+# Into the running container. --clean --if-exists makes it repeatable.
+docker cp /var/tmp/restore.dump postgres:/tmp/restore.dump
+docker exec postgres pg_restore \
+  --username=storytime --dbname=storytime \
+  --clean --if-exists --no-owner --no-privileges --jobs 2 \
+  /tmp/restore.dump
+
+# The dump is plaintext children's data — remove it from both filesystems.
+docker exec postgres rm -f /tmp/restore.dump && shred -u /var/tmp/restore.dump
+```
+
+Full procedure with verification steps: [`docs/migration.md`](../docs/migration.md)
+step 5.
+
+### Restore verification
+
+`enable_restore_verification` (on by default) installs a weekly job that pulls the
+newest dump, restores it into a **throwaway** Postgres container on no published
+port, asserts the table count is at least `restore_verify_min_tables`, and destroys
+the container. It never touches the live database. The result is recorded at
+`_status/last-restore-verify.json`, so "when was a restore last actually exercised"
+is answerable without shell access.
+
+> **The restore has NOT been exercised against real data yet.** Nothing in this
+> repository has been applied. Drill it — [`docs/migration.md`](../docs/migration.md)
+> step 2 — before trusting it. Until a human has restored a real dump and looked at
+> the rows, these are backups on paper.
 
 ### What replaces what
 
@@ -75,49 +291,56 @@ they are; they simply stop being the thing that runs in the new model.
 infra/
 ├── versions.tf                  provider + required_version pins, S3 backend
 ├── providers.tf                 aws provider, default_tags
-├── variables.tf                 every input, with the reasoning in the descriptions
-├── locals.tf                    prefix, container/route expansion, SSM param flattening
-├── guards.tf                    plan-time fail-fast preconditions
+├── variables.tf                 every input, with the reasoning in its description
+├── locals.tf                    prefix, container/route expansion, memory budget
+├── guards.tf                    plan-time fail-fast preconditions  <- read this
 ├── network.tf                   VPC, public subnet, 2 private subnets, IGW
 ├── security.tf                  app SG (no :22) + data SG (app-only ingress)
-├── ecr.tf                       shared per-service repositories
-├── iam.tf                       instance role: ECR pull, own-environment SSM, SSM SM
-├── compute.tf                   the instance, EIP, user-data  ← topology rationale
+├── ecr.tf                       per-service repositories, shared across stacks
+├── iam.tf                       instance role: ECR pull, own-prefix SSM, backup write
+├── compute.tf                   the instance, EIP, user-data
 ├── proxy.tf                     renders the Caddyfile in Terraform
 ├── ssm-config.tf                config_plain -> String, secret_keys -> SecureString
-├── rds.tf                       read-only lookup of the shared DB; optional dedicated DB
+├── database.tf                  container Postgres | RDS, behind one variable
+├── backups.tf                   S3 dump bucket + DLM snapshots  <- load-bearing
 ├── redis.tf                     container | elasticache | external
 ├── github-oidc.tf               OIDC provider + CI deploy role
-├── cloudflare.tf                DNS records, origin lockdown (off by default)
-├── outputs.tf
+├── cloudflare.tf                DNS records (the cutover lever), origin lockdown
+├── outputs.tf                   incl. memory_budget + backup health checks
 ├── templates/
-│   ├── user-data.sh.tftpl       bootstrap + redeploy.sh + reverse proxy + redis
+│   ├── user-data.sh.tftpl       bootstrap: docker, postgres, redis, containers,
+│   │                            caddy (pinned + SHA-512 verified), backup timers
 │   └── Caddyfile.tftpl          host-based routing, SSE-aware
-├── terraform.shared.tfvars.example
-├── terraform.dev.tfvars.example
-└── terraform.prod.tfvars.example
+├── terraform.all.tfvars.example      <- START HERE (the single box)
+├── terraform.shared.tfvars.example   optional account-global-only stack
+├── terraform.dev.tfvars.example      } for when an environment is
+├── terraform.prod.tfvars.example     } split onto its own box
+├── .terraform.lock.hcl          committed on purpose (pins provider versions)
+└── .gitignore
 ```
 
 ## Workspaces
 
-Five workspaces in one state bucket. `shared` is not a runtime environment: it
-owns the resources that must exist exactly once per account (the ECR
-repositories and the GitHub OIDC provider + CI role).
+**`all` is the default and, initially, the only one.** The rest exist so an
+environment can be peeled off later without rewriting anything.
 
 ```
-env:/shared/infra/terraform.tfstate    ECR repos, GitHub OIDC provider, CI role
-env:/dev/infra/terraform.tfstate
-env:/staging/infra/terraform.tfstate
-env:/blue/infra/terraform.tfstate       the v1.3.0 parallel line
-env:/prod/infra/terraform.tfstate
+env:/all/infra/terraform.tfstate        <- the single box: every environment on it
+env:/shared/infra/terraform.tfstate     optional: account-global resources only
+env:/dev/infra/terraform.tfstate        }
+env:/staging/infra/terraform.tfstate    } created only when an environment is
+env:/blue/infra/terraform.tfstate       } split onto its own box
+env:/prod/infra/terraform.tfstate       }
 ```
 
 `guards.tf` fails the plan if `terraform.workspace` and `var.environment`
 disagree, because in a workspace-per-environment layout every expensive mistake
 is "right command, wrong workspace".
 
-**Apply `shared` first.** Runtime workspaces read the ECR repositories through a
-data source and their plans will fail until those repositories exist.
+With `all`, that stack owns the ECR repositories itself (`manage_shared_ecr = true`),
+so there is no two-step bootstrap. Only if you later split environments does one
+stack need to own the repositories while the others read them through a data
+source — and then that one must be applied first.
 
 ## Remote state
 
@@ -215,24 +438,49 @@ re-run redeploy" — no Terraform, no file edit on the box.
 
 ## Safety rails
 
-- **`guards.tf`** — workspace/environment mismatch, `shared` trying to create an
-  instance, `create_database` without a password, `enable_origin_tls` without a
-  certificate, `restrict_to_cloudflare` without a proxied record (which would
-  make the origin unreachable), and secret names with no values: all fail at
-  **plan** time.
+All of these fail at **plan** time, before anything is created:
+
+- **Workspace/environment mismatch** — in a workspace-per-stack layout every
+  expensive mistake is "right command, wrong workspace".
+- **Memory budget** — committed container memory versus the instance's RAM, with the
+  arithmetic in the error message. Also rejects `memory_mb = 0`: an uncapped
+  container on a shared box can OOM the entire platform.
+- **Duplicate hostnames** across services — Caddy rejects two site blocks for one
+  address, which would kill the bootstrap before any container started.
+- **`config_plain` PORT disagreeing with `container_port`** — the proxy routes to
+  `container_port`, so a mismatch means an app listening where nothing is looking.
+- **Plaintext production** — a prod-bearing stack with neither Cloudflare nor origin
+  TLS is refused, unless `allow_plaintext_origin` says so explicitly. Children's
+  personal data does not go over the public internet in cleartext by omission.
+- **A secret name with no value** — an empty value would blank a live SSM parameter.
+- **`db_password` missing** — required for both database backends.
+- **`restrict_to_cloudflare` without a proxied record** — that combination makes the
+  origin unreachable.
+
+At apply/runtime:
+
 - **RDS** carries `prevent_destroy` *and* `deletion_protection`, a mandatory final
   snapshot, and `ignore_changes` on `password` and `engine_version` so an
-  out-of-band rotation or an AWS auto-minor-upgrade never shows up as a diff that
-  an apply would "correct" against a live database.
-- **ECR** is *not* `force_delete` (FateRound's is): a `destroy` there would take
-  the images every environment is running, prod included.
-- **IMDSv2 required**, hop limit 1 — IMDS is unreachable from inside a container,
-  so a compromised app process cannot mint instance-role credentials.
-- **Root EBS encrypted**; RDS and ElastiCache encrypted at rest, ElastiCache also
-  in transit.
+  out-of-band rotation or an AWS auto-minor upgrade never becomes a diff an apply
+  would "correct" against a live database.
+- **The backup bucket is not `force_destroy`** — `terraform destroy` cannot take the
+  backup history with it. The instance role has **no `s3:DeleteObject`**.
+- **ECR is not `force_delete`** (FateRound's is) — a destroy there would take the
+  images every environment is running.
+- **The Caddy binary is pinned and SHA-512 verified** against the digest committed in
+  `var.caddy_sha512`, not pulled unverified from `caddyserver.com/api/download`. A
+  mismatch aborts the bootstrap. This repository has already shipped one payload
+  disguised as a font; an unverified root-installed binary is the same exposure.
+- **IMDSv2 required**, hop limit 1 — IMDS is unreachable from inside a container, so
+  a compromised app process cannot mint instance-role credentials.
+- **Root EBS encrypted**; RDS and ElastiCache encrypted at rest, ElastiCache also in
+  transit; the backup bucket SSE-encrypted and TLS-only.
 - **No port 22 anywhere.** Shell access is SSM Session Manager.
-- Everything Cloudflare-related, the dedicated database, and origin TLS are
-  **off by default**.
+- **`Postgres is never recreated in place`** — the bootstrap starts an existing
+  container rather than replacing it, because recreating with a different image tag
+  against an initialised data directory is how a major-version mismatch corrupts a
+  database.
+- Cloudflare, the managed database, and origin TLS are all **off by default**.
 
 ## Running it
 
@@ -243,16 +491,18 @@ Docker with buildx for image builds, and the state bucket bootstrapped above.
 cd infra
 terraform init
 
-# Bootstrap workspace, once.
-terraform workspace new shared
-cp terraform.shared.tfvars.example terraform.shared.tfvars
-terraform plan -var-file=terraform.shared.tfvars
-
-# A runtime environment.
-terraform workspace new dev
-cp terraform.dev.tfvars.example terraform.dev.tfvars   # then fill in secret_values
-terraform plan -var-file=terraform.dev.tfvars
+terraform workspace new all
+cp terraform.all.tfvars.example terraform.all.tfvars
+# then: set the real hostnames, choose a TLS path, fill in secret_values
+export TF_VAR_db_password='...'          # required; keep it out of the file
+terraform plan -var-file=terraform.all.tfvars
 ```
+
+**The shipped example fails the plan on purpose.** `environment = "all"` serves
+production hostnames, and neither `cloudflare_enabled` nor `enable_origin_tls` is
+set, so `guards.tf` refuses rather than quietly serving children's data over
+plaintext HTTP. Pick a TLS path — or set `allow_plaintext_origin = true`, which is
+only defensible pre-cutover with no real traffic.
 
 ### Dry-running safely
 
@@ -305,7 +555,7 @@ re-run user-data on Amazon Linux 2023 — which is why `latest` is a bad tag her
 
 ## Adopting the existing RDS
 
-`emerj-shared-db` is currently referenced **read-only** via
+`the legacy shared RDS instance` is currently referenced **read-only** via
 `data.aws_db_instance.shared`, purely so its endpoint appears in outputs.
 Terraform does not manage it.
 
@@ -322,49 +572,91 @@ replaced. When you do it:
    *any* modification, and especially anything marked "must be replaced", stop
    and fix the resource definition — do not apply.
 
-### Splitting the shared database
+### Migrating off the legacy shared database
 
-One RDS instance serves dev **and** staging **and** blue **and** prod
-simultaneously. A dev migration, a bad seed, or a runaway query in staging is a
-production incident. `create_database = true` per environment provisions a
-dedicated instance, but the *cutover* — dump, restore, connection-string change,
-verification, rollback plan — is a data-migration project, not a
-`terraform apply`. It is deliberately off by default in every environment.
+One legacy RDS instance serves dev **and** staging **and** blue **and** prod
+simultaneously, and it is publicly resolvable. A dev migration, a bad seed, or a
+runaway query in staging is a production incident.
+
+The target here is not "split it four ways" — it is **migrate off it entirely** onto
+this stack's own Postgres (container by default, RDS if `use_managed_database`
+becomes true). That is [`docs/migration.md`](../docs/migration.md) step 5: dump the
+legacy instance, restore into the new one, verify, cut over, keep the old one until
+confident.
+
+Until that happens the legacy instance is only ever *read* by Terraform, via
+`data.aws_db_instance.shared`, so its endpoint appears in outputs during the
+migration.
+
+## Region and data residency
+
+Defaulted to **`eu-west-1`**, where every existing resource already is.
+
+Storytime processes **children's personal data** and ships **GDPR data-export
+features**, so region is a **data-residency and compliance decision**, not a latency
+preference — FateRound's own README frames region choice exactly that way. Moving it
+to `us-east-1` for consistency with FateRound would move children's personal data to
+another jurisdiction. **Do not do that without an explicit, recorded decision.**
+
+It is `var.aws_region`, so changing it is one line plus a migration
+([`docs/migration.md`](../docs/migration.md)) — not a rewrite.
 
 ## Open decisions
 
 Things that genuinely cannot be settled from here:
 
-1. **Region / data residency.** Defaulted to **`eu-west-1`**, where everything
-   already is. Storytime processes children's personal data and ships GDPR
-   export features, so this is a compliance decision needing an explicit
-   sign-off — not something to align with FateRound's `us-east-1`.
+1. **Region sign-off** — see the section immediately above. `eu-west-1` is the
+   default; a change is a GDPR decision.
 2. **Which AWS account.** FateRound is `772316781095`. Storytime's existing
    resources are named `emerj-*`, which suggests a different account. If it is
    the *same* account, the GitHub OIDC provider already exists and
    `manage_github_oidc` must stay `false` everywhere (creating a second provider
    for the same URL fails).
-3. **The shared RDS split.** Prerequisite for real environment isolation, and the
-   largest outstanding risk in the platform. Needs a migration plan.
-4. **Redis per environment.** `container` (cheap, loses queued jobs on box
-   replacement) vs `elasticache` (durable, costs money). Defaults: container for
-   dev/blue, ElastiCache for staging/prod. Needs cost sign-off.
-5. **Cloudflare or stay on Namecheap.** DNS is hand-edited at Namecheap today
+3. **Migrating off the legacy shared database.** The largest outstanding risk in
+   the platform. Procedure is written; scheduling it and accepting the downtime
+   window is a human call.
+4. **Whether the ~24h backup RPO is acceptable.** That is what a container Postgres
+   with nightly dumps gives you. `use_managed_database = true` buys PITR for
+   +$12.41/mo. This is a data-loss-tolerance decision about children's data.
+5. **Drilling the restore.** Nothing here has been applied, so no dump has ever been
+   restored. Until a human does it once, the backups are unproven.
+6. **Cloudflare or stay on Namecheap.** DNS is hand-edited at Namecheap today
    (TTL 1800, no CDN, no load balancer). Everything Cloudflare is off by default.
    Moving the zone also decides where TLS terminates.
-6. **Moving waitlist production and the apex marketing site off the dev box.**
-   They run on `52.18.195.224` today, alongside dev, staging and blue — so a dev
+7. **Moving waitlist production and the apex marketing site off the shared box.**
+   They run on `host-a` today, alongside dev, staging and blue — so a dev
    deploy can take down the public marketing site. They are `enabled = false` in
    `terraform.prod.tfvars.example` pending a scheduled DNS cutover.
-7. **Prod deploy authorisation.** The CI role is tag-scoped to the whole project,
+8. **Prod deploy authorisation.** The CI role is tag-scoped to the whole project,
    so one role can redeploy any environment including prod. If prod should need a
    separate role or a manual approval, split `gha_deploy_ssm` per environment.
-8. **Dockerfiles do not exist yet.** No app repo has one. Nothing here can run
+9. **Dockerfiles do not exist yet.** No app repo has one. Nothing here can run
    until they do, and each needs the right Node base image — fe requires
    Node >= 24, superadmin pins 20, backend CI uses 22.
-9. **The log viewer.** `logs.py` runs as a CGI behind nginx + fcgiwrap with basic
+10. **The log viewer.** `logs.py` runs as a CGI behind nginx + fcgiwrap with basic
    auth. It has no service entry here: containerising a CGI, or replacing it with
    CloudWatch Logs, is an open question.
-10. **The two waitlist API ports are unknown.** Both PM2 processes default to
+11. **The two waitlist API ports are unknown.** Both PM2 processes default to
     3000 and the real ports were never recorded. `enabled = false` until the
     capture output confirms them.
+
+## Follow-ups outside this repository
+
+Not fixed here, listed so they are not forgotten:
+
+1. **`storytime_be/.github/workflows/dev-deploy.yml` hardcodes the legacy host's
+   `IP:22` and the legacy RDS hostname** across five `step-security/harden-runner`
+   `allowed-endpoints` blocks under `egress-policy: block`. Any migration silently
+   breaks dev deploys until that file is edited, and the failure looks like a
+   network problem rather than a configuration one. This is exactly the hidden
+   coupling this work exists to remove.
+2. **No Dockerfile in any app repo.** Nothing here can run until they exist, each on
+   the right Node base (fe >= 24, superadmin 20, backend 22).
+3. **No CI workflow builds or pushes images to ECR.** The OIDC role and its ECR
+   permissions are here; the workflow that uses them is not.
+4. **Nothing pages a human when the backup heartbeat goes stale.** The signal exists
+   and is readable from anywhere; wiring it to an alert does not.
+5. **This repository is public**, and its git history — including this branch's
+   earlier commits — contains the legacy host IPs and RDS endpoint. They have been
+   removed from the working tree. Whether to make the repository private or rewrite
+   history is a human decision.

@@ -33,13 +33,53 @@ output "redis_endpoint" {
   value       = local.redis_endpoint
 }
 
-output "dedicated_db_endpoint" {
-  description = "Endpoint of this environment's dedicated RDS instance, when create_database = true."
-  value       = try(aws_db_instance.main[0].endpoint, null)
+output "database_endpoint" {
+  description = "Where the app should reach Postgres: the RDS endpoint when use_managed_database = true, otherwise the container's name on the box's docker network."
+  value       = var.use_managed_database ? try(aws_db_instance.main[0].endpoint, null) : "postgres:5432 (container, loopback-published on 127.0.0.1:5432)"
+}
+
+output "database_backend" {
+  description = "Which database backend this stack uses."
+  value       = var.use_managed_database ? "rds" : "container"
+}
+
+output "backup_bucket" {
+  description = "S3 bucket holding the nightly pg_dump output."
+  value       = try(aws_s3_bucket.backups[0].bucket, null)
+}
+
+output "backup_health_check" {
+  description = "Run this to see when the last backup actually succeeded. A stale timestamp is how a backup failure surfaces without shell access to the box."
+  value = try(
+    "aws s3 cp s3://${aws_s3_bucket.backups[0].bucket}/_status/last-success.json - | cat",
+    null
+  )
+}
+
+output "restore_verification_check" {
+  description = "Run this to see when a dump was last actually restored and its tables counted. If this is null or stale, the backups are unproven."
+  value = try(
+    "aws s3 cp s3://${aws_s3_bucket.backups[0].bucket}/_status/last-restore-verify.json - | cat",
+    null
+  )
+}
+
+output "memory_budget" {
+  description = "Committed container memory vs the instance's RAM. Enforced at plan time by guards.tf."
+  value = {
+    instance_type   = var.instance_type
+    instance_ram_mb = local.instance_ram_known ? local.instance_ram_total_mb : null
+    app_mb          = local.app_memory_mb
+    postgres_mb     = local.postgres_container_mb
+    redis_mb        = local.redis_container_mb
+    host_reserve_mb = var.host_reserved_mb
+    committed_mb    = local.committed_memory_mb
+    headroom_mb     = local.instance_ram_known ? local.instance_ram_total_mb - local.committed_memory_mb : null
+  }
 }
 
 output "shared_db_endpoint" {
-  description = "Endpoint of the EXISTING shared RDS instance, looked up read-only. Note it currently serves dev, staging, blue AND prod at once."
+  description = "Endpoint of the EXISTING legacy shared RDS instance, looked up read-only. It currently serves dev, staging, blue AND prod at once; this is the migration SOURCE, not a target."
   value       = try(data.aws_db_instance.shared[0].endpoint, null)
 }
 

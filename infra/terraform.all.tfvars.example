@@ -1,0 +1,152 @@
+# terraform.all.tfvars — THE DEFAULT STACK. Start here.
+#
+#   terraform workspace new all       # or: terraform workspace select all
+#   cp terraform.all.tfvars.example terraform.all.tfvars
+#   terraform plan -var-file=terraform.all.tfvars
+#
+# ONE t3.small box, running Postgres and Redis as containers alongside the
+# applications, behind Cloudflare. ~$24/mo all in. Storytime has fewer than 100
+# monthly users; one instance per environment was ~$225/mo and was rejected as
+# overbuilt. See README -> "Cost" and "One box, and when to stop using one box".
+
+environment   = "all"
+aws_region    = "eu-west-1" # children's data + GDPR: a compliance choice, not a default
+instance_type = "t3.small"  # 2 GiB. Bump to t3.medium (4 GiB) to enable more services.
+
+root_volume_size = 30
+
+# Data tier: containers on the same box.
+use_managed_database = false      # true -> RDS instead (~+$12.41/mo)
+redis_mode           = "container" # BullMQ queues + cache + guest sessions
+
+# REQUIRED. Do not put a real value in this file — use the environment:
+#   export TF_VAR_db_password='...'
+db_password = ""
+
+# ---------------------------------------------------------------------------
+# MEMORY BUDGET — guards.tf fails the plan if this does not fit.
+#
+#   t3.small total                     2048 MiB
+#   - host reserve (OS, docker, SSM)   -400
+#   - postgres container               -512
+#   - redis container                  -192
+#   ------------------------------------------
+#   available for applications          944 MiB
+#
+# So: two application containers on a t3.small. The API and the web frontend are
+# the two that have to exist. Everything else is defined below but DISABLED, with
+# the instance size it needs noted — turning one on without resizing will fail the
+# plan with the arithmetic, which is the intended behaviour.
+# ---------------------------------------------------------------------------
+services = {
+  "api" = {
+    container_port = 3000
+    host_port      = 3000
+    hostnames      = ["api.example.invalid"] # <-- replace with the real hostname
+    sse            = true                    # story generation + TTS progress stream
+    max_body_size  = "25m"
+    read_timeout   = "3600s"
+    health_path    = "/health"
+    image_tag      = "latest" # switch to the commit SHA once CI pushes images
+    memory_mb      = 512
+  }
+
+  "web" = {
+    container_port = 3000
+    host_port      = 3100
+    hostnames      = ["web.example.invalid"] # <-- replace
+    memory_mb      = 384
+  }
+
+  # --- needs t3.medium or larger -------------------------------------------
+
+  "admin" = {
+    container_port = 3000
+    host_port      = 3200
+    hostnames      = []
+    enabled        = false
+    memory_mb      = 320
+  }
+
+  "waitlist-web" = {
+    container_port = 3000
+    host_port      = 3300
+    hostnames      = []
+    enabled        = false
+    memory_mb      = 256
+  }
+
+  # Port never recorded on the live box (the PM2 process defaults to 3000).
+  # Confirm from the capture output's 70-network/listening-sockets.txt first.
+  "waitlist-api" = {
+    container_port = 3000
+    host_port      = 3400
+    hostnames      = []
+    enabled        = false
+    memory_mb      = 256
+  }
+}
+
+# Non-secret config -> SSM String parameters. Committed on purpose.
+# NOTE: if you set PORT here it must equal that service's container_port, or the
+# plan fails — the reverse proxy routes to container_port.
+config_plain = {
+  "api" = {
+    NODE_ENV = "production"
+  }
+  "web" = {
+    NODE_ENV = "production"
+  }
+}
+
+# NAMES of the secrets each service needs -> SSM SecureString parameters.
+# Committed on purpose: this is the shape of the configuration, and reviewing it is
+# how you notice a missing key. Fill from the capture output's
+# 90-apps/env-keys/*.keys.txt, which emits names only.
+secret_keys = {
+  "api" = [
+    # "DATABASE_URL",
+    # "REDIS_URL",
+    # "JWT_SECRET",
+  ]
+}
+
+# VALUES. Never committed (this file is gitignored). Prefer TF_VAR_secret_values.
+secret_values = {}
+
+# ---------------------------------------------------------------------------
+# Edge / TLS.
+#
+# Left off, so THIS EXAMPLE WILL FAIL THE PLAN as-is — on purpose. `environment`
+# is prod-bearing, and a plan that quietly served children's data over plaintext
+# HTTP would be worse than one that stops and asks. Choose one:
+#
+#   a) cloudflare_enabled = true  + zone id + CLOUDFLARE_API_TOKEN   <- intended
+#   b) enable_origin_tls  = true  + a Cloudflare Origin Certificate
+#   c) allow_plaintext_origin = true, only pre-cutover with no real traffic
+# ---------------------------------------------------------------------------
+cloudflare_enabled = false
+# cloudflare_zone_id     = "REPLACE_WITH_ZONE_ID"
+# cloudflare_proxied     = true   # orange cloud: TLS/WAF/CDN at the edge
+# restrict_to_cloudflare = true   # lock the origin to Cloudflare's IPs
+# cloudflare_dns_ttl     = 60     # low TTL = a working rollback lever
+
+allow_plaintext_origin = false
+
+# ---------------------------------------------------------------------------
+# Backups. Do not switch these off — this stack has no managed database, so these
+# ARE the backups. See README -> "Backups".
+# ---------------------------------------------------------------------------
+# backup_bucket_name        = ""     # defaults to storytime-all-backups
+backup_retention_days       = 30
+enable_ebs_snapshots        = true
+enable_restore_verification = true
+restore_verify_min_tables   = 5
+
+# The legacy shared instance, looked up READ-ONLY so its endpoint shows in outputs
+# during the migration. Terraform never modifies it.
+shared_db_identifier = "" # e.g. the legacy shared RDS identifier, or "" to skip
+
+manage_shared_ecr = true
+# Confirm the account has no OIDC provider first: aws iam list-open-id-connect-providers
+manage_github_oidc = false

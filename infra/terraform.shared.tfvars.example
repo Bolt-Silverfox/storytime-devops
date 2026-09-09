@@ -15,7 +15,15 @@ aws_region      = "eu-west-1"
 create_instance = false
 
 manage_shared_ecr = true
-manage_github_oidc = true
+
+# LEFT FALSE ON PURPOSE. Creating a second OIDC provider for
+# token.actions.githubusercontent.com in an account that already has one FAILS the
+# apply, and which AWS account this is has not been settled (README -> "Open
+# decisions"). Confirm the account has no existing provider, then set this true —
+# note it also gates the CI deploy role, so CI has no role until you do.
+#
+#   aws iam list-open-id-connect-providers
+manage_github_oidc = false
 
 # One repository per service. The keys here define which repositories exist; the
 # runtime workspaces pick from them.

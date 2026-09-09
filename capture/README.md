@@ -85,19 +85,23 @@ Two files are needed: `capture-host.sh` and `lib/redact.py`.
 
 **Over SSH:**
 
+Archive ONLY the two files, never `capture/.` — that would sweep up any existing
+`captures/` output and ship previous (possibly unreviewed) captures to the host,
+or into shell history via the base64 one-liner below.
+
 ```bash
-tar czf - -C capture . | ssh ubuntu@52.18.195.224 \
+tar czf - -C capture capture-host.sh lib | ssh ubuntu@<host> \
   'mkdir -p ~/st-capture && tar xzf - -C ~/st-capture && cd ~/st-capture && ./capture-host.sh'
 
 # bring the result back
-scp -r ubuntu@52.18.195.224:~/st-capture/captures/ ./capture/captures/
+scp -r ubuntu@<host>:~/st-capture/captures/ ./capture/captures/
 ```
 
 **Over SSM Session Manager** (no file transfer available — paste a bundle):
 
 ```bash
 # locally: print a one-liner, then paste it into the session
-echo "echo '$(tar czf - -C capture . | base64 -w0)' | base64 -d | tar xzf - -C ~/st-capture"
+echo "echo '$(tar czf - -C capture capture-host.sh lib | base64 -w0)' | base64 -d | tar xzf - -C ~/st-capture"
 ```
 
 Then, inside the session:

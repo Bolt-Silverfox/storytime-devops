@@ -84,12 +84,52 @@ WARNINGS=""
 
 have() { command -v "$1" >/dev/null 2>&1; }
 
+warn() {
+  echo "  ! $1" >&2
+  WARNINGS="${WARNINGS}$1"$'\n'
+}
+
+# ---------------------------------------------------------------------------
+# Secure scratch directory.
+#
+# run_redacted has to hold a probe's RAW output somewhere while the redactor runs,
+# and that raw output is real secrets. A plain `rm -f` at the end of the function
+# is not enough: Ctrl-C in a Session Manager shell, a SIGTERM, or a dropped
+# connection would leave unredacted material in /tmp.
+#
+# So: one 0700 directory, and a trap on every signal that can end this script,
+# which shreds the contents. `shred` when available (it overwrites before
+# unlinking), `rm -rf` otherwise.
+# ---------------------------------------------------------------------------
+SCRATCH=$(mktemp -d "${TMPDIR:-/tmp}/storytime-capture.XXXXXX")
+chmod 700 "$SCRATCH"
+
+scrub_scratch() {
+  [ -d "$SCRATCH" ] || return 0
+  if have shred; then
+    find "$SCRATCH" -type f -exec shred -u -n 1 {} + 2>/dev/null || true
+  fi
+  rm -rf "$SCRATCH"
+}
+# EXIT alone does not fire on an uncaught signal, so name them explicitly.
+trap 'scrub_scratch' EXIT
+trap 'scrub_scratch; exit 130' INT
+trap 'scrub_scratch; exit 143' TERM
+trap 'scrub_scratch; exit 129' HUP
+
 # Bound every probe. SIGTERM first, SIGKILL 5s later if it ignores that.
 # Exit code 124 from `timeout` shows up in 00-MANIFEST.txt, so a probe that timed
 # out is visibly different from one whose tool is missing.
 TIMEOUT=()
 if have timeout; then
   TIMEOUT=(timeout --signal=TERM --kill-after=5 "$TIMEOUT_S")
+else
+  # Without coreutils' `timeout` the documented per-probe budget is NOT in force,
+  # and a hung probe will hang the whole capture. That is worth being loud about
+  # — it lands in 99-WARNINGS.txt — but not worth refusing to run over: this
+  # script exists to gather evidence from possibly-degraded hosts, and a missing
+  # coreutils binary is itself a finding rather than a reason to give up.
+  warn "coreutils 'timeout' not found: probes run WITHOUT a wall-clock limit, so --timeout ${TIMEOUT_S}s is NOT enforced. A hung probe will hang this capture; interrupt it with Ctrl-C (temporary files are shredded on the way out)."
 fi
 
 # sudo, non-interactive only. Never prompts, never hangs a Session Manager shell.
@@ -99,11 +139,6 @@ if [ "$(id -u)" = "0" ]; then
 elif have sudo && sudo -n true 2>/dev/null; then
   SUDO="sudo -n"
 fi
-
-warn() {
-  echo "  ! $1" >&2
-  WARNINGS="${WARNINGS}$1"$'\n'
-}
 
 # ---------------------------------------------------------------------------
 # run <relative-output-path> <command...>
@@ -153,8 +188,10 @@ run_redacted() {
     return 0
   fi
 
+  # Inside the trapped, 0700 scratch directory — never a bare /tmp mktemp.
   local raw redacted
-  raw=$(mktemp); redacted=$(mktemp)
+  raw=$(mktemp "$SCRATCH/raw.XXXXXX")
+  redacted=$(mktemp "$SCRATCH/red.XXXXXX")
   chmod 600 "$raw" "$redacted"
 
   "${TIMEOUT[@]}" "$@" > "$raw" 2>/dev/null
@@ -168,12 +205,22 @@ run_redacted() {
       echo "---"
       cat "$redacted"
     } > "$OUT/$dest"
-    echo "ok     $dest  <- $* [redacted:$mode]" >> "$OUT/00-MANIFEST.txt"
+    # The redaction succeeding says nothing about the PROBE succeeding. A missing
+    # tool or a denied sudo must not be recorded as a successful capture.
+    if [ "$rc" = "0" ]; then
+      echo "ok     $dest  <- $* [redacted:$mode]" >> "$OUT/00-MANIFEST.txt"
+    else
+      echo "rc=$rc  $dest  <- $* [redacted:$mode]" >> "$OUT/00-MANIFEST.txt"
+      if [ "$rc" = "124" ]; then
+        warn "TIMEOUT after ${TIMEOUT_S}s: $dest  <- $*"
+      fi
+    fi
   else
     warn "SKIPPED $dest — redact.py '$mode' failed on the input; refusing to write it unredacted."
   fi
 
-  # Shred the intermediate: it held real secrets.
+  # Shred the intermediates immediately; the trap is the backstop, not the plan.
+  if have shred; then shred -u -n 1 "$raw" "$redacted" 2>/dev/null || true; fi
   rm -f "$raw" "$redacted"
 }
 

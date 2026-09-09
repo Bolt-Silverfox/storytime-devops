@@ -8,7 +8,7 @@
 # Private subnets have NO egress route, which is fine — RDS and ElastiCache do
 # not need outbound internet.
 #
-# NOTE: the existing shared RDS (emerj-shared-db) is PUBLICLY resolvable, so
+# NOTE: the existing shared RDS (the legacy shared RDS instance) is PUBLICLY resolvable, so
 # while environments still point at it they reach it over the internet rather
 # than inside this VPC. That is a finding, not a design: see README.
 

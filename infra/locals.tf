@@ -1,4 +1,59 @@
 locals {
+  # ---------------------------------------------------------------------------
+  # Memory budget.
+  #
+  # The whole platform runs on ONE small box, and that box also hosts Postgres and
+  # Redis. On a t3.small (2 GiB) there is roughly 1.2 GiB left for application
+  # containers after the OS, dockerd, the SSM agent and Caddy. Overcommitting does
+  # not fail at apply time — it fails at 03:00 when the kernel OOM-kills whichever
+  # container it likes least. guards.tf turns that into a plan-time error.
+  #
+  # RAM per instance type, in MiB. Extend as needed, or set
+  # var.instance_ram_mb_override; an unknown type simply skips the check.
+  # ---------------------------------------------------------------------------
+  instance_ram_mb = {
+    "t3.micro"   = 1024
+    "t3.small"   = 2048
+    "t3.medium"  = 4096
+    "t3.large"   = 8192
+    "t3.xlarge"  = 16384
+    "t4g.small"  = 2048
+    "t4g.medium" = 4096
+    "t4g.large"  = 8192
+    "m6i.large"  = 8192
+    "m7g.large"  = 8192
+  }
+
+  instance_ram_known = (
+    var.instance_ram_mb_override > 0
+    || contains(keys(local.instance_ram_mb), var.instance_type)
+  )
+
+  instance_ram_total_mb = (
+    var.instance_ram_mb_override > 0
+    ? var.instance_ram_mb_override
+    : lookup(local.instance_ram_mb, var.instance_type, 0)
+  )
+
+  # Data-tier containers only count when they actually run on the box.
+  postgres_container_mb = var.use_managed_database ? 0 : var.postgres_memory_mb
+  redis_container_mb    = var.redis_mode == "container" ? var.redis_memory_mb : 0
+
+  # A service with memory_mb = 0 is UNCAPPED, so the budget cannot be checked
+  # against it. Counted separately and reported, rather than silently treated as 0.
+  uncapped_services = [for k, v in local.enabled_services : k if v.memory_mb == 0]
+
+  app_memory_mb = sum(concat([0], [
+    for c in local.containers : c.memory_mb
+  ]))
+
+  committed_memory_mb = (
+    local.app_memory_mb
+    + local.postgres_container_mb
+    + local.redis_container_mb
+    + var.host_reserved_mb
+  )
+
   # Every resource name and every SSM path is namespaced by project+environment,
   # so four workspaces can coexist in one account without colliding.
   prefix = "${var.name_prefix}-${var.environment}"
@@ -37,8 +92,24 @@ locals {
     } if length(svc.hostnames) > 0
   ]
 
-  # All hostnames this environment answers for, deduped, for DNS records.
+  # All hostnames this stack answers for, deduped, for DNS records.
   all_hostnames = distinct(flatten([for r in local.routes : r.hostnames]))
+
+  # Undeduped, so a collision between two services is detectable in guards.tf.
+  declared_hostnames = flatten([for r in local.routes : r.hostnames])
+
+  duplicate_hostnames = distinct([
+    for h in local.declared_hostnames : h
+    if length([for x in local.declared_hostnames : x if x == h]) > 1
+  ])
+
+  # Services whose config_plain PORT contradicts their container_port. PORT is now
+  # applied as a default rather than an override, so a mismatch would leave the app
+  # listening where the proxy is not looking.
+  port_conflicts = [
+    for name, svc in local.enabled_services : name
+    if lookup(lookup(var.config_plain, name, {}), "PORT", tostring(svc.container_port)) != tostring(svc.container_port)
+  ]
 
   # ---------------------------------------------------------------------------
   # SSM parameter flattening.

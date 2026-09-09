@@ -25,17 +25,28 @@ variable "name_prefix" {
 
 variable "environment" {
   description = <<-EOT
-    Which environment this workspace represents.
+    Which stack this workspace represents.
 
-    `shared` is not a runtime environment: it is the bootstrap workspace that
-    owns the account-global resources (ECR repositories, the GitHub OIDC
-    provider). Apply `shared` first, once, then the runtime environments.
+    `all` is the DEFAULT and the initial deployment: a SINGLE box hosting every
+    environment's containers side by side. Storytime has fewer than 100 monthly
+    users, and one instance per environment was rejected as overbuilt for that.
+    See README -> "One box, and when to stop using one box".
+
+    The other values exist so an environment can be PEELED OFF onto its own box
+    later without rewriting anything: create a new workspace, set
+    `environment = "prod"`, give it only the prod services, and flip the
+    Cloudflare records. That is the whole migration.
+
+    `shared` is not a runtime stack; it exists only if you later want the
+    account-global resources (ECR repositories, the GitHub OIDC provider) split
+    away from the runtime stacks. With `all` they belong to the single stack.
   EOT
   type        = string
+  default     = "all"
 
   validation {
-    condition     = contains(["shared", "dev", "staging", "blue", "prod"], var.environment)
-    error_message = "environment must be one of: shared, dev, staging, blue, prod."
+    condition     = contains(["all", "shared", "dev", "staging", "blue", "prod"], var.environment)
+    error_message = "environment must be one of: all, shared, dev, staging, blue, prod."
   }
 }
 
@@ -51,24 +62,56 @@ variable "vpc_cidr" {
 
 variable "instance_type" {
   description = <<-EOT
-    EC2 instance type for this environment's application host.
+    EC2 instance type for the application host. A VARIABLE, not a hardcoded
+    resource attribute, so resizing is a one-line change and a migration never
+    has to hunt for it.
 
-    Sizing note: this box runs SEVERAL containers (see var.services), not one.
-    The shared multi-env box today runs ~10 PM2 processes, so a t3.small is not
-    a realistic starting point for dev/staging/blue.
+    Default `t3.small` (2 vCPU, 2 GiB, ~$16.64/mo in eu-west-1) — deliberately
+    minimal, to scale UP from rather than down to.
+
+    BUDGET REALITY, and `guards.tf` enforces it: the box also runs Postgres and
+    Redis as containers. On 2 GiB that leaves roughly 1.2 GiB for application
+    containers, which is two small Node services — not eighteen. If you put
+    dev + staging + prod of every service on one box you need t3.medium (4 GiB)
+    or t3.large (8 GiB). The plan will tell you rather than the box OOM-killing
+    at 03:00.
+
+      t3.small   2 GiB   ~$16.64/mo
+      t3.medium  4 GiB   ~$33.29/mo
+      t3.large   8 GiB   ~$66.58/mo
   EOT
   type        = string
-  default     = "t3.medium"
+  default     = "t3.small"
+}
+
+variable "instance_ram_mb_override" {
+  description = <<-EOT
+    RAM in MiB for `instance_type`, for the memory-budget guard. Only needed for
+    an instance type not in `locals.instance_ram_mb`; 0 means "look it up, and
+    skip the check if unknown". Never used to size a resource.
+  EOT
+  type        = number
+  default     = 0
+}
+
+variable "host_reserved_mb" {
+  description = "RAM held back for the OS, dockerd, the SSM agent and Caddy, and excluded from the container memory budget."
+  type        = number
+  default     = 400
 }
 
 variable "root_volume_size" {
-  description = "Root EBS volume size (GiB). Must hold several container images plus logs; `docker image prune -af` runs on each redeploy."
+  description = <<-EOT
+    Root EBS volume size (GiB), always encrypted. Holds the container images, the
+    Postgres data directory when `use_managed_database = false`, and logs.
+    `docker image prune -af` runs on every redeploy so images stay bounded.
+  EOT
   type        = number
-  default     = 40
+  default     = 30
 
   validation {
     condition     = var.root_volume_size >= 20
-    error_message = "root_volume_size must be at least 20 GiB (multiple container images plus logs)."
+    error_message = "root_volume_size must be at least 20 GiB (container images + Postgres data + logs)."
   }
 }
 
@@ -216,78 +259,104 @@ variable "secret_values" {
 # Database
 # ---------------------------------------------------------------------------
 
-variable "shared_db_identifier" {
+variable "use_managed_database" {
   description = <<-EOT
-    Identifier of the EXISTING shared RDS instance (today: emerj-shared-db in
-    eu-west-1, serving dev AND staging AND blue AND prod at the same time).
+    false (DEFAULT) -> Postgres runs as a CONTAINER on the app box.
+    true            -> a managed RDS instance is created instead.
 
-    When set, a READ-ONLY data source looks it up so its endpoint can be
-    surfaced in outputs and referenced while environments still share it.
-    Terraform never modifies it through this variable. Leave "" to skip.
-  EOT
-  type        = string
-  default     = ""
-}
+    Managed RDS would roughly double the bill at this user count
+    (db.t4g.micro ~$12.41/mo on top of a $16.64 instance), so the default is the
+    container. The switch exists so moving to RDS later is a VARIABLE FLIP plus a
+    data migration, not a rewrite: the app reads its connection string from SSM
+    either way, and `outputs.tf` reports whichever endpoint is live.
 
-variable "create_database" {
-  description = <<-EOT
-    Create a DEDICATED RDS Postgres instance for this environment.
-
-    DEFAULTS TO FALSE. Splitting the single shared database is a prerequisite
-    for real environment isolation, but it is a data-migration project, not a
-    `terraform apply`. Turn this on per environment only when the cutover for
-    that environment is planned. The resource carries prevent_destroy and
-    deletion_protection.
+    THE PRICE OF THE DEFAULT: a container's data lives on the instance's EBS
+    volume, so Postgres is the one thing on this box that is not disposable. That
+    is only defensible because backups are mandatory and real — nightly pg_dump to
+    a versioned encrypted S3 bucket plus DLM EBS snapshots (see backups.tf). This
+    is children's personal data under GDPR. Do not remove the backups.
   EOT
   type        = bool
   default     = false
 }
 
-variable "db_engine_version" {
-  description = "Postgres engine version for a dedicated instance. Must match or exceed what the shared instance runs; confirm with the capture output before setting."
+variable "postgres_image" {
+  description = "Image used when use_managed_database = false. Pinned to a minor line, never `latest` — an unpinned major upgrade would refuse to start against an existing data directory."
   type        = string
-  default     = "16.4"
+  default     = "public.ecr.aws/docker/library/postgres:16.4-alpine"
 }
 
-variable "db_instance_class" {
-  description = "Instance class for a dedicated RDS instance."
-  type        = string
-  default     = "db.t4g.micro"
-}
-
-variable "db_allocated_storage" {
-  description = "Initial storage (GiB) for a dedicated RDS instance."
+variable "postgres_memory_mb" {
+  description = "Memory limit for the Postgres container. Counts against the instance memory budget enforced in guards.tf."
   type        = number
-  default     = 20
+  default     = 512
 }
 
-variable "db_max_allocated_storage" {
-  description = "Storage autoscaling ceiling (GiB) for a dedicated RDS instance. 0 disables autoscaling."
+variable "redis_memory_mb" {
+  description = "Memory limit for the Redis container. Counts against the instance memory budget enforced in guards.tf."
   type        = number
-  default     = 100
+  default     = 192
 }
 
 variable "db_name" {
-  description = "Initial database name for a dedicated RDS instance."
+  description = "Initial database name, for either backend."
   type        = string
   default     = "storytime"
 }
 
 variable "db_username" {
-  description = "Master username for a dedicated RDS instance."
+  description = "Database superuser/master username, for either backend."
   type        = string
   default     = "storytime"
 }
 
 variable "db_password" {
-  description = "Master password for a dedicated RDS instance. Required when create_database = true."
+  description = "Database password. REQUIRED for both backends — a container Postgres with a blank password is as bad as an RDS one. Supply via TF_VAR_db_password or a gitignored tfvars."
   type        = string
   default     = ""
   sensitive   = true
 }
 
+variable "shared_db_identifier" {
+  description = <<-EOT
+    Identifier of the EXISTING shared RDS instance (today: the legacy shared RDS instance in
+    eu-west-1, serving dev AND staging AND blue AND prod at the same time).
+
+    When set, a READ-ONLY data source looks it up so its endpoint is visible in
+    outputs during a migration. Terraform never modifies it. Leave "" to skip.
+  EOT
+  type        = string
+  default     = ""
+}
+
+# --- only used when use_managed_database = true -----------------------------
+
+variable "db_engine_version" {
+  description = "Postgres engine version for a managed instance. Confirm it matches what the container/source database runs before migrating."
+  type        = string
+  default     = "16.4"
+}
+
+variable "db_instance_class" {
+  description = "Managed instance class. eu-west-1: db.t4g.micro ~$12.41/mo, db.t4g.small ~$25.55, db.t4g.medium ~$50.37."
+  type        = string
+  default     = "db.t4g.micro"
+}
+
+variable "db_allocated_storage" {
+  description = "Initial storage (GiB) for a managed instance."
+  type        = number
+  default     = 20
+}
+
+variable "db_max_allocated_storage" {
+  description = "Storage autoscaling ceiling (GiB) for a managed instance. 0 disables autoscaling."
+  type        = number
+  default     = 100
+}
+
 variable "db_backup_retention_days" {
-  description = "Automated backup retention for a dedicated RDS instance. Never 0 — 0 disables backups AND point-in-time recovery."
+  description = "Automated backup retention for a managed instance. Never 0 — 0 disables backups AND point-in-time recovery."
   type        = number
   default     = 7
 
@@ -295,6 +364,91 @@ variable "db_backup_retention_days" {
     condition     = var.db_backup_retention_days >= 1
     error_message = "db_backup_retention_days must be >= 1; 0 disables automated backups and PITR."
   }
+}
+
+# ---------------------------------------------------------------------------
+# Backups — NOT OPTIONAL. See use_managed_database above for why.
+# ---------------------------------------------------------------------------
+
+variable "backup_bucket_name" {
+  description = <<-EOT
+    S3 bucket for nightly pg_dump output. Created by this configuration
+    (versioned, SSE-encrypted, public-access-blocked, TLS-only, lifecycle-expired)
+    — unlike the Terraform STATE bucket, there is no chicken-and-egg here.
+
+    Empty means "<name_prefix>-<environment>-backups". Bucket names are globally
+    unique; if that is taken, set one explicitly.
+  EOT
+  type        = string
+  default     = ""
+}
+
+variable "backup_schedule_calendar" {
+  description = "systemd OnCalendar expression for the nightly dump. Default 02:15 UTC — after the daily traffic trough, before the DLM snapshot window."
+  type        = string
+  default     = "*-*-* 02:15:00 UTC"
+}
+
+variable "backup_retention_days" {
+  description = "Days to keep a dump before the S3 lifecycle rule expires it. Noncurrent versions are kept a further 7 days, so an overwrite is recoverable."
+  type        = number
+  default     = 30
+
+  validation {
+    condition     = var.backup_retention_days >= 7
+    error_message = "backup_retention_days must be at least 7: a shorter window cannot survive an unnoticed weekend failure."
+  }
+}
+
+variable "enable_ebs_snapshots" {
+  description = <<-EOT
+    Create a DLM policy taking scheduled EBS snapshots of this stack's volumes —
+    an INDEPENDENT second layer, so a corrupted or truncated pg_dump is not a
+    total loss. On by default; the two layers fail differently on purpose.
+  EOT
+  type        = bool
+  default     = true
+}
+
+variable "ebs_snapshot_time" {
+  description = "UTC HH:MM start of the DLM snapshot window. After the pg_dump window so a snapshot captures a completed dump."
+  type        = string
+  default     = "03:30"
+
+  validation {
+    condition     = can(regex("^([01][0-9]|2[0-3]):[0-5][0-9]$", var.ebs_snapshot_time))
+    error_message = "ebs_snapshot_time must be UTC HH:MM, 24-hour."
+  }
+}
+
+variable "ebs_snapshot_retain_count" {
+  description = "How many EBS snapshots DLM keeps."
+  type        = number
+  default     = 7
+
+  validation {
+    condition     = var.ebs_snapshot_retain_count >= 1 && var.ebs_snapshot_retain_count <= 1000
+    error_message = "ebs_snapshot_retain_count must be between 1 and 1000."
+  }
+}
+
+variable "enable_restore_verification" {
+  description = <<-EOT
+    Install a weekly job that restores the LATEST dump into a THROWAWAY Postgres
+    container and asserts the table count is above `restore_verify_min_tables`.
+
+    This is what turns the backup from an assumption into something proven. It
+    touches neither the live database nor the live container: it starts a separate
+    container on an unpublished port, restores into it, counts, and destroys it.
+  EOT
+  type        = bool
+  default     = true
+}
+
+variable "restore_verify_min_tables" {
+  description = "Minimum table count a restored dump must contain for verification to pass. A dump that restores but is nearly empty is a failed backup, not a successful one."
+  type        = number
+  default     = 5
 }
 
 # ---------------------------------------------------------------------------
@@ -344,9 +498,21 @@ variable "redis_node_type" {
 }
 
 variable "redis_engine_version" {
-  description = "Engine version when redis_mode = \"elasticache\"."
+  description = <<-EOT
+    Engine version when redis_mode = "elasticache".
+
+    Constrained to 7.x because the parameter group in redis.tf declares
+    family = "redis7"; a 6.x version here would be rejected by ElastiCache at
+    apply time. Redis 6 is also end-of-life, so widening this is not worth the
+    version-to-family mapping it would need.
+  EOT
   type        = string
   default     = "7.1"
+
+  validation {
+    condition     = can(regex("^7(\\.[0-9]+)*$", var.redis_engine_version))
+    error_message = "redis_engine_version must be a 7.x version (the ElastiCache parameter group family is redis7)."
+  }
 }
 
 variable "redis_maxmemory_policy" {
@@ -382,6 +548,26 @@ variable "cloudflare_zone_id" {
   default     = ""
 }
 
+variable "cloudflare_dns_ttl" {
+  description = <<-EOT
+    TTL in seconds for unproxied records. Kept LOW on purpose: DNS is the cutover
+    and rollback lever for a migration, and the current estate's fatal flaw is
+    hand-edited Namecheap records at TTL 1800 — half an hour of committed traffic
+    with no way to shift it back.
+
+    Ignored when cloudflare_proxied = true: a proxied record's TTL is managed by
+    Cloudflare (the provider requires 1, meaning "automatic"), and cutover is
+    instant because the edge address never changes — only the origin behind it.
+  EOT
+  type        = number
+  default     = 60
+
+  validation {
+    condition     = var.cloudflare_dns_ttl >= 60 && var.cloudflare_dns_ttl <= 1800
+    error_message = "cloudflare_dns_ttl must be between 60 and 1800 seconds. Cloudflare's minimum for a non-enterprise zone is 60, and anything near 1800 defeats the point of having a cutover lever."
+  }
+}
+
 variable "cloudflare_proxied" {
   description = "Proxy records through Cloudflare's edge (orange cloud) for TLS/WAF/CDN."
   type        = bool
@@ -390,6 +576,77 @@ variable "cloudflare_proxied" {
 
 variable "restrict_to_cloudflare" {
   description = "Restrict the instance security group's web ingress to Cloudflare's published edge ranges, so the origin cannot be reached directly by IP."
+  type        = bool
+  default     = false
+}
+
+# ---------------------------------------------------------------------------
+# Reverse proxy binary
+# ---------------------------------------------------------------------------
+
+variable "caddy_version" {
+  description = <<-EOT
+    Caddy release to install, pinned.
+
+    NOT fetched from `caddyserver.com/api/download`, which returns an unpinned
+    binary with nothing to verify it against. This repository has already shipped
+    one payload disguised as a font; an unverified binary downloaded onto the box
+    at every boot is exactly the same class of exposure, and pinning plus a
+    checksum costs nothing.
+  EOT
+  type        = string
+  default     = "2.11.4"
+
+  validation {
+    condition     = can(regex("^[0-9]+\\.[0-9]+\\.[0-9]+$", var.caddy_version))
+    error_message = "caddy_version must be a bare semver like 2.11.4 (no leading v)."
+  }
+}
+
+variable "caddy_sha512" {
+  description = <<-EOT
+    SHA-512 of the official `caddy_<version>_linux_<arch>.tar.gz` release asset,
+    per architecture, as published in that release's `checksums.txt`.
+
+    The bootstrap refuses to install a binary that does not match, so bumping
+    caddy_version REQUIRES updating these — which is the point: the checksum is
+    reviewed here, in the pull request, rather than trusted at 3am on the box.
+
+    Defaults are the published checksums for 2.11.4:
+      curl -fsSL https://github.com/caddyserver/caddy/releases/download/v2.11.4/caddy_2.11.4_checksums.txt
+  EOT
+  type        = map(string)
+  default = {
+    amd64 = "8220d1f013b6f27510247b2360c9e0ca9f018feebd82515f07635318b34ff9777ccc8fd0b6e6f2486ce3a33fe389fbb7db12d05baa474f4587509fb4f5ebf1c9"
+    arm64 = "d5a7c423853c24a799765e0e8210d5c7c22a8f56ed37a3cae2fb9f58be138853c02b4efd6b59d576e6d8c7c0d30b9c1592deeaa6a536ff69bcca23b8c1ea709c"
+  }
+
+  validation {
+    condition = alltrue([
+      for k, v in var.caddy_sha512 : can(regex("^[0-9a-f]{128}$", v))
+    ])
+    error_message = "Each caddy_sha512 value must be a 128-character lowercase hex SHA-512."
+  }
+
+  validation {
+    condition     = contains(keys(var.caddy_sha512), "amd64") && contains(keys(var.caddy_sha512), "arm64")
+    error_message = "caddy_sha512 must contain both amd64 and arm64 keys (the architecture is chosen on the box from uname -m)."
+  }
+}
+
+variable "allow_plaintext_origin" {
+  description = <<-EOT
+    Accept serving production hostnames over plaintext HTTP.
+
+    Defaults to FALSE, and `guards.tf` fails the plan for a prod-bearing stack
+    unless either Cloudflare or origin TLS is enabled. That refusal is deliberate:
+    this platform carries children's personal data, and the alternative is
+    cleartext credentials and story content across the public internet with
+    0.0.0.0/0 ingress.
+
+    Setting it true is only defensible BEFORE the DNS cutover, while the stack has
+    no real traffic and is reachable only by its Elastic IP.
+  EOT
   type        = bool
   default     = false
 }
@@ -430,7 +687,18 @@ variable "extra_web_ingress_cidrs" {
 # ---------------------------------------------------------------------------
 
 variable "manage_github_oidc" {
-  description = "Create the account-global GitHub OIDC provider and the CI deploy role. Set true only in the `shared` workspace; if the AWS account already has a provider for token.actions.githubusercontent.com, leave this false and reuse it."
+  description = <<-EOT
+    Create the account-global GitHub OIDC provider and the CI deploy role.
+
+    Defaults to FALSE, deliberately. Creating a second provider for
+    token.actions.githubusercontent.com in an account that already has one fails
+    the apply, and which AWS account this is has not been settled. Failing safe
+    here means "CI has no deploy role yet", an obvious and harmless gap, rather
+    than "the first apply blows up".
+
+    Confirm with `aws iam list-open-id-connect-providers`, then set it true. Note
+    it also gates the CI deploy role, so both appear together.
+  EOT
   type        = bool
   default     = false
 }

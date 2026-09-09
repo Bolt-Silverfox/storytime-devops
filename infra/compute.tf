@@ -92,7 +92,27 @@ resource "aws_instance" "app" {
     redis_mode        = var.redis_mode
     redis_image       = var.redis_container_image
     redis_policy      = var.redis_maxmemory_policy
+    redis_memory_mb   = var.redis_memory_mb
     caddyfile         = local.caddyfile
+
+    # Pinned, checksum-verified reverse-proxy binary (see var.caddy_sha512).
+    caddy_version      = var.caddy_version
+    caddy_sha512_amd64 = var.caddy_sha512["amd64"]
+    caddy_sha512_arm64 = var.caddy_sha512["arm64"]
+
+    # Database: container or managed.
+    use_managed_database = var.use_managed_database
+    postgres_image       = var.postgres_image
+    postgres_memory_mb   = var.postgres_memory_mb
+    db_name              = var.db_name
+    db_username          = var.db_username
+
+    # Backups. Not optional — see backups.tf.
+    backup_bucket               = local.backup_bucket
+    backup_prefix               = local.backup_prefix
+    backup_schedule_calendar    = var.backup_schedule_calendar
+    enable_restore_verification = var.enable_restore_verification
+    restore_verify_min_tables   = var.restore_verify_min_tables
     containers = [
       for c in local.containers : {
         service        = c.service
@@ -113,11 +133,42 @@ resource "aws_instance" "app" {
   tags = { Name = "${local.prefix}-app" }
 
   lifecycle {
-    # data.aws_ami uses most_recent, so a new AL2023 publish would otherwise show
-    # up as "must be replaced" on an unrelated apply. Pin to the launched AMI and
-    # roll deliberately (taint / -replace) instead.
+    # `data.aws_ami.al2023` uses most_recent, so a newer AL2023 publish would
+    # otherwise force a full instance rebuild on every `terraform apply` (a plan
+    # would show aws_instance.app "must be replaced" purely because AWS shipped a
+    # new AMI). Pin to the launched AMI and rebuild deliberately (taint /
+    # -replace) instead. New instances created for other reasons (e.g.
+    # user_data_replace_on_change) still get the current AMI.
+    #
+    # Note what is NOT here: a hardcoded AMI id. A migration to another region
+    # would have to hunt one down, and it would silently rot.
     ignore_changes = [ami]
   }
+
+  # The instance must not be replaceable out from under a database that lives on
+  # its volume. With use_managed_database = false, replacing this instance
+  # destroys the Postgres volume with it — restore from S3 is the only recovery.
+  # Read the plan: if it says "must be replaced", make sure that is intended.
+  # The bootstrap reads its ENTIRE configuration from SSM, but `templatefile`
+  # only receives locals and variables — so Terraform sees no dependency edge and
+  # is free to launch the instance before the parameters exist. user-data runs
+  # once, under `set -euo pipefail`, so losing that race does not retry itself: it
+  # leaves a box with no containers on it. Declare the edges explicitly.
+  depends_on = [
+    aws_ssm_parameter.plain,
+    aws_ssm_parameter.secret,
+    aws_ssm_parameter.origin_cert,
+    aws_ssm_parameter.origin_key,
+    aws_ssm_parameter.db_password,
+    aws_ssm_parameter.db_host,
+    aws_ssm_parameter.db_name,
+    aws_ssm_parameter.db_username,
+    # The backup bucket and its lifecycle/encryption/TLS rules must exist before
+    # the nightly timer can ever fire against it.
+    aws_s3_bucket_lifecycle_configuration.backups,
+    aws_s3_bucket_public_access_block.backups,
+    aws_s3_bucket_policy.backups,
+  ]
 }
 
 resource "aws_eip" "app" {

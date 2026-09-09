@@ -7,7 +7,7 @@
 # to today's topology, not codifications of it, and both need sign-off:
 #
 #  1. WAITLIST PRODUCTION AND THE APEX MARKETING SITE MOVE HERE.
-#     Today they run on 52.18.195.224 — the same box as dev, staging and blue.
+#     Today they run on `host-a` — the same box as dev, staging and blue.
 #     A dev deploy can therefore take down the public marketing site and the
 #     waitlist. Putting them in the prod workspace fixes that, but it is a
 #     migration with a DNS cutover, so they are `enabled = false` below until
@@ -21,22 +21,27 @@
 environment   = "prod"
 aws_region    = "eu-west-1"
 vpc_cidr      = "10.43.0.0/16"
-instance_type = "t3.large"
+instance_type = "t3.medium" # 4 GiB; raise to t3.large if the budget guard complains
 
 root_volume_size = 60
 
-# Production queues carry unsent emails, pending push notifications and
-# in-flight TTS batches. Losing them when the box is replaced is real user-visible
-# work lost, so prod does NOT use a local redis container.
+# Production queues carry unsent emails, pending push notifications and in-flight
+# TTS batches. Losing them when the box is replaced is real user-visible work lost,
+# so once prod is on its own box a managed Redis becomes worth its ~$12/mo.
 redis_mode             = "elasticache"
 redis_node_type        = "cache.t4g.small"
 redis_maxmemory_policy = "noeviction"
 
-# Prod still points at the shared database until the split happens. This is the
-# single largest outstanding risk in the platform: a dev migration lands in the
-# same instance that serves production.
-shared_db_identifier = "emerj-shared-db"
-create_database      = false # see README -> "Splitting the shared database"
+# Likewise: on a dedicated prod box, PITR is worth +$12.41/mo over a ~24h dump RPO.
+use_managed_database = true
+db_instance_class    = "db.t4g.micro"
+
+# Required. Keep it out of this file: export TF_VAR_db_password='...'
+db_password = ""
+
+# The legacy shared instance, looked up READ-ONLY during the migration so its
+# endpoint appears in outputs. Terraform never modifies it. "" to skip.
+shared_db_identifier = ""
 
 services = {
   # storytime-api-production (PM2 cluster mode, max(2, cpus-1) workers)
@@ -44,12 +49,12 @@ services = {
     container_port = 3000
     host_port      = 3000
     hostnames      = ["api.storytimeapp.me"]
-    replicas       = 2 # match to the instance size; PM2 cluster-mode equivalent
+    replicas       = 2 # PM2 cluster-mode equivalent; size the instance to match
     sse            = true
     max_body_size  = "25m"
     read_timeout   = "3600s"
     health_path    = "/health"
-    memory_mb      = 1536
+    memory_mb      = 768 # x2 replicas = 1536 MiB against the budget
   }
 
   # storytime-fe-prod (PM2, port 3000)
@@ -105,10 +110,16 @@ secret_values = {
   # NEVER COMMIT. Supply via TF_VAR_secret_values or this gitignored file.
 }
 
-# Production is the environment where locking the origin to Cloudflare and
-# terminating TLS on the box (Full (strict)) matter most. Both stay off until the
-# DNS cutover from Namecheap happens.
-cloudflare_enabled     = false
-cloudflare_proxied     = true
-restrict_to_cloudflare = false
-enable_origin_tls      = false
+# Production MUST have a TLS path. guards.tf refuses to plan a prod stack with
+# neither Cloudflare nor origin TLS unless allow_plaintext_origin says so
+# explicitly — children's personal data does not travel in cleartext by omission.
+cloudflare_enabled     = true
+cloudflare_zone_id     = "REPLACE_WITH_ZONE_ID"
+cloudflare_proxied     = true  # orange cloud: TLS/WAF/CDN at the edge
+cloudflare_dns_ttl     = 60    # low TTL = a working cutover/rollback lever
+restrict_to_cloudflare = true  # lock the origin to Cloudflare's edge IPs
+enable_origin_tls      = false # set true + supply an Origin Cert for Full (strict)
+allow_plaintext_origin = false
+
+manage_shared_ecr  = false
+manage_github_oidc = false

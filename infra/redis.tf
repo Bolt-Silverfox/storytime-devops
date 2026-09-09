@@ -42,7 +42,9 @@ resource "aws_elasticache_subnet_group" "main" {
 resource "aws_elasticache_parameter_group" "main" {
   count = var.create_instance && var.redis_mode == "elasticache" ? 1 : 0
 
-  name   = "${local.prefix}-redis"
+  name = "${local.prefix}-redis"
+  # Pinned to the redis7 family; var.redis_engine_version is validated to 7.x so
+  # the two cannot drift apart into an apply-time rejection.
   family = "redis7"
 
   parameter {
