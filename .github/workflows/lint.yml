@@ -55,13 +55,31 @@ jobs:
           # Extension globs alone miss shell scripts with no extension, e.g.
           # .githooks/pre-commit. Select by extension OR by shell shebang, so a
           # hook added later is covered automatically instead of silently skipped.
+          #
+          # *.tftpl MUST be rejected before the shebang fallback. The note above
+          # says templates are excluded, but the fallback re-included them: a
+          # Terraform template of a shell script starts with a real `#!` line, so
+          # user-data.sh.tftpl matched and shellcheck then reported SC2288/SC1083
+          # on every `%{ if ... ~}` directive. That is unfixable noise (the file
+          # is not shell until Terraform renders it) and it failed the gate.
+          #
+          # The shebang test is a bash regex rather than `head | grep -q`: with
+          # `pipefail`, grep -q closes the pipe on a match, head can die of
+          # SIGPIPE (141), and the pipeline's non-zero status then hits
+          # `|| continue` — silently dropping a real script from the lint. Same
+          # swallowed-result class that had to be fixed twice in
+          # scan-injection.sh; not worth leaving here to be discovered later.
           files=()
           while IFS= read -r f; do
             [ -s "$f" ] || continue
             [ "$f" = "scripts/scan-injection.sh" ] && continue
             case "$f" in
+              *.tftpl) continue ;;
               *.sh|*.bash) ;;
-              *) head -n 1 -- "$f" | grep -Eq '^#!.*[ /](ba|da|k)?sh([[:space:]]|$)' || continue ;;
+              *)
+                first=$(head -n 1 -- "$f" 2>/dev/null || true)
+                [[ $first =~ ^#!.*[\ /](ba|da|k)?sh([[:space:]]|$) ]] || continue
+                ;;
             esac
             files+=("$f")
           done < <(git ls-files)
