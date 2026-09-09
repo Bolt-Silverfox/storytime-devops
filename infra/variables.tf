@@ -17,6 +17,26 @@ variable "aws_region" {
   default     = "eu-west-1"
 }
 
+variable "allowed_account_ids" {
+  description = <<-EOT
+    AWS account ids this configuration is permitted to touch.
+
+    Storytime deploys into FateRound's account, `772316781095` — a SHARED
+    account: the FateRound application and a third-party `Portfolio-Server` also
+    live there. Nothing in this stack may assume sole ownership of the account,
+    which is why every resource is name-prefixed and tagged `Project = storytime`
+    (see providers.tf), and why manage_github_oidc stays false (github-oidc.tf).
+
+    Region is still eu-west-1 and does NOT follow FateRound's us-east-1: see
+    aws_region above — that one is a GDPR decision.
+
+    Set to [] to disable the check (e.g. deploying this stack into a genuinely
+    different account).
+  EOT
+  type        = list(string)
+  default     = ["772316781095"]
+}
+
 variable "name_prefix" {
   description = "Project prefix for every resource name and SSM path."
   type        = string
@@ -34,8 +54,8 @@ variable "environment" {
 
     The other values exist so an environment can be PEELED OFF onto its own box
     later without rewriting anything: create a new workspace, set
-    `environment = "prod"`, give it only the prod services, and flip the
-    Cloudflare records. That is the whole migration.
+    `environment = "prod"`, give it only the prod services, and move the Elastic
+    IP to it. That is the whole migration.
 
     `shared` is not a runtime stack; it exists only if you later want the
     account-global resources (ECR repositories, the GitHub OIDC provider) split
@@ -134,8 +154,9 @@ variable "services" {
     - host_port      : first host port published. With replicas > 1, replica i
                        publishes host_port + i.
     - hostnames      : public hostnames routed to this service by the on-box
-                       reverse proxy (Caddy). Cloudflare DNS records are created
-                       for these when cloudflare_enabled = true.
+                       reverse proxy (Caddy), and the names Caddy requests
+                       certificates for when tls_mode = "acme". Their A records
+                       are created BY HAND at Namecheap (see dns.tf).
     - replicas       : horizontal copies on the box, load-balanced round-robin by
                        Caddy. This is the container-world replacement for PM2
                        cluster mode (prod API runs max(2, cpus-1) workers today).
@@ -526,62 +547,100 @@ variable "redis_maxmemory_policy" {
 }
 
 # ---------------------------------------------------------------------------
-# Edge / DNS
+# Addressing / DNS  (Namecheap by hand; the Elastic IP is the cutover lever)
 # ---------------------------------------------------------------------------
 
-variable "cloudflare_enabled" {
-  description = "Manage DNS records in Cloudflare. Off by default: DNS is hand-edited at Namecheap today, and cutting over is a deliberate migration."
-  type        = bool
-  default     = false
-}
-
-variable "cloudflare_api_token" {
-  description = "Cloudflare API token scoped DNS:Edit. Falls back to the CLOUDFLARE_API_TOKEN env var when empty; keep it out of tfvars."
-  type        = string
-  default     = ""
-  sensitive   = true
-}
-
-variable "cloudflare_zone_id" {
-  description = "Cloudflare Zone ID for the Storytime domain."
-  type        = string
-  default     = ""
-}
-
-variable "cloudflare_dns_ttl" {
+variable "namecheap_dns_ttl" {
   description = <<-EOT
-    TTL in seconds for unproxied records. Kept LOW on purpose: DNS is the cutover
-    and rollback lever for a migration, and the current estate's fatal flaw is
-    hand-edited Namecheap records at TTL 1800 — half an hour of committed traffic
-    with no way to shift it back.
+    TTL, in seconds, of the hand-written Namecheap A records. NOT applied by
+    Terraform — Namecheap is edited by hand (see dns.tf) — it is recorded here so
+    `terraform output dns_records_required` prints the value a human should type,
+    and so the runbook and the zone cannot silently disagree.
 
-    Ignored when cloudflare_proxied = true: a proxied record's TTL is managed by
-    Cloudflare (the provider requires 1, meaning "automatic"), and cutover is
-    instant because the edge address never changes — only the origin behind it.
+    1800 is what the legacy estate uses today. It only matters for the FIRST
+    migration, which is the one cutover that cannot use an EIP remap (the legacy
+    boxes are in a different AWS account). Drop it to 300 at least 24 hours
+    before that cutover, then put it back afterwards.
   EOT
   type        = number
-  default     = 60
+  default     = 1800
 
   validation {
-    condition     = var.cloudflare_dns_ttl >= 60 && var.cloudflare_dns_ttl <= 1800
-    error_message = "cloudflare_dns_ttl must be between 60 and 1800 seconds. Cloudflare's minimum for a non-enterprise zone is 60, and anything near 1800 defeats the point of having a cutover lever."
+    condition     = var.namecheap_dns_ttl >= 60 && var.namecheap_dns_ttl <= 86400
+    error_message = "namecheap_dns_ttl must be between 60 and 86400 seconds (Namecheap's own range)."
   }
 }
 
-variable "cloudflare_proxied" {
-  description = "Proxy records through Cloudflare's edge (orange cloud) for TLS/WAF/CDN."
+variable "eip_allocation_id" {
+  description = <<-EOT
+    Adopt an EXISTING Elastic IP instead of allocating a new one.
+
+    Empty (the default) means this stack allocates its own EIP and keeps it —
+    which is what a first apply, and any standalone environment, wants.
+
+    Set it to another stack's allocation id (eipalloc-...) to make THIS stack the
+    new owner of the live address. That is the cutover: the association moves,
+    atomically, in one AWS API call, and the address itself never changes — so no
+    DNS record is touched and Namecheap's TTL is irrelevant. Rollback is putting
+    the id back on the old stack and applying there.
+
+    CONSTRAINT: an EIP can only be remapped between instances IN THE SAME AWS
+    ACCOUNT. The legacy Storytime boxes are in a different account, so the first
+    migration into this account cannot use this and needs one Namecheap edit.
+    See docs/migration.md.
+  EOT
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.eip_allocation_id == "" || can(regex("^eipalloc-[0-9a-f]+$", var.eip_allocation_id))
+    error_message = "eip_allocation_id must be empty or an allocation id like eipalloc-0123456789abcdef0 (NOT the IP address, and not an association id)."
+  }
+}
+
+variable "associate_eip" {
+  description = <<-EOT
+    Attach the Elastic IP to this stack's instance.
+
+    True by default. Set it FALSE while a replacement stack is being built and
+    verified: the instance still gets an auto-assigned public IPv4 to test
+    against, and the live address stays where it is until you deliberately move
+    it. It is also how the OLD stack is told to let go after a cutover.
+
+    The association carries allow_reassociation, so moving the address is one
+    apply and does not require detaching first — the window in which the address
+    points at nothing is measured in seconds.
+  EOT
   type        = bool
   default     = true
 }
 
-variable "restrict_to_cloudflare" {
-  description = "Restrict the instance security group's web ingress to Cloudflare's published edge ranges, so the origin cannot be reached directly by IP."
-  type        = bool
-  default     = false
+variable "web_ingress_cidrs" {
+  description = <<-EOT
+    IPv4 CIDRs allowed to reach :80 and :443 on the instance.
+
+    0.0.0.0/0 by default, because this box IS the public edge: there is no CDN
+    and no Cloudflare in front of it. It also has to stay open for ACME: Let's
+    Encrypt validates from multiple, unannounced source addresses, so an
+    allowlist cannot include it and guards.tf refuses that combination.
+
+    Narrowing this is only meaningful with tls_mode = "static" or "none" (for
+    example, an internal-only environment restricted to an office range).
+  EOT
+  type        = list(string)
+  default     = ["0.0.0.0/0"]
+
+  validation {
+    # An empty list renders a security group rule with no CIDRs, which AWS
+    # rejects at apply time with a much less helpful message. If the intent is
+    # "no public web ingress", set create_instance = false.
+    condition     = length(var.web_ingress_cidrs) > 0
+    error_message = "web_ingress_cidrs must contain at least one CIDR; an empty list produces an invalid security group rule."
+  }
 }
 
 # ---------------------------------------------------------------------------
-# Reverse proxy binary
+# Reverse proxy binary and TLS
 # ---------------------------------------------------------------------------
 
 variable "caddy_version" {
@@ -634,52 +693,103 @@ variable "caddy_sha512" {
   }
 }
 
+variable "tls_mode" {
+  description = <<-EOT
+    Where HTTPS is terminated for the public hostnames. This is now LOAD-BEARING:
+    there is no Cloudflare edge, so if the box has no certificate the site is
+    down, not merely unproxied.
+
+      "acme"   (default) Caddy obtains and renews Let's Encrypt certificates on
+               the box, automatically, for exactly the hostnames in
+               services[*].hostnames. Requires that those names already resolve
+               to this instance's address and that :80 and :443 are reachable
+               from the internet.
+      "static" Caddy serves a certificate and key supplied through SSM
+               (tls_certificate / tls_private_key). For a name that cannot be
+               validated by ACME yet, or a certificate issued elsewhere.
+      "none"   plain HTTP on :80. Only defensible pre-cutover, with no real
+               traffic; guards.tf refuses it for a prod-bearing stack unless
+               allow_plaintext_origin is also set.
+
+    The ordering trap, stated once: ACME cannot issue a certificate for a
+    hostname that does not yet point at this box. A replacement stack therefore
+    gets its certificates AFTER the address moves to it, which takes seconds but
+    is not instantaneous — docs/migration.md step 7 restarts Caddy immediately
+    after the remap so issuance is attempted at once instead of on Caddy's
+    backoff schedule.
+  EOT
+  type        = string
+  default     = "acme"
+
+  validation {
+    condition     = contains(["acme", "static", "none"], var.tls_mode)
+    error_message = "tls_mode must be one of: acme, static, none."
+  }
+}
+
+variable "acme_email" {
+  description = <<-EOT
+    Contact address for the Let's Encrypt account. Required when
+    tls_mode = "acme" on a stack that creates an instance.
+
+    Not optional-by-omission on purpose: it is the only channel by which anyone
+    is told that renewal has been failing, and with TLS now terminating solely on
+    this box, a silent renewal failure is a total outage 90 days later. Use a
+    monitored alias, not a personal mailbox.
+  EOT
+  type        = string
+  default     = ""
+}
+
+variable "acme_ca_directory" {
+  description = <<-EOT
+    ACME directory URL. Empty means Let's Encrypt production.
+
+    Set it to https://acme-staging-v02.api.letsencrypt.org/directory when
+    REHEARSING a migration. Let's Encrypt's production limits are per registered
+    domain and are easy to hit while drilling a cutover (notably 5 duplicate
+    certificates per week for the same set of names), and hitting them turns a
+    drill into a real outage. Staging certificates are untrusted by browsers,
+    which is exactly the point: verify with `curl -k` and read the issuer.
+  EOT
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.acme_ca_directory == "" || can(regex("^https://", var.acme_ca_directory))
+    error_message = "acme_ca_directory must be empty or an https:// URL."
+  }
+}
+
+variable "tls_certificate" {
+  description = "Full-chain certificate PEM served by Caddy when tls_mode = \"static\". Keep it out of tracked files."
+  type        = string
+  default     = ""
+  sensitive   = true
+}
+
+variable "tls_private_key" {
+  description = "Private key PEM matching tls_certificate. Required when tls_mode = \"static\"."
+  type        = string
+  default     = ""
+  sensitive   = true
+}
+
 variable "allow_plaintext_origin" {
   description = <<-EOT
-    Accept serving production hostnames over plaintext HTTP.
+    Accept serving production hostnames over plaintext HTTP (tls_mode = "none").
 
-    Defaults to FALSE, and `guards.tf` fails the plan for a prod-bearing stack
-    unless either Cloudflare or origin TLS is enabled. That refusal is deliberate:
-    this platform carries children's personal data, and the alternative is
-    cleartext credentials and story content across the public internet with
-    0.0.0.0/0 ingress.
+    Defaults to FALSE, and guards.tf fails the plan for a prod-bearing stack that
+    sets tls_mode = "none" without it. That refusal is deliberate: this platform
+    carries children's personal data, and the alternative is cleartext
+    credentials and story content across the public internet with 0.0.0.0/0
+    ingress.
 
-    Setting it true is only defensible BEFORE the DNS cutover, while the stack has
-    no real traffic and is reachable only by its Elastic IP.
+    Setting it true is only defensible BEFORE the cutover, while the stack has no
+    real traffic and is reachable only by its own address.
   EOT
   type        = bool
   default     = false
-}
-
-variable "enable_origin_tls" {
-  description = <<-EOT
-    Terminate HTTPS on the box with a Cloudflare Origin Certificate (Cloudflare
-    SSL mode "Full (strict)"). When false the origin serves plain HTTP on :80 and
-    TLS stops at Cloudflare's edge. Either way this replaces certbot: there are no
-    Let's Encrypt renewals on the instance.
-  EOT
-  type        = bool
-  default     = false
-}
-
-variable "origin_cert" {
-  description = "Cloudflare Origin Certificate PEM. Required when enable_origin_tls = true."
-  type        = string
-  default     = ""
-  sensitive   = true
-}
-
-variable "origin_key" {
-  description = "Cloudflare Origin Certificate private key PEM. Required when enable_origin_tls = true."
-  type        = string
-  default     = ""
-  sensitive   = true
-}
-
-variable "extra_web_ingress_cidrs" {
-  description = "Additional IPv4 CIDRs allowed to reach :80/:443 (e.g. an office range during migration). Empty by default."
-  type        = list(string)
-  default     = []
 }
 
 # ---------------------------------------------------------------------------
@@ -690,14 +800,18 @@ variable "manage_github_oidc" {
   description = <<-EOT
     Create the account-global GitHub OIDC provider and the CI deploy role.
 
-    Defaults to FALSE, deliberately. Creating a second provider for
-    token.actions.githubusercontent.com in an account that already has one fails
-    the apply, and which AWS account this is has not been settled. Failing safe
-    here means "CI has no deploy role yet", an obvious and harmless gap, rather
-    than "the first apply blows up".
+    Defaults to FALSE and MUST STAY FALSE for account 772316781095. That account
+    already has a GitHub OIDC provider for token.actions.githubusercontent.com,
+    created by the FateRound stack; AWS permits exactly one provider per URL per
+    account, so creating a second one fails the apply outright.
 
-    Confirm with `aws iam list-open-id-connect-providers`, then set it true. Note
-    it also gates the CI deploy role, so both appear together.
+    The consequence is a real gap, stated plainly: CI has no deploy role from
+    this stack. Closing it means REUSING the existing provider — reference its
+    ARN and attach a Storytime-specific role to it — not creating another.
+    Confirm what exists with `aws iam list-open-id-connect-providers`.
+
+    Only set it true in an account that has no such provider at all. Note it also
+    gates the CI deploy role, so both appear together.
   EOT
   type        = bool
   default     = false

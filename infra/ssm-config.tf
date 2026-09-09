@@ -48,24 +48,28 @@ resource "aws_ssm_parameter" "secret" {
   }
 }
 
-# Origin TLS material for the on-box reverse proxy. base64-encoded so multi-line
-# PEM survives the SSM/CLI round trip intact.
-resource "aws_ssm_parameter" "origin_cert" {
-  count = var.create_instance && var.enable_origin_tls ? 1 : 0
+# TLS material for the on-box reverse proxy, for tls_mode = "static" only.
+# base64-encoded so multi-line PEM survives the SSM/CLI round trip intact.
+#
+# With the default tls_mode = "acme" there is nothing here: Caddy obtains and
+# renews the certificates itself, and the private key never exists anywhere a
+# Terraform state file or an SSM parameter could leak it.
+resource "aws_ssm_parameter" "tls_certificate" {
+  count = var.create_instance && var.tls_mode == "static" ? 1 : 0
 
-  name  = "/${local.prefix}/_proxy/ORIGIN_CERT_B64"
+  name  = "/${local.prefix}/_proxy/TLS_CERT_B64"
   type  = "SecureString"
-  value = base64encode(var.origin_cert)
-  tags  = { Name = "${local.prefix}-origin-cert" }
+  value = base64encode(var.tls_certificate)
+  tags  = { Name = "${local.prefix}-tls-cert" }
 }
 
-resource "aws_ssm_parameter" "origin_key" {
-  count = var.create_instance && var.enable_origin_tls ? 1 : 0
+resource "aws_ssm_parameter" "tls_private_key" {
+  count = var.create_instance && var.tls_mode == "static" ? 1 : 0
 
-  name  = "/${local.prefix}/_proxy/ORIGIN_KEY_B64"
+  name  = "/${local.prefix}/_proxy/TLS_KEY_B64"
   type  = "SecureString"
-  value = base64encode(var.origin_key)
-  tags  = { Name = "${local.prefix}-origin-key" }
+  value = base64encode(var.tls_private_key)
+  tags  = { Name = "${local.prefix}-tls-key" }
 }
 
 # ---------------------------------------------------------------------------

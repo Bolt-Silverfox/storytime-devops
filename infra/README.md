@@ -27,7 +27,7 @@ differences are the substance of this stack rather than incidental:
 | Backups | n/a (Supabase) | **built here**: nightly `pg_dump` to S3 + DLM EBS snapshots |
 | Region | `us-east-1` | **`eu-west-1`** — a compliance decision, not a preference |
 | State bucket | `fateround-tfstate` | `storytime-tfstate` (separate; no shared blast radius) |
-| Reverse proxy | optional Caddy for origin TLS | **always** — several hostnames per box |
+| Reverse proxy | optional Caddy for origin TLS | **always** — several hostnames per box, and the only TLS terminator |
 | CI subjects | one repo, two refs | five repos, enumerated refs |
 
 No FateRound resource is imported, referenced or modified. That repo was read for
@@ -37,7 +37,8 @@ patterns only.
 
 **Everything runs on ONE `t3.small`**: the applications, Postgres and Redis, all as
 Docker containers behind an on-box Caddy reverse proxy, with one Elastic IP and
-Cloudflare in front.
+**nothing in front of it** — no CDN, no edge proxy. DNS stays hand-edited at
+Namecheap ([`dns.tf`](dns.tf)) and TLS is Caddy + Let's Encrypt on the box.
 
 Storytime has **fewer than 100 monthly users**. An instance per environment came to
 about **$225/mo** and was rejected as overbuilt, correctly. This design is meant to
@@ -70,8 +71,8 @@ Concrete triggers, not vibes:
 | Compliance | an auditor asks for environment isolation, which a shared host cannot demonstrate |
 
 Splitting is deliberately cheap: create a workspace, set
-`environment = "prod"`, give it only the prod services, flip the Cloudflare
-records. That is the whole procedure, and it is
+`environment = "prod"`, give it only the prod services, move the Elastic IP to it.
+That is the whole procedure, and it is
 [`docs/migration.md`](../docs/migration.md).
 
 ### Sizing and the memory budget
@@ -140,21 +141,37 @@ aws elbv2 describe-load-balancers --query 'LoadBalancers[].[LoadBalancerName,Sta
 
 ## Migrating is a routine operation
 
-The box is **disposable**: images in ECR, config in SSM, database dumps in S3, DNS
-in Cloudflare. Losing the instance entirely costs the time to re-apply and restore.
+The box is **disposable**: images in ECR, config in SSM, database dumps in S3, and
+the public address in an Elastic IP that is not tied to any particular instance.
+Losing the instance entirely costs the time to re-apply and restore.
 
 Nothing a migration would have to hunt down is hardcoded — region, AZ, instance
 type, hostnames and environment name are all variables, there are **no literal IP
 addresses anywhere**, and the AMI comes from `data.aws_ami` with
 `ignore_changes = [ami]` rather than a pinned id that would silently rot.
 
-**Cloudflare is the cutover lever.** The legacy estate's fatal flaw is DNS
-hand-edited at Namecheap with a 1800s TTL and no proxy layer, so there is no way to
-shift traffic or roll back quickly. Here the record is in Terraform with
-`cloudflare_dns_ttl` defaulting to 60s, and cutover is: **apply the new stack →
-restore the latest dump → verify → flip the record → keep the old box until
-confident.** Rollback is flipping the record back, which is why the old box must
-not be destroyed in the same apply.
+**The Elastic IP is the cutover lever — not DNS.** The legacy estate's fatal flaw is
+that its only lever *is* DNS: hand-edited at Namecheap, TTL 1800, so shifting traffic
+or rolling back means half an hour of committed requests. Cloudflare would have fixed
+that with a low TTL and a stable edge address; the zone is not moving to Cloudflare,
+so the fix here is to stop using DNS as the lever at all.
+
+`aws_eip.app` (the address) and `aws_eip_association.app` (which instance holds it)
+are separate resources. Cutover is: **apply the new stack with
+`associate_eip = false` → restore the latest dump → verify → move the association →
+keep the old box until confident.** Moving it is one atomic AWS call, a few seconds,
+and rollback is moving it back. **No DNS record changes, so the TTL is irrelevant.**
+
+The constraint that shapes the runbook: **an EIP can only be remapped inside ONE AWS
+account.** The legacy boxes are in a different account from this stack's target
+(`772316781095`), so the *first* migration cannot use the remap — it needs one
+Namecheap A-record edit, with the TTL lowered ~24h ahead. Every migration after that
+needs no DNS change at all. AWS supports transferring an Elastic IP *between*
+accounts, which would remove even that one edit, but it must be initiated from the
+source account — see Open decisions.
+
+The old box must not be destroyed in the same apply; step 9 of the runbook is a
+separate day.
 
 **The one known gap:** with `use_managed_database = false` the Postgres data
 directory is a Docker volume on the instance's EBS volume, so it is the single piece
@@ -315,13 +332,63 @@ is answerable without shell access.
 | PM2 + `ecosystem.config.js` in each app repo | Docker containers + `var.services` |
 | nvm juggling Node 20 / 22 / 24 on one box | each service's own image, its own base |
 | nginx vhosts edited on disk, in no repo | `templates/Caddyfile.tftpl`, rendered by Terraform and visible in `plan` |
-| certbot + a renewal timer/cron | Cloudflare edge TLS, or a Cloudflare Origin Certificate from SSM |
+| certbot + a renewal timer/cron that can silently stop | Caddy's built-in ACME: issuance and renewal inside the process that serves the traffic (`tls_mode = "acme"`) |
+| DNS records hand-edited at Namecheap as the only cutover lever | still hand-edited at Namecheap — but the lever is now the Elastic IP, so cutover and rollback do not touch DNS |
 | `.env` files on disk | SSM Parameter Store, read at boot into a tmpfs env-file that is deleted immediately |
 | SSH keys | SSM Session Manager (**no port 22 rule exists in `security.tf`**) |
 | no `pm2 startup` unit — a reboot leaves everything down | `--restart always` + enabled `docker.service` + a `storytime-reconcile` unit |
 
 The app repos are **not touched**. Their `ecosystem.config.js` files stay where
 they are; they simply stop being the thing that runs in the new model.
+
+## When TLS breaks
+
+**This is now a total-outage class of failure, so it gets its own section.** There is
+no Cloudflare edge and no CDN in front of the box: `tls_mode = "acme"` means Caddy
+obtains and renews Let's Encrypt certificates itself, and if it cannot, the site does
+not serve HTTPS at all.
+
+What has to be true for issuance to work — check them in this order:
+
+1. **The hostname resolves to this box.** ACME validates by connecting to the name.
+   ```bash
+   dig +short api.<zone>                       # must equal terraform output instance_public_ip
+   ```
+   A new stack that has not taken the Elastic IP yet **cannot** be issued a
+   certificate for the real hostname. That is expected, not a fault — see
+   [`docs/migration.md`](../docs/migration.md) step 7.
+2. **:80 and :443 are open to the whole internet.** Let's Encrypt validates from
+   several unannounced source addresses, so `web_ingress_cidrs` must contain
+   `0.0.0.0/0`; `guards.tf` refuses the combination that would break this.
+3. **Caddy is running and its log says what happened.**
+   ```bash
+   aws ssm start-session --target "$(terraform output -raw instance_id)"
+   systemctl status caddy --no-pager
+   journalctl -u caddy --no-pager | grep -iE 'acme|certificate|obtain|error' | tail -40
+   ls -l /var/lib/caddy/certificates/*/                # issued certs live here
+   ```
+4. **You have not hit a rate limit.** Let's Encrypt allows **5 duplicate
+   certificates per week** for the same set of names, and replacing the instance
+   discards the on-disk certificate store, so repeated rebuilds re-issue every time.
+   The log says `too many certificates already issued`. There is no way to force it;
+   you wait, or you rehearse against
+   `acme_ca_directory = "https://acme-staging-v02.api.letsencrypt.org/directory"`.
+5. **`acme_email` is a mailbox someone reads.** It is the only channel by which
+   Let's Encrypt warns that renewal has been failing; `guards.tf` requires it for
+   exactly that reason.
+
+Immediate mitigations, in order of preference:
+
+- `systemctl restart caddy` — forces an issuance attempt now instead of on Caddy's
+  retry backoff. This is the normal fix straight after a cutover.
+- Roll the address back to the old box ([`docs/migration.md`](../docs/migration.md)
+  step 8). It still has its own working certificate.
+- `tls_mode = "static"` with a certificate obtained elsewhere, applied and the
+  instance replaced. Slowest, but it does not depend on ACME at all.
+
+**Renewal**, once issuance works, is unattended: Caddy renews at ~30 days remaining,
+in the same process that serves traffic, so there is no separate timer that can stop
+without anyone noticing — which was the failure mode of the legacy certbot setup.
 
 ## Layout
 
@@ -336,14 +403,14 @@ infra/
 ├── security.tf                  app SG (no :22) + data SG (app-only ingress)
 ├── ecr.tf                       per-service repositories, shared across stacks
 ├── iam.tf                       instance role: ECR pull, own-prefix SSM, backup write
-├── compute.tf                   the instance, EIP, user-data
+├── compute.tf                   the instance, user-data, EIP + association (the lever)
 ├── proxy.tf                     renders the Caddyfile in Terraform
 ├── ssm-config.tf                config_plain -> String, secret_keys -> SecureString
 ├── database.tf                  container Postgres | RDS, behind one variable
 ├── backups.tf                   S3 dump bucket + DLM snapshots  <- load-bearing
 ├── redis.tf                     container | elasticache | external
 ├── github-oidc.tf               OIDC provider + CI deploy role
-├── cloudflare.tf                DNS records (the cutover lever), origin lockdown
+├── dns.tf                       why DNS is manual at Namecheap; web ingress CIDRs
 ├── outputs.tf                   incl. memory_budget + backup health checks
 ├── templates/
 │   ├── user-data.sh.tftpl       bootstrap: docker, postgres, redis, containers,
@@ -487,13 +554,17 @@ All of these fail at **plan** time, before anything is created:
   address, which would kill the bootstrap before any container started.
 - **`config_plain` PORT disagreeing with `container_port`** — the proxy routes to
   `container_port`, so a mismatch means an app listening where nothing is looking.
-- **Plaintext production** — a prod-bearing stack with neither Cloudflare nor origin
-  TLS is refused, unless `allow_plaintext_origin` says so explicitly. Children's
-  personal data does not go over the public internet in cleartext by omission.
+- **Plaintext production** — a prod-bearing stack with `tls_mode = "none"` is
+  refused unless `allow_plaintext_origin` says so explicitly. Children's personal
+  data does not go over the public internet in cleartext by omission.
+- **ACME without a contact address** — `tls_mode = "acme"` requires `acme_email`,
+  because it is the only warning anyone gets that renewal has been failing.
+- **ACME behind a restricted origin** — `tls_mode = "acme"` requires
+  `web_ingress_cidrs` to include `0.0.0.0/0`; Let's Encrypt validates from
+  unannounced addresses, so an allowlist cannot be written for it.
+- **`associate_eip` with no instance** — an association with nothing to attach to.
 - **A secret name with no value** — an empty value would blank a live SSM parameter.
 - **`db_password` missing** — required for both database backends.
-- **`restrict_to_cloudflare` without a proxied record** — that combination makes the
-  origin unreachable.
 
 At apply/runtime:
 
@@ -518,7 +589,12 @@ At apply/runtime:
   container rather than replacing it, because recreating with a different image tag
   against an initialised data directory is how a major-version mismatch corrupts a
   database.
-- Cloudflare, the managed database, and origin TLS are all **off by default**.
+- **The Elastic IP carries `prevent_destroy`.** A released address is gone for good,
+  and after a cutover the *old* workspace still owns the allocation the *new* stack
+  is serving on — so a careless `destroy` there would take the live address with it.
+- The managed database and `tls_mode = "static"` are **off by default**; TLS itself
+  is **on** by default (`tls_mode = "acme"`), because with no edge proxy there is no
+  safe "off".
 
 ## Running it
 
@@ -537,10 +613,16 @@ terraform plan -var-file=terraform.all.tfvars
 ```
 
 **The shipped example fails the plan on purpose.** `environment = "all"` serves
-production hostnames, and neither `cloudflare_enabled` nor `enable_origin_tls` is
-set, so `guards.tf` refuses rather than quietly serving children's data over
-plaintext HTTP. Pick a TLS path — or set `allow_plaintext_origin = true`, which is
-only defensible pre-cutover with no real traffic.
+production hostnames with `tls_mode = "acme"` and an empty `acme_email`, so
+`guards.tf` refuses. Supply a monitored address — or, pre-cutover only, set
+`tls_mode = "none"` **and** `allow_plaintext_origin = true`, which is defensible
+exactly while there is no real traffic.
+
+Note the ordering, because it catches people: **ACME cannot issue a certificate for a
+hostname that does not resolve to this box yet.** A first apply for a name still
+pointing at the legacy estate will come up without a certificate. That is expected;
+the certificate arrives after the cutover ([`docs/migration.md`](../docs/migration.md)
+step 7), and *When TLS breaks* below says what to check.
 
 ### Dry-running safely
 
@@ -645,11 +727,26 @@ Things that genuinely cannot be settled from here:
 
 1. **Region sign-off** — see the section immediately above. `eu-west-1` is the
    default; a change is a GDPR decision.
-2. **Which AWS account.** FateRound is `772316781095`. Storytime's existing
-   resources are named `emerj-*`, which suggests a different account. If it is
-   the *same* account, the GitHub OIDC provider already exists and
-   `manage_github_oidc` must stay `false` everywhere (creating a second provider
-   for the same URL fails).
+2. **SETTLED: the AWS account is FateRound's `772316781095`, `eu-west-1`.** It is a
+   **shared** account — the FateRound application and a third-party
+   `Portfolio-Server` also run there — so nothing in this stack may assume sole
+   ownership of it: everything is name-prefixed and tagged `Project = storytime`,
+   and `providers.tf` pins `allowed_account_ids` so a stray `AWS_PROFILE` cannot
+   quietly build a parallel copy elsewhere. `manage_github_oidc` **stays `false`**:
+   that account already has a GitHub OIDC provider from the FateRound stack, and AWS
+   permits one per URL per account. The region does **not** follow FateRound's
+   `us-east-1` (see the section above — GDPR).
+
+   Cost context, because it is a shared bill: the account runs **~$54/mo gross**
+   today and is **fully covered by credits**, whose balance and expiry are
+   **console-only** — not queryable from the CLI, and not visible to this repo. When
+   those credits lapse, this stack's ~$24/mo becomes real money on someone's card.
+   Whoever owns that billing relationship should know the expiry date.
+
+   *Still open:* **who controls the legacy account** holding the current boxes and
+   their Elastic IPs. That answer decides whether the first migration can use an
+   AWS Elastic IP transfer (no DNS change at all) or has to take the one Namecheap
+   edit — [`docs/migration.md`](../docs/migration.md) step 7A.
 3. **Migrating off the legacy shared database.** The largest outstanding risk in
    the platform. Procedure is written; scheduling it and accepting the downtime
    window is a human call.
@@ -658,9 +755,17 @@ Things that genuinely cannot be settled from here:
    +$12.41/mo. This is a data-loss-tolerance decision about children's data.
 5. **Drilling the restore.** Nothing here has been applied, so no dump has ever been
    restored. Until a human does it once, the backups are unproven.
-6. **Cloudflare or stay on Namecheap.** DNS is hand-edited at Namecheap today
-   (TTL 1800, no CDN, no load balancer). Everything Cloudflare is off by default.
-   Moving the zone also decides where TLS terminates.
+6. **SETTLED: DNS stays at Namecheap, hand-edited. Cloudflare is not being
+   adopted.** There is no DNS provider in this stack and no Terraform resource for
+   an A record — the usable Namecheap providers are unmaintained and require
+   whitelisting the caller's IP, which a laptop or a runner does not have stably.
+   The records are a documented manual step; `terraform output
+   dns_records_required` prints exactly what to type. See [`dns.tf`](dns.tf).
+
+   The consequence to be honest about: **TLS is now entirely Caddy's job**, so a
+   failed certificate is a full outage rather than a degraded edge. That is why
+   `tls_mode` defaults to `"acme"`, why `acme_email` is mandatory for it, and why
+   *When TLS breaks* exists above.
 7. **Moving waitlist production and the apex marketing site off the shared box.**
    They run on `host-a` today, alongside dev, staging and blue — so a dev
    deploy can take down the public marketing site. They are `enabled = false` in

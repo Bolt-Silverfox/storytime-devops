@@ -84,15 +84,17 @@ export TF_VAR_db_password='...'
 terraform plan -var-file=terraform.all.tfvars
 ```
 
-The shipped example **fails the plan on purpose** until you choose a TLS path — a
-prod-bearing stack will not quietly serve children's data over plaintext HTTP.
+The shipped example **fails the plan on purpose** until you supply `acme_email` and
+real hostnames — a prod-bearing stack will not quietly serve children's data over
+plaintext HTTP, and TLS now terminates on this box or nowhere.
 
 ## Target architecture, in one paragraph
 
 **One** `t3.small` EC2 instance (Amazon Linux 2023) in `eu-west-1`, running every
 service — plus **Postgres and Redis** — as **Docker containers** pulled from **ECR**,
 with a stable Elastic IP, an on-box Caddy reverse proxy doing host-based routing, and
-**Cloudflare** in front. All configuration lives in **SSM Parameter Store**, read at
+**nothing in front of it** — no CDN and no edge proxy. **DNS stays at Namecheap and is
+edited by hand**; **TLS is Caddy + Let's Encrypt on the box**. All configuration lives in **SSM Parameter Store**, read at
 boot into a tmpfs env-file that is deleted immediately — **no `.env` files on disk**.
 Shell access is **SSM Session Manager**; there are **no SSH keys and no port 22
 rule**. CI authenticates with **GitHub OIDC**, so no long-lived AWS credentials sit
@@ -114,10 +116,25 @@ readable without touching the box. This is children's personal data under GDPR;
 [do not remove the backups](infra/README.md#backups).
 
 **The box is disposable and migrating is routine.** Images in ECR, config in SSM,
-dumps in S3, DNS in Cloudflare — losing the instance costs the time to re-apply and
-restore. Nothing a migration would have to hunt down is hardcoded: no literal IPs, no
-pinned AMI id, region and hostnames are variables, and Cloudflare with a 60s TTL is
-the cutover *and rollback* lever. See [`docs/migration.md`](docs/migration.md).
+dumps in S3 — losing the instance costs the time to re-apply and restore. Nothing a
+migration would have to hunt down is hardcoded: no literal IPs, no pinned AMI id,
+region and hostnames are variables.
+
+**The cutover lever is the Elastic IP, not DNS.** Remapping it between two instances
+is one atomic AWS call, and rollback is remapping it back — so the hand-edited
+Namecheap records, TTL 1800, never enter into it. The catch, stated once: an EIP can
+only be remapped **within one AWS account**, and the legacy boxes are in a different
+account from the target (FateRound's `772316781095`). So the *first* migration costs
+one Namecheap edit and one TTL wait; every one after it costs no DNS change at all.
+See [`docs/migration.md`](docs/migration.md).
+
+**It deploys into FateRound's AWS account, `772316781095`** — an account **shared**
+with the FateRound application and a third-party `Portfolio-Server`. Nothing here may
+assume sole ownership of it: every resource is name-prefixed and tagged
+`Project = storytime`, `manage_github_oidc` stays `false` because that account already
+has a GitHub OIDC provider, and the provider is pinned to that account id so a stray
+`AWS_PROFILE` cannot build a parallel copy somewhere else. The region stays
+`eu-west-1` (children's data / GDPR) and does **not** follow FateRound's `us-east-1`.
 
 This deliberately mirrors the FateRound stack (`chinazaaa/fateround`, `infra/`) so the
 two projects operate alike. Where Storytime genuinely differs — six services instead
@@ -135,8 +152,14 @@ or modified.
   [`docs/migration.md`](docs/migration.md) step 5, and is not automatic.
 - **The restore has never been exercised.** Nothing here has been applied, so no dump
   has ever been restored. Until a human drills it, the backups are unproven.
-- **DNS.** Hand-edited at Namecheap, TTL 1800. All Cloudflare support is off by
-  default.
+- **DNS.** Hand-edited at Namecheap, TTL 1800, and staying that way: there is no
+  Terraform resource for the A records and no DNS provider in the stack. The rows to
+  type in come from `terraform output dns_records_required`. Cloudflare was
+  considered and rejected. See [`infra/dns.tf`](infra/dns.tf).
+- **TLS is now single-point.** With no edge proxy, Caddy's Let's Encrypt certificate
+  is the only thing between the public internet and cleartext — a certificate failure
+  is an outage. What to check is in
+  [`infra/README.md` → When TLS breaks](infra/README.md#when-tls-breaks).
 - **The log viewer** (`logs.py`, a CGI behind nginx + fcgiwrap). No service entry
   yet.
 - **CI workflows** to build and push images. Not written.

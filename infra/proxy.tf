@@ -5,10 +5,15 @@
 # hand-edited nginx vhosts which today exist only on the boxes' disks and are in
 # no repository at all.
 #
-# Caddy rather than nginx because it needs no separate certbot: with
-# enable_origin_tls it serves a Cloudflare Origin Certificate supplied from SSM,
-# and with it off it serves plain HTTP behind Cloudflare's edge. Either way there
-# is no Let's Encrypt renewal timer to silently stop working.
+# Caddy rather than nginx because it needs no separate certbot: with the default
+# tls_mode = "acme" it obtains and renews Let's Encrypt certificates itself, as
+# part of the same process that serves the traffic, so there is no renewal timer
+# to stop working independently of the thing it renews for.
+#
+# THIS IS NOW THE ONLY PLACE PUBLIC TLS EXISTS. There is no Cloudflare edge in
+# front of the box (see dns.tf), so a Caddy that cannot get a certificate is an
+# outage, not a degraded mode. What to check when that happens is in
+# infra/README.md -> "When TLS breaks".
 #
 # Behaviours carried over verbatim from the current nginx configuration:
 #   - proxy_buffering off      -> `flush_interval -1` on SSE routes
@@ -18,7 +23,9 @@
 locals {
   caddyfile = templatefile("${path.module}/templates/Caddyfile.tftpl", {
     routes            = local.routes
-    enable_origin_tls = var.enable_origin_tls
+    tls_mode          = var.tls_mode
+    acme_email        = var.acme_email
+    acme_ca_directory = var.acme_ca_directory
     environment       = var.environment
   })
 }

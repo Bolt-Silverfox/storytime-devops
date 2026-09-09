@@ -21,9 +21,10 @@ This is written to be followed literally. Each step says what to verify and what
 | Container images | ECR | already there; pull by tag |
 | App configuration | SSM Parameter Store | `terraform apply` |
 | Database contents | S3 (nightly `pg_dump`) + EBS snapshots | `pg_restore` — step 5 |
-| DNS | Cloudflare, in Terraform | `terraform apply` |
+| The public address | an Elastic IP, independent of any instance | re-associate it — step 7 |
+| DNS | Namecheap, **edited by hand** | not recreated; it does not change |
 | Reverse proxy config | rendered from `infra/proxy.tf` | `terraform apply` |
-| TLS | Cloudflare edge, or an Origin Cert in SSM | `terraform apply` |
+| TLS | Caddy + Let's Encrypt, on the box | re-issued automatically once the address moves |
 
 **The one known gap, stated plainly:** with `use_managed_database = false` the
 Postgres *data directory* is a Docker volume on the instance's EBS volume. Losing
@@ -36,6 +37,43 @@ Also true, and deliberate: **no literal IP addresses, no hardcoded AMI ids, and 
 hardcoded region anywhere in `infra/`.** Region, AZ, instance type, hostnames and
 environment name are all variables. The AMI comes from `data.aws_ami` with
 `ignore_changes = [ami]`, so it is current at launch and stable thereafter.
+### The lever: the Elastic IP, not DNS
+
+**Cutover is remapping the Elastic IP from the old instance to the new one.** One
+AWS API call, atomic, a few seconds. **Rollback is remapping it back.** DNS is not
+touched, so the Namecheap TTL — 1800s, hand-edited — is irrelevant to both.
+
+`infra/compute.tf` allocates the address (`aws_eip.app`) and attaches it
+(`aws_eip_association.app`) as **separate** resources precisely so the address can
+outlive any instance and move between them.
+
+**The constraint that shapes this whole document:**
+
+> **An Elastic IP can only be remapped between instances IN THE SAME AWS ACCOUNT.**
+
+The legacy Storytime boxes live in a **different AWS account** from the target
+(FateRound's `772316781095`, `eu-west-1`). So:
+
+| Migration | Lever | DNS change? | Does the TTL matter? |
+|---|---|---|---|
+| **The first one** — legacy account into `772316781095` | one Namecheap A-record edit per hostname | **yes, once** | yes, once (step 7A) |
+| **Every one after it** — inside `772316781095` | EIP remap | **no** | no |
+
+That contrast is the payoff. The first move is the only one that pays the DNS tax;
+after it, rebuilding or replacing a box never touches Namecheap again.
+
+There is a way to avoid even that one edit: **AWS Elastic IP transfer between
+accounts** (`aws ec2 enable-address-transfer` in the source account, then
+`aws ec2 accept-address-transfer` in the destination —
+<https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/elastic-ip-addresses-eip.html#transfer-EIPs-intro>).
+The address itself changes accounts, so the legacy IPs keep serving traffic
+throughout and no DNS record ever changes.
+
+**It has to be initiated by whoever controls the SOURCE account** — the one that
+owns `52.18.195.224` and `18.203.158.141`. **Identifying that account owner is an
+open action**, tracked in `infra/README.md` → Open decisions. Until someone can run
+`enable-address-transfer` there, plan for step 7A.
+
 
 ---
 
@@ -116,9 +154,21 @@ Edit `terraform.all-v2.tfvars`:
   changing, re-read [`infra/README.md` → Region](../infra/README.md#region-and-data-residency)
   first: this is a GDPR decision, not a latency one.**
 - `backup_bucket_name` — a *new* bucket. Never point two stacks at one.
-- `cloudflare_enabled = true`, but **leave the hostnames pointing nowhere yet** —
-  give the new stack temporary hostnames (e.g. `api-v2.<zone>`) so it can be
-  tested end to end before it owns the real names.
+- `associate_eip = false` — **the new stack must not take the live address while it
+  is being built.** It still gets an auto-assigned public IPv4 to test against.
+- `tls_mode` — the new box **cannot obtain a Let's Encrypt certificate for a
+  hostname that does not resolve to it yet**, and none of the real ones will until
+  step 7. Use either:
+  - a temporary hostname (e.g. `api-v2.<zone>`) with its own hand-made Namecheap A
+    record pointing at the new box's auto-assigned IP, and `tls_mode = "acme"`; or
+  - `tls_mode = "none"` with `allow_plaintext_origin = true` for the verification
+    window only, flipping to `"acme"` as part of step 7.
+
+  If you are rehearsing this more than once, set
+  `acme_ca_directory = "https://acme-staging-v02.api.letsencrypt.org/directory"`.
+  Production Let's Encrypt allows **5 duplicate certificates per week** for the
+  same set of names; burning that quota on drills turns the real cutover into an
+  outage.
 
 ```bash
 terraform plan -var-file=terraform.all-v2.tfvars -out=v2.tfplan
@@ -273,13 +323,17 @@ aws s3 rm "s3://$NEW_BUCKET/postgres/restore-in/source.dump"
 
 (The instance role has no `s3:DeleteObject`, so run this from your workstation.)
 
-## 6. Verify the new stack through its temporary hostname
+## 6. Verify the new stack before it owns any traffic
 
-Before it owns any real traffic:
+Against its temporary hostname, or straight at its auto-assigned public IP:
 
 ```bash
-curl -fsS https://api-v2.<zone>/health
+NEW_IP=$(terraform output -raw instance_public_ip)   # or the temporary hostname
+curl -fsS "http://$NEW_IP/health" -H 'Host: api.<zone>'
 ```
+
+> The `Host:` header matters: Caddy routes by hostname, so a request to the bare IP
+> matches no site block and returns a 404-ish error that looks like a broken app.
 
 Then exercise the paths that break in interesting ways:
 
@@ -292,85 +346,188 @@ Then exercise the paths that break in interesting ways:
 - **A queued job** — trigger an email or a TTS batch and watch it drain, proving
   Redis and BullMQ are wired up.
 
-**Check:** all four behave as on the old stack. **Do not flip DNS until they do.**
+**Check:** all four behave as on the old stack. **Do not move the address until
+they do.**
 
 ---
 
-## 7. Cut over — flip the Cloudflare record
+## 7. Cut over
 
-This is the whole point of putting DNS in Terraform with a low TTL.
+Two cases, and which one you are in is decided by a single question: **are the old
+and new instances in the same AWS account?**
 
-> ### One hostname, one owner. Never two.
+- **7A — different accounts** (this is the FIRST migration: the legacy boxes are
+  in another account, the new stack is in FateRound's `772316781095`). One
+  Namecheap A-record edit per hostname, and the 1800s TTL applies. Once.
+- **7B — same account** (every migration after that, including any rebuild of a
+  box inside `772316781095`). Remap the Elastic IP. No DNS change at all.
+
+> ### The invariant, in both cases
 >
-> Cloudflare permits **multiple A records for the same name**, and Terraform
-> workspaces do not coordinate with each other. So if you add the real hostname to
-> `all-v2` *before* removing it from `all`, both records exist and Cloudflare
-> **round-robins traffic between the two origins** — half of it to a stack you have
-> not finished verifying, with a split-brain database underneath.
+> **The old box keeps running until the new one is verified in production.** Nothing
+> in step 7 destroys, stops or `terraform destroy`s the old stack — that is the only
+> reason rollback exists. Decommissioning is step 9, on another day.
 >
-> That is far worse than a few seconds of NXDOMAIN. So: **remove, then add**, with
-> both plans computed in advance so the two applies are back to back.
+> ### One address, one owner
+>
+> This is what replaces the old "one hostname, one owner" rule, and the EIP model
+> makes it structural rather than a discipline: **an Elastic IP has exactly one
+> association at a time.** Two boxes cannot both serve the address, so there is no
+> round-robin-between-two-origins failure mode to avoid any more.
+>
+> Two things still need care:
+>
+> 1. **Exactly one stack may set `associate_eip = true` for a given allocation.**
+>    Two workspaces both claiming it will fight on every apply, each stealing it
+>    back from the other. Set it false in the old stack as part of the cutover.
+> 2. **Split-brain is now a DATA problem, not a traffic one.** The old box is still
+>    running with its own Postgres. It receives no requests once the address moves,
+>    but if anything reaches it directly, or a queue worker there is still draining,
+>    it will write to a database nobody is reading. Stop the old stack's app
+>    containers if that is a real risk — but leave the box itself up.
 
-Edit the tfvars first — remove the real hostnames from `terraform.all.tfvars`, and add
-them to `terraform.all-v2.tfvars` — then compute **both** plans before applying
-either:
+### 7A. Different accounts — one DNS edit
+
+**Pre-step, at least 24 hours ahead:** lower the TTL at Namecheap.
+
+```
+Namecheap -> Domain List -> Manage -> Advanced DNS -> Host Records
+  set TTL to 300 (5 min) on every record you are about to move
+```
+
+**Check:** `dig +noall +answer api.<zone>` reports a TTL that counts down from ~300,
+not ~1800. The old value must have expired everywhere *before* the cutover, which is
+why this is a day early and not an hour.
+
+Then, at cutover time:
 
 ```bash
-terraform workspace select all
-terraform plan -var-file=terraform.all.tfvars     -out=release.tfplan
-terraform show release.tfplan            # expect: cloudflare_record DESTROY only
-
 terraform workspace select all-v2
-terraform plan -var-file=terraform.all-v2.tfvars  -out=cut.tfplan
-terraform show cut.tfplan                # expect: cloudflare_record CREATE only
-```
-
-**Check before applying anything:** `release.tfplan` destroys **only**
-`cloudflare_record` resources. If it proposes destroying the instance, the EIP or the
-backup bucket, **stop** — you still need the old box for rollback.
-
-Then apply them back to back, release first:
-
-```bash
-terraform workspace select all   && terraform apply release.tfplan
-terraform workspace select all-v2 && terraform apply cut.tfplan
-```
-
-**Do this during a quiet period**, and watch:
-
-```bash
-dig +short api.<zone>
-curl -fsS https://api.<zone>/health
-```
-
-Expect a gap of a few seconds between the two applies during which the name does not
-resolve. With `cloudflare_proxied = true` the edge address does not change — only the
-origin behind it — so propagation is effectively instant; unproxied,
-`cloudflare_dns_ttl` (default 60s) bounds it.
-
-## 8. Rollback
-
-**Rollback is flipping the record back.** That is the only reason the old box is
-still running, and it is why step 7 must never destroy it.
-
-Same single-owner rule, in reverse — remove from `all-v2` first, then restore to
-`all`, or you recreate the split-brain you just avoided:
-
-```bash
-# 1. Release the hostnames from the new stack.
-terraform workspace select all-v2
-#    remove the real hostnames from terraform.all-v2.tfvars
+# in terraform.all-v2.tfvars: real hostnames, associate_eip = true, tls_mode = "acme"
 terraform apply -var-file=terraform.all-v2.tfvars
 
-# 2. Return them to the old stack.
+terraform output dns_records_required     # the exact rows to type into Namecheap
+```
+
+Enter those A records at Namecheap, replacing the legacy IPs.
+
+**Check:** `dig +short api.<zone>` returns the new Elastic IP from more than one
+resolver (`dig @1.1.1.1`, `dig @8.8.8.8`). Allow up to the *old* TTL for stragglers.
+
+**Then wait for the certificate**, because ACME could not have run before this
+moment — the name did not point here:
+
+```bash
+NEW_INSTANCE=$(terraform output -raw instance_id)
+aws ssm send-command --instance-ids "$NEW_INSTANCE" \
+  --document-name AWS-RunShellScript \
+  --parameters 'commands=["systemctl restart caddy"]'
+```
+
+Restarting Caddy forces an immediate issuance attempt instead of waiting out its
+retry backoff. Then:
+
+```bash
+curl -sSv https://api.<zone>/health 2>&1 | grep -E 'issuer|subject|SSL certificate'
+```
+
+**Check:** the issuer is `Let's Encrypt` (or your staging CA if rehearsing) and the
+request succeeds. If it does not, go to *When TLS breaks* in
+[`infra/README.md`](../infra/README.md) — and remember the rollback below is still
+available.
+
+> **This is the one migration whose IP address changes**, so it is also the one that
+> breaks `storytime_be/.github/workflows/dev-deploy.yml` (see the last section).
+> Edit it in the same change window.
+
+### 7B. Same account — remap the Elastic IP
+
+No DNS is involved. The address moves; every record stays exactly as it is.
+
+```bash
+# The address you are moving, read from the stack that currently owns it.
 terraform workspace select all
-#    restore the real hostnames in terraform.all.tfvars
+OLD_ALLOC=$(terraform output -raw eip_allocation_id)
+echo "$OLD_ALLOC"
+
+# 1. The NEW stack takes the address. allow_reassociation makes this one atomic
+#    call rather than detach-then-attach, so the gap is seconds.
+terraform workspace select all-v2
+#    in terraform.all-v2.tfvars:
+#      eip_allocation_id = "<OLD_ALLOC>"
+#      associate_eip     = true
+terraform plan -var-file=terraform.all-v2.tfvars -out=cut.tfplan
+terraform show cut.tfplan          # expect: aws_eip_association CREATE, nothing destroyed
+terraform apply cut.tfplan
+
+# 2. Tell the OLD stack to stop claiming it, so the two do not fight.
+terraform workspace select all
+#    in terraform.all.tfvars: associate_eip = false
 terraform apply -var-file=terraform.all.tfvars
 ```
 
-**Caveat you must think about before cutting over:** any data written to the NEW
-stack after cutover does not exist on the old one. Rolling back therefore loses
-it. Either roll back fast (minutes), or dump the new stack and restore into the
+**Check before applying anything:** neither plan destroys an instance, an EIP or a
+backup bucket. `aws_eip.app` carries `prevent_destroy`, so a plan that tries to
+release the address fails loudly rather than losing it forever.
+
+**Check after:** 
+
+```bash
+aws ec2 describe-addresses --allocation-ids "$OLD_ALLOC" \
+  --query 'Addresses[0].{IP:PublicIp,Instance:InstanceId}'
+curl -fsS https://api.<zone>/health
+```
+
+The instance id is the new one, the IP is unchanged, and no DNS was touched.
+
+**Certificates:** the new box has been serving a different address until now, so it
+may not hold certificates for the real hostnames yet. Restart Caddy immediately
+after the remap, exactly as in 7A, and check the issuer.
+
+**Emergency, out-of-band version** — if you need the address moved *right now* and
+will reconcile Terraform afterwards:
+
+```bash
+terraform output -raw eip_remap_command    # prints the exact command
+aws ec2 associate-address --allocation-id <alloc> --instance-id <target> \
+  --allow-reassociation --region eu-west-1
+```
+
+Then fix the tfvars so state and reality agree again, or the next apply will move it
+back.
+
+## 8. Rollback
+
+**Rollback is putting the address back.** That is the only reason the old box is
+still running, and it is why step 7 must never destroy it.
+
+**7B (same account) — seconds:**
+
+```bash
+# 1. New stack lets go.
+terraform workspace select all-v2
+#    associate_eip = false
+terraform apply -var-file=terraform.all-v2.tfvars
+
+# 2. Old stack takes it back.
+terraform workspace select all
+#    associate_eip = true
+terraform apply -var-file=terraform.all.tfvars
+```
+
+Or, faster, in one call:
+`aws ec2 associate-address --allocation-id <alloc> --instance-id <OLD instance> --allow-reassociation`
+— then reconcile the tfvars.
+
+**7A (the cross-account first migration) — minutes, not seconds.** There is no
+address to move back: rollback means editing the Namecheap records back to the
+legacy IPs and waiting out the TTL you lowered. That asymmetry is the reason the
+TTL pre-step is not optional, and the reason to do this one during a genuinely
+quiet window.
+
+**Caveat you must think about before cutting over, in both cases:** any data written
+to the NEW stack after cutover does not exist on the old one. Rolling back therefore
+loses it. Either roll back fast (minutes), or dump the new stack and restore into the
 old one first. Decide which of those you are doing *before* step 7, not during it.
 
 ---
@@ -392,6 +549,26 @@ terraform destroy -var-file=terraform.all.tfvars
 were using managed RDS Terraform will refuse — that is deliberate, and removing
 the guard to get past it is a decision that needs a human.
 
+**`aws_eip.app` also carries `prevent_destroy`, and here it matters more than
+usual.** After a 7B cutover the *old* workspace still owns the allocation in its
+state while the *new* stack is serving traffic on it. A destroy that released it
+would take the live address away permanently — AWS will not give the same one back.
+Hand the address over first:
+
+```bash
+# In the OLD workspace: stop managing the address without releasing it.
+terraform state rm 'aws_eip.app[0]'
+terraform destroy -var-file=terraform.all.tfvars
+
+# In the NEW workspace: adopt it properly, so it is not orphaned.
+#   set eip_allocation_id = "" in terraform.all-v2.tfvars
+terraform import 'aws_eip.app[0]' <eipalloc-...>
+terraform plan -var-file=terraform.all-v2.tfvars   # expect: no changes
+```
+
+Until that import, the address is real but unmanaged — which is survivable, and
+is still better than releasing it, but do not leave it that way.
+
 **The backup bucket is not `force_destroy`, so `destroy` leaves it and its
 contents behind.** That is intentional: emptying the backup history must be a
 separate, deliberate act, never a side effect. Delete it by hand, later, once you
@@ -412,5 +589,10 @@ breaks dev deploys until that file is edited: the runner will block the connecti
 and the failure will look like a network problem, not a configuration one.
 
 Not fixed here — it is in another repository — but it is exactly the kind of hidden
-coupling this work exists to eliminate. Edit it **as part of step 7**, in the same
-change window, and check it off before you call the migration done.
+coupling this work exists to eliminate.
+
+**It only breaks on the cross-account migration (step 7A), because that is the only
+one where the address changes.** A 7B remap keeps the same Elastic IP, so the
+allowlist stays valid — which is a second, quieter payoff of making the address the
+lever instead of the DNS record. Edit the workflow **as part of step 7A**, in the
+same change window, and check it off before you call the migration done.

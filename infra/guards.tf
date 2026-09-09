@@ -68,15 +68,25 @@ resource "terraform_data" "guards" {
     }
 
     precondition {
-      condition     = !var.enable_origin_tls || (trimspace(var.origin_cert) != "" && trimspace(var.origin_key) != "")
-      error_message = "enable_origin_tls = true requires both origin_cert and origin_key."
+      condition     = var.tls_mode != "static" || (trimspace(var.tls_certificate) != "" && trimspace(var.tls_private_key) != "")
+      error_message = "tls_mode = \"static\" requires both tls_certificate and tls_private_key."
     }
 
     precondition {
-      # Locking the origin to Cloudflare only works if traffic actually arrives
-      # via a proxied Cloudflare record; otherwise the box is unreachable.
-      condition     = !var.restrict_to_cloudflare || (var.cloudflare_enabled && var.cloudflare_proxied)
-      error_message = "restrict_to_cloudflare = true requires cloudflare_enabled = true and cloudflare_proxied = true, or the origin becomes unreachable."
+      # ACME needs a monitored contact address. With TLS terminating only on this
+      # box, the expiry warning email is the ONLY out-of-band signal that renewal
+      # has been failing, and the failure is otherwise invisible until the
+      # certificate expires and the whole platform goes dark.
+      condition     = !var.create_instance || var.tls_mode != "acme" || trimspace(var.acme_email) != ""
+      error_message = "tls_mode = \"acme\" requires acme_email. It is where Let's Encrypt sends expiry and renewal-failure notices, and TLS now terminates nowhere else. Use a monitored alias."
+    }
+
+    precondition {
+      # Let's Encrypt validates from several unannounced source addresses, so an
+      # allowlisted origin cannot complete an HTTP-01 or TLS-ALPN-01 challenge.
+      # Caught here rather than as an issuance failure on the box.
+      condition     = !var.create_instance || var.tls_mode != "acme" || contains(var.web_ingress_cidrs, "0.0.0.0/0")
+      error_message = "tls_mode = \"acme\" requires web_ingress_cidrs to include 0.0.0.0/0: Let's Encrypt validates from unannounced addresses in several regions, so a restricted origin cannot be issued a certificate."
     }
 
     precondition {
@@ -108,16 +118,15 @@ resource "terraform_data" "guards" {
 
     precondition {
       # A production hostname served over plaintext HTTP, with 0.0.0.0/0 ingress,
-      # for a service handling children's personal data. Either terminate TLS at
-      # Cloudflare's edge or on the box; or say explicitly that you accept
-      # cleartext (which is only reasonable pre-cutover, with no real traffic).
+      # for a service handling children's personal data. There is no edge proxy
+      # to terminate TLS instead of the box any more, so this is the only place
+      # it can happen: either Caddy does it, or nobody does.
       condition = (
         !contains(["prod", "all"], var.environment)
-        || var.cloudflare_enabled
-        || var.enable_origin_tls
+        || var.tls_mode != "none"
         || var.allow_plaintext_origin
       )
-      error_message = "environment = \"${var.environment}\" serves production hostnames, but neither cloudflare_enabled nor enable_origin_tls is set — traffic would be plaintext HTTP over the public internet. Enable one, or set allow_plaintext_origin = true to accept cleartext deliberately (only defensible before the DNS cutover, with no real traffic)."
+      error_message = "environment = \"${var.environment}\" serves production hostnames with tls_mode = \"none\" — traffic would be plaintext HTTP over the public internet, and there is no proxy in front of this box to terminate TLS instead. Use tls_mode = \"acme\" (or \"static\"), or set allow_plaintext_origin = true to accept cleartext deliberately (only defensible pre-cutover, with no real traffic)."
     }
 
     precondition {

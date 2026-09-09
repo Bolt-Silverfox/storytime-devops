@@ -3,11 +3,20 @@
 # redeploy. No long-lived AWS access keys exist in any GitHub secret.
 #
 # Both the OIDC provider and the deploy role are account-global, so they belong to
-# the `shared` workspace (manage_github_oidc = true there, false everywhere else).
-# If the AWS account already has a provider for token.actions.githubusercontent.com
-# — for example because it is shared with another project — leave this false
-# everywhere and reuse the existing one; creating a second one for the same URL
-# fails.
+# the `shared` workspace.
+#
+# BUT: NONE OF IT IS CREATED IN THE ACCOUNT THIS STACK ACTUALLY TARGETS.
+# manage_github_oidc defaults to false and must stay false for account
+# 772316781095 — the FateRound stack already created an OIDC provider for
+# token.actions.githubusercontent.com there, AWS allows exactly one per URL per
+# account, and a second one fails the apply. That account is shared with the
+# FateRound application and a third-party `Portfolio-Server`; this stack does not
+# get to assume it owns account-global identity resources.
+#
+# To give Storytime CI a role, REUSE the existing provider: reference its ARN in
+# the assume-role policy instead of aws_iam_openid_connect_provider.github[0].
+# The resources below stay for the case of a dedicated account with no provider
+# of its own.
 
 data "tls_certificate" "github" {
   count = var.manage_github_oidc ? 1 : 0

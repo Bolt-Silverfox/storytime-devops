@@ -9,8 +9,39 @@ output "instance_id" {
 }
 
 output "instance_public_ip" {
-  description = "Elastic IP. Point DNS here."
-  value       = try(aws_eip.app[0].public_ip, null)
+  description = "The Elastic IP this stack serves on, whether it allocated it or adopted an existing one. This is the address the Namecheap A records point at."
+  value       = local.eip_public_ip
+}
+
+output "eip_allocation_id" {
+  description = <<-EOT
+    Allocation id of the Elastic IP. THIS IS THE CUTOVER LEVER: a replacement
+    stack sets eip_allocation_id to this value to take the live address over, and
+    a rollback is putting it back. Keep it somewhere findable — it outlives every
+    instance.
+  EOT
+  value       = local.eip_allocation_id
+}
+
+output "eip_remap_command" {
+  description = "Emergency, out-of-band version of the cutover. Terraform is the normal path (see docs/migration.md step 7); this is for when you need the address moved right now and will reconcile state afterwards."
+  value = (
+    local.eip_allocation_id == null
+    ? null
+    : "aws ec2 associate-address --allocation-id ${local.eip_allocation_id} --instance-id <target-instance-id> --allow-reassociation --region ${var.aws_region}"
+  )
+}
+
+output "dns_records_required" {
+  description = <<-EOT
+    The A records a human must create BY HAND at Namecheap (Domain List -> Manage
+    -> Advanced DNS -> Host Records). Terraform does not manage DNS — see
+    infra/dns.tf for why — so this output is the interface between the two.
+
+    Once these exist, they never change again for a migration inside this AWS
+    account: the Elastic IP moves instead.
+  EOT
+  value       = local.dns_records_required
 }
 
 output "ecr_repository_urls" {

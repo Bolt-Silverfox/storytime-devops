@@ -361,17 +361,28 @@ cat > /etc/caddy/Caddyfile <<'CADDYFILE'
 ${caddyfile}
 CADDYFILE
 
-%{ if enable_origin_tls ~}
-# Origin TLS: Cloudflare Origin Certificate from SSM, enabling Cloudflare SSL
-# mode "Full (strict)". This is what replaces certbot — no ACME, no renewal timer.
+%{ if tls_mode == "acme" ~}
+# Caddy's certificate store. It holds the issued certificates AND the ACME
+# account key, so it is 0700 and root-owned: a readable copy of these is a
+# readable copy of the site's private keys.
+#
+# It lives on the instance's own disk, which means replacing the instance
+# re-issues every certificate. That is fine occasionally and a problem
+# repeatedly — Let's Encrypt caps duplicate certificates at 5 per week for the
+# same set of names. Rehearse cutovers against the staging directory
+# (var.acme_ca_directory).
+install -d -o root -g root -m 0700 /var/lib/caddy
+%{ endif ~}
+%{ if tls_mode == "static" ~}
+# tls_mode = "static": certificate and key come from SSM rather than ACME.
 aws ssm get-parameter --region "${aws_region}" --with-decryption \
-  --name "/${prefix}/_proxy/ORIGIN_CERT_B64" --query 'Parameter.Value' --output text \
-  | base64 -d > /etc/caddy/origin.crt
+  --name "/${prefix}/_proxy/TLS_CERT_B64" --query 'Parameter.Value' --output text \
+  | base64 -d > /etc/caddy/tls.crt
 aws ssm get-parameter --region "${aws_region}" --with-decryption \
-  --name "/${prefix}/_proxy/ORIGIN_KEY_B64" --query 'Parameter.Value' --output text \
-  | base64 -d > /etc/caddy/origin.key
-chmod 600 /etc/caddy/origin.key
-chmod 644 /etc/caddy/origin.crt
+  --name "/${prefix}/_proxy/TLS_KEY_B64" --query 'Parameter.Value' --output text \
+  | base64 -d > /etc/caddy/tls.key
+chmod 600 /etc/caddy/tls.key
+chmod 644 /etc/caddy/tls.crt
 %{ endif ~}
 
 cat > /etc/systemd/system/caddy.service <<'CADDYSVC'

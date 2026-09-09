@@ -85,15 +85,15 @@ resource "aws_instance" "app" {
   # Plain templatefile: aws_instance.user_data takes raw text and Terraform does
   # the encoding. Do NOT base64encode here.
   user_data = templatefile("${path.module}/templates/user-data.sh.tftpl", {
-    aws_region        = var.aws_region
-    prefix            = local.prefix
-    environment       = var.environment
-    enable_origin_tls = var.enable_origin_tls
-    redis_mode        = var.redis_mode
-    redis_image       = var.redis_container_image
-    redis_policy      = var.redis_maxmemory_policy
-    redis_memory_mb   = var.redis_memory_mb
-    caddyfile         = local.caddyfile
+    aws_region      = var.aws_region
+    prefix          = local.prefix
+    environment     = var.environment
+    tls_mode        = var.tls_mode
+    redis_mode      = var.redis_mode
+    redis_image     = var.redis_container_image
+    redis_policy    = var.redis_maxmemory_policy
+    redis_memory_mb = var.redis_memory_mb
+    caddyfile       = local.caddyfile
 
     # Pinned, checksum-verified reverse-proxy binary (see var.caddy_sha512).
     caddy_version      = var.caddy_version
@@ -157,8 +157,8 @@ resource "aws_instance" "app" {
   depends_on = [
     aws_ssm_parameter.plain,
     aws_ssm_parameter.secret,
-    aws_ssm_parameter.origin_cert,
-    aws_ssm_parameter.origin_key,
+    aws_ssm_parameter.tls_certificate,
+    aws_ssm_parameter.tls_private_key,
     aws_ssm_parameter.db_password,
     aws_ssm_parameter.db_host,
     aws_ssm_parameter.db_name,
@@ -177,10 +177,70 @@ resource "aws_instance" "app" {
   ]
 }
 
+# ---------------------------------------------------------------------------
+# THE ELASTIC IP: the address the world knows, and the cutover lever.
+#
+# Allocation and association are SEPARATE resources on purpose. An `aws_eip` with
+# an `instance` argument welds the address to one instance for the life of that
+# resource; splitting them means the address is a durable, independent object
+# that can be pointed at a different instance in ONE API call, atomically, in a
+# couple of seconds — with no DNS change, so Namecheap's TTL never enters into a
+# cutover or a rollback. It also lets a replacement stack be built and tested on
+# its own auto-assigned public IPv4 (associate_eip = false) while the live
+# address stays exactly where it is.
+#
+# Constraint that shapes the whole runbook: THIS ONLY WORKS INSIDE ONE AWS
+# ACCOUNT. The legacy Storytime boxes are in a different account from this one,
+# so the first migration still needs one Namecheap A-record edit. Every migration
+# after that is a remap. See docs/migration.md.
+# ---------------------------------------------------------------------------
+
 resource "aws_eip" "app" {
-  count    = var.create_instance ? 1 : 0
-  instance = aws_instance.app[0].id
-  domain   = "vpc"
+  # Not created when this stack is adopting an address that already exists.
+  count  = var.create_instance && var.eip_allocation_id == "" ? 1 : 0
+  domain = "vpc"
 
   tags = { Name = "${local.prefix}-eip" }
+
+  lifecycle {
+    # A released Elastic IP is gone for good — AWS will not give the same address
+    # back, and anything still resolving to it (a cached DNS answer, a partner's
+    # allowlist, the legacy dev-deploy workflow) breaks permanently. Decommission
+    # deliberately: `terraform state rm aws_eip.app[0]` first if the address must
+    # outlive this workspace, which during a migration it must. See
+    # docs/migration.md step 9.
+    prevent_destroy = true
+  }
+}
+
+data "aws_eip" "adopted" {
+  count = var.create_instance && var.eip_allocation_id != "" ? 1 : 0
+  id    = var.eip_allocation_id
+}
+
+resource "aws_eip_association" "app" {
+  count = var.create_instance && var.associate_eip ? 1 : 0
+
+  allocation_id = local.eip_allocation_id
+  instance_id   = aws_instance.app[0].id
+
+  # This is what makes a cutover one step instead of two. Without it, moving the
+  # address means disassociating from the old instance first, and the gap between
+  # the two calls is a gap in service. With it, AWS moves the address in a single
+  # operation.
+  allow_reassociation = true
+}
+
+locals {
+  eip_allocation_id = (
+    var.eip_allocation_id != ""
+    ? var.eip_allocation_id
+    : try(aws_eip.app[0].id, null)
+  )
+
+  eip_public_ip = (
+    var.eip_allocation_id != ""
+    ? try(data.aws_eip.adopted[0].public_ip, null)
+    : try(aws_eip.app[0].public_ip, null)
+  )
 }

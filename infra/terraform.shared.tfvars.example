@@ -16,11 +16,14 @@ create_instance = false
 
 manage_shared_ecr = true
 
-# LEFT FALSE ON PURPOSE. Creating a second OIDC provider for
-# token.actions.githubusercontent.com in an account that already has one FAILS the
-# apply, and which AWS account this is has not been settled (README -> "Open
-# decisions"). Confirm the account has no existing provider, then set this true —
-# note it also gates the CI deploy role, so CI has no role until you do.
+# LEFT FALSE ON PURPOSE, AND IT STAYS FALSE FOR THIS ACCOUNT.
+# The target account is FateRound's 772316781095, which already has an OIDC
+# provider for token.actions.githubusercontent.com created by the FateRound
+# stack. AWS allows exactly one per URL per account, so creating a second one
+# fails the apply. Giving Storytime CI a role means REUSING that provider (see
+# infra/github-oidc.tf), not creating another.
+#
+# The consequence, stated plainly: CI has no deploy role from this stack yet.
 #
 #   aws iam list-open-id-connect-providers
 manage_github_oidc = false

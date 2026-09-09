@@ -113,16 +113,25 @@ secret_values = {
   # NEVER COMMIT. Supply via TF_VAR_secret_values or this gitignored file.
 }
 
-# Production MUST have a TLS path. guards.tf refuses to plan a prod stack with
-# neither Cloudflare nor origin TLS unless allow_plaintext_origin says so
-# explicitly — children's personal data does not travel in cleartext by omission.
-cloudflare_enabled     = true
-cloudflare_zone_id     = "REPLACE_WITH_ZONE_ID"
-cloudflare_proxied     = true  # orange cloud: TLS/WAF/CDN at the edge
-cloudflare_dns_ttl     = 60    # low TTL = a working cutover/rollback lever
-restrict_to_cloudflare = true  # lock the origin to Cloudflare's edge IPs
-enable_origin_tls      = false # set true + supply an Origin Cert for Full (strict)
+# Production MUST have a TLS path, and on this design there is exactly one:
+# Caddy, on the box, with Let's Encrypt. Nothing sits in front of it, so a
+# certificate failure is an outage — guards.tf refuses tls_mode = "none" here
+# unless allow_plaintext_origin says so explicitly. Children's personal data does
+# not travel in cleartext by omission.
+tls_mode               = "acme"
+acme_email             = "REPLACE_WITH_A_MONITORED_ALIAS"
 allow_plaintext_origin = false
 
+# The A records for the hostnames above must already point at this stack's
+# Elastic IP before the first apply can obtain certificates:
+#   terraform output dns_records_required   -> type them into Namecheap by hand
+#
+# After that, a rebuild or a migration inside this AWS account moves the ELASTIC
+# IP and touches no DNS at all:
+# eip_allocation_id = "eipalloc-..."   # take over the live address
+# associate_eip     = true             # false while verifying a replacement
+
 manage_shared_ecr  = false
+# MUST STAY FALSE: account 772316781095 already has the GitHub OIDC provider
+# (created by the FateRound stack); a second one for the same URL fails the apply.
 manage_github_oidc = false

@@ -1,5 +1,5 @@
 # security.tf
-# Security groups. web_ingress_ipv4 / web_ingress_ipv6 are defined in cloudflare.tf.
+# Security groups. web_ingress_ipv4 / web_ingress_ipv6 are defined in dns.tf.
 
 resource "aws_security_group" "app" {
   count = var.create_instance ? 1 : 0
@@ -13,8 +13,11 @@ resource "aws_security_group" "app" {
   # key material. If you find yourself wanting to add 22 here, add the reason to
   # the README first.
 
+  # :80 is NOT decorative. With tls_mode = "acme" it carries the ACME HTTP-01
+  # challenge, so closing it breaks certificate ISSUANCE AND RENEWAL — and the
+  # renewal failure would only show up 60 days later, as an expired certificate.
   ingress {
-    description      = "HTTP"
+    description      = "HTTP (public traffic + ACME HTTP-01 challenge)"
     from_port        = 80
     to_port          = 80
     protocol         = "tcp"

@@ -5,7 +5,9 @@
 #   terraform plan -var-file=terraform.all.tfvars
 #
 # ONE t3.small box, running Postgres and Redis as containers alongside the
-# applications, behind Cloudflare. ~$24/mo all in. Storytime has fewer than 100
+# applications, facing the internet directly (no CDN, no edge proxy: DNS is
+# Namecheap, edited by hand, and TLS is Caddy + Let's Encrypt on the box).
+# ~$24/mo all in. Storytime has fewer than 100
 # monthly users; one instance per environment was ~$225/mo and was rejected as
 # overbuilt. See README -> "Cost" and "One box, and when to stop using one box".
 
@@ -121,23 +123,43 @@ secret_keys = {
 secret_values = {}
 
 # ---------------------------------------------------------------------------
-# Edge / TLS.
+# TLS. There is no Cloudflare and no edge proxy: if Caddy has no certificate,
+# the platform is down. tls_mode defaults to "acme".
 #
-# Left off, so THIS EXAMPLE WILL FAIL THE PLAN as-is — on purpose. `environment`
-# is prod-bearing, and a plan that quietly served children's data over plaintext
-# HTTP would be worse than one that stops and asks. Choose one:
+# THIS EXAMPLE STILL FAILS THE PLAN as-is, on purpose: acme_email is empty, and
+# the hostnames above are .invalid placeholders. Both must be real before Let's
+# Encrypt can issue anything.
 #
-#   a) cloudflare_enabled = true  + zone id + CLOUDFLARE_API_TOKEN   <- intended
-#   b) enable_origin_tls  = true  + a Cloudflare Origin Certificate
-#   c) allow_plaintext_origin = true, only pre-cutover with no real traffic
+#   acme_email  -> a MONITORED alias. It is the only warning you get that
+#                  renewal has been failing before the certificate expires.
+#   the A records for every hostname must already point at this stack's Elastic
+#   IP (`terraform output dns_records_required`), because ACME validates by
+#   connecting to them. Namecheap is edited by hand — see infra/dns.tf.
 # ---------------------------------------------------------------------------
-cloudflare_enabled = false
-# cloudflare_zone_id     = "REPLACE_WITH_ZONE_ID"
-# cloudflare_proxied     = true   # orange cloud: TLS/WAF/CDN at the edge
-# restrict_to_cloudflare = true   # lock the origin to Cloudflare's IPs
-# cloudflare_dns_ttl     = 60     # low TTL = a working rollback lever
+tls_mode   = "acme"
+acme_email = "" # <-- REQUIRED, e.g. "ops@storytimeapp.me"
+# acme_ca_directory = "https://acme-staging-v02.api.letsencrypt.org/directory"
+#   ^ use the staging directory when REHEARSING a cutover: production Let's
+#     Encrypt allows only 5 duplicate certificates per week for the same names.
 
-allow_plaintext_origin = false
+# tls_mode = "static" instead, if a certificate is issued elsewhere:
+# tls_certificate = ""   # via TF_VAR_tls_certificate; never commit it
+# tls_private_key = ""   # via TF_VAR_tls_private_key
+
+allow_plaintext_origin = false # only true pre-cutover, with no real traffic
+
+# ---------------------------------------------------------------------------
+# Addressing. The Elastic IP is the cutover lever, not DNS.
+# ---------------------------------------------------------------------------
+# eip_allocation_id = ""    # "" = allocate a new one. Set to another stack's
+#                           #   allocation id to TAKE OVER the live address —
+#                           #   that is a cutover, and it needs no DNS change.
+#                           #   Only works within ONE AWS account.
+# associate_eip     = true  # false while building a replacement stack: it then
+#                           #   runs on its own auto-assigned public IP until you
+#                           #   deliberately move the live address to it.
+# namecheap_dns_ttl = 1800  # what the hand-written A records use. Drop to 300 a
+#                           #   day before the ONE cutover that needs DNS.
 
 # ---------------------------------------------------------------------------
 # Backups. Do not switch these off — this stack has no managed database, so these
@@ -154,5 +176,7 @@ restore_verify_min_tables   = 5
 shared_db_identifier = "" # e.g. the legacy shared RDS identifier, or "" to skip
 
 manage_shared_ecr = true
-# Confirm the account has no OIDC provider first: aws iam list-open-id-connect-providers
+# MUST STAY FALSE in account 772316781095: the FateRound stack already created
+# the token.actions.githubusercontent.com OIDC provider there, and AWS allows one
+# per URL per account. Verify: aws iam list-open-id-connect-providers
 manage_github_oidc = false
