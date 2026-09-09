@@ -118,8 +118,19 @@ and copy it back out of the terminal.
 
 The capture is the **input to writing the Terraform**, specifically:
 
-1. `90-apps/env-keys/*.keys.txt` → `var.secret_keys` in
-   `infra/terraform.<env>.tfvars` (names only, same shape).
+1. `90-apps/env-keys/*.keys.txt` → **split by hand** into
+   `infra/terraform.<env>.tfvars`:
+   - secret names → `var.secret_keys` (committed — names only), values into
+     `var.secret_values` (gitignored, never committed) → SSM `SecureString`;
+   - non-secret settings → `var.config_plain` as name **and** value, both
+     committed → SSM `String`.
+
+   **This step needs a human.** The capture reports every variable as
+   `KEY=<set>` / `KEY=<empty>` and cannot tell which is which — that is the
+   point of the redaction, not a gap in it. Routing everything to `secret_keys`
+   would put non-secret settings into `SecureString` parameters *and* leave
+   `config_plain` empty, so the shape of the environment stops being reviewable
+   in a pull request.
 2. `40-nginx/nginx-T.redacted.conf` → `hostnames`, `sse`, `max_body_size` and
    `read_timeout` per service in `var.services`.
 3. `70-network/listening-sockets.txt` → the two **unknown** waitlist API ports.
