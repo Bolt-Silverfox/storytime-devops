@@ -101,14 +101,20 @@ checked=0
 while IFS=$'\t' read -r host want; do
   [ -n "${host:-}" ] || continue
   for resolver in "${RESOLVERS[@]}"; do
-    checked=$((checked + 1))
-
     # +short prints a CNAME target on its own line before the A records, so
     # filter to things that look like IPv4 rather than assuming line 1.
     if ! raw=$(dig +short +time=5 +tries=2 A "$host" "@$resolver" 2>/dev/null); then
       drift+="  $host via $resolver: dig failed (resolver unreachable?)"$'\n'
       continue
     fi
+
+    # Count only lookups that actually RETURNED. `checked` is the guard that
+    # separates "everything matched" from "nothing could be checked": counting
+    # attempts meant a total resolver outage left checked > 0, skipped the
+    # refuse-to-report-success branch, and exited 1 (DNS drift) on the strength
+    # of "dig failed" lines — reporting a zone problem when the real fault was
+    # the network. Counting successes makes that case exit 2 as documented.
+    checked=$((checked + 1))
 
     got=$(printf '%s\n' "$raw" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | sort -u | tr '\n' ' ')
     got="${got% }"
