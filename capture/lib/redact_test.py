@@ -13,6 +13,7 @@ Two directions matter equally and both are asserted here:
                  important directive in the vhosts.
 """
 import importlib.util
+import json
 import os
 import sys
 
@@ -55,6 +56,32 @@ VISIBLE = [
     ("listen 443 ssl;", "443"),
 ]
 
+# filter_pm2_json: PM2_SAFE_KEYS may be honoured ONLY inside pm2_env.
+# ENV_CONTAINER_RE also matches env / env_production / environment_* — those are
+# pure application config, so a key colliding with the allowlist (e.g. "name")
+# must still be masked there. Passing preserve=True for every container emitted
+# env_production: {"name": "..."} verbatim.
+PM2_CASES = [
+    # (label, input dict, must_be_absent, must_be_present)
+    ("env_production.name is masked",
+     {"env_production": {"name": "super-secret-value"}}, "super-secret-value", None),
+    ("environment_staging.name is masked",
+     {"environment_staging": {"name": "another-secret"}}, "another-secret", None),
+    ("plain env.name is masked",
+     {"env": {"name": "also-secret"}}, "also-secret", None),
+    ("pm2_env secrets still masked",
+     {"pm2_env": {"JWT_SECRET": "leakme"}}, "leakme", None),
+    # The other direction: 30-pm2/summary.txt is built from these, so pm2_env
+    # bookkeeping must survive or the artefact loses the point of capturing it.
+    ("pm2_env.name preserved",
+     {"pm2_env": {"name": "storytime-api-production"}}, None, "storytime-api-production"),
+    ("pm2_env.exec_mode preserved",
+     {"pm2_env": {"exec_mode": "cluster_mode"}}, None, "cluster_mode"),
+    ("pm2_env.pm_cwd preserved",
+     {"pm2_env": {"pm_cwd": "/home/ubuntu/storytime"}}, None, "/home/ubuntu/storytime"),
+]
+
+
 def main() -> int:
     failed = 0
     for line, plaintext in LEAKS:
@@ -71,7 +98,18 @@ def main() -> int:
             failed += 1
         else:
             print(f"pass visible {line!r} -> {out!r}")
-    print(f"\n{len(LEAKS)} leak cases, {len(VISIBLE)} visibility cases, {failed} failed")
+    for label, payload, absent, present in PM2_CASES:
+        out = redact.filter_pm2_json(json.dumps(payload))
+        if absent is not None and absent in out:
+            print(f"FAIL pm2    {label}: {absent!r} survived in {out!r}")
+            failed += 1
+        elif present is not None and present not in out:
+            print(f"FAIL pm2    {label}: lost {present!r} from {out!r}")
+            failed += 1
+        else:
+            print(f"pass pm2    {label}")
+    print(f"\n{len(LEAKS)} leak cases, {len(VISIBLE)} visibility cases, "
+          f"{len(PM2_CASES)} pm2 cases, {failed} failed")
     return 1 if failed else 0
 
 if __name__ == "__main__":

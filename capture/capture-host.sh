@@ -459,7 +459,18 @@ if have redis-cli; then
   # allowlist: the whole point of a capture is discovering an unknown legacy host,
   # so its namespaces are not knowable in advance. A shape test generalises;
   # a fixed list would bucket every real prefix as unknown.
+  #
+  # The shape test ALONE was not enough: `alice:session` is identifier-shaped, so
+  # it printed `alice` — a user identifier, which is exactly what this artefact
+  # must never emit. The fix is a frequency gate rather than an allowlist. A real
+  # namespace is shared by many keys; a per-user identifier appears on one or two.
+  # Segments seen fewer than MIN_SEG times are collapsed into a single <rare>
+  # line that reports how many keys and how many distinct segments were
+  # suppressed — so the signal "there are non-namespace keys here" survives while
+  # the identifiers themselves do not. Discovery still works: an unknown-but-real
+  # namespace clears the threshold on its own.
   run 60-redis/key-prefix-histogram.txt bash -c '
+    MIN_SEG=5   # below this, a first segment is an identifier, not a namespace
     dbcount=$(redis-cli config get databases 2>/dev/null | tail -1); dbcount=${dbcount:-16}
     for db in $(seq 0 $((dbcount - 1))); do
       keys=$(redis-cli -n "$db" dbsize 2>/dev/null)
@@ -471,7 +482,14 @@ if have redis-cli; then
             if (seg ~ /^[A-Za-z][A-Za-z_-]{0,23}$/) print seg
             else print \"<opaque>\"
           }" \
-        | sort | uniq -c | sort -rn | head -25
+        | sort | uniq -c | sort -rn \
+        | awk -v min="$MIN_SEG" "
+            { if (\$1 + 0 >= min) print; else { rare += \$1; distinct++ } }
+            END {
+              if (distinct)
+                printf \"%7d <rare: %d distinct segment(s) seen fewer than %d times — suppressed as possible identifiers>\\n\", rare, distinct, min
+            }" \
+        | head -25
       echo
     done'
 

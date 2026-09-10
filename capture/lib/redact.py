@@ -298,10 +298,21 @@ def _walk(node):
         out = {}
         for k, v in node.items():
             if ENV_CONTAINER_RE.match(k) and isinstance(v, (dict, list)):
-                # Only the process's own pm2_env/env map carries PM2 bookkeeping
-                # worth keeping (exec_mode, status, pm_cwd — 30-pm2/summary.txt is
-                # built from them). Anything nested below it is application config.
-                out[k] = _mask_env_value(v, preserve_pm2_metadata=True)
+                # PM2_SAFE_KEYS may be honoured ONLY inside `pm2_env`, which is the
+                # single map carrying PM2's own bookkeeping (exec_mode, status,
+                # pm_cwd — 30-pm2/summary.txt is built from them).
+                #
+                # ENV_CONTAINER_RE deliberately also matches `env`, `environment`
+                # and the per-environment overrides `env_production`,
+                # `env_staging`, `environment_*`. Those are pure APPLICATION
+                # config: every value in them is a candidate secret, and none of
+                # PM2's bookkeeping lives there. Passing preserve=True for them
+                # meant any key that happens to collide with PM2_SAFE_KEYS was
+                # emitted verbatim — `env_production: {"name": "…"}` came through
+                # unmasked because `name` is allowlisted.
+                out[k] = _mask_env_value(
+                    v, preserve_pm2_metadata=(k.lower() == "pm2_env")
+                )
             elif ENV_CONTAINER_RE.match(k):
                 # An env key holding a scalar: mask it rather than pass it through.
                 out[k] = _mask_scalar(v)
