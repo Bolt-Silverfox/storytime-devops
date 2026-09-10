@@ -296,7 +296,7 @@ def mask_text(line: str) -> str:
 
 
 def _unbalanced_quote(line: str):
-    """Return the quote character left open at end of line, or None.
+    """Return (quote character, index) for the quote left open, else (None, -1).
 
     A left-to-right scan rather than a regex: the regex form of this
     ("balanced pairs, then a lone quote") needs nested quantifiers and can
@@ -311,33 +311,55 @@ def _unbalanced_quote(line: str):
     tells the operator nothing.
     """
     quote = None
+    at = -1
     for i, ch in enumerate(line):
         if quote is None:
             if ch in "\"'" and (i == 0 or line[i - 1] in "=: \t"):
-                quote = ch
+                quote, at = ch, i
         elif ch == quote:
-            quote = None
-    return quote
+            quote, at = None, -1
+    return quote, at
 
 
-def _continuation_quote(raw: str, masked: str):
-    """The quote this line leaves open, if it opened a value we just masked.
+def _mask_line_and_quote(raw: str, strict: bool = False):
+    """Mask one line and report the quote it leaves open, if any.
 
-    Shared by both places that can start continuation mode — the ordinary line
-    and the REMAINDER of a line that closed a previous one. Keeping it in one
-    place is not tidiness: the remainder path originally cleared the state and
-    never recomputed it, so
+    Everything from an unterminated opening quote to end of line is part of the
+    value, so it is CUT rather than masked piecewise. Without that, an unbalanced
+    quote that mask_text's grammars did not own survived on the line:
+    `JWT_SECRET=x other="ccc` kept `other="ccc`, and the tail of a closing line
+    kept `"ccc`. QUOTED only matches balanced pairs, so it cannot help here.
+
+    Both callers share this function deliberately. The remainder-of-a-closing-line
+    path originally had its own copy of the entry test, cleared the state and never
+    recomputed it, so
 
         SECRET="aaa
         bbb" PASSWORD="ccc
         ddd"
 
     left continuation mode on the middle line and emitted `ddd"` verbatim — the
-    same tail-of-a-secret this function exists to prevent, one branch over.
+    same tail-of-a-secret this exists to prevent, one branch over.
+
+    `strict` is for that remainder: we already know the text carries the tail of a
+    secret value, so every quoted string left on it is masked and an unbalanced
+    quote continues without the line having to name something secret-ish itself.
     """
-    if masked == raw or not _line_mentions_secret(raw):
-        return None
-    return _unbalanced_quote(raw)
+    masked = mask_text(raw)
+    quote, at = _unbalanced_quote(raw)
+    if strict:
+        masked = QUOTED.sub("<redacted>", masked)
+    elif quote is not None and (masked == raw or not _line_mentions_secret(raw)):
+        # An apostrophe in a comment (`# don't do this`) must not start swallowing
+        # the file, so an ordinary line has to have been rewritten AND mention
+        # something secret-ish before its open quote is believed.
+        quote = None
+    if quote is None:
+        return masked, None
+    head = mask_text(raw[:at])
+    if strict:
+        head = QUOTED.sub("<redacted>", head)
+    return head + "<redacted>", quote
 
 
 def mask_stream(text: str) -> str:
@@ -364,13 +386,10 @@ def mask_stream(text: str) -> str:
             if end == -1:
                 out.append("<redacted: continuation of a quoted value>")
                 continue
-            tail = raw[end + 1:]
-            masked_tail = mask_text(tail)
-            pending = _continuation_quote(tail, masked_tail)
+            masked_tail, pending = _mask_line_and_quote(raw[end + 1:], strict=True)
             out.append("<redacted: continuation of a quoted value>" + masked_tail)
             continue
-        masked = mask_text(raw)
-        pending = _continuation_quote(raw, masked)
+        masked, pending = _mask_line_and_quote(raw)
         out.append(masked)
     if in_pem:
         # EOF inside a key block: the END line never arrived. Say so rather than

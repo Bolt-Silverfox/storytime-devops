@@ -117,6 +117,20 @@ STREAM_CASES = [
     ("a closing line that opens a second unterminated value stays in continuation",
      'SECRET="aaa\nbbb" PASSWORD="ccc\nddd"\nproxy_pass http://x;\n',
      ["aaa", "bbb", "ccc", "ddd"], ["proxy_pass http://x"]),
+    # An unbalanced quote none of mask_text's grammars owned. QUOTED only matches
+    # balanced pairs, so `other="ccc` survived on the line and `"ccc` survived on
+    # the tail of a closing line. Everything from an open quote to end of line is
+    # part of the value, so it is cut.
+    ("an open quote no grammar owns is cut, on the line and on a closing tail",
+     'JWT_SECRET=x other="ccc\nddd"\nlisten 443 ssl;\n',
+     ["ccc", "ddd"], ["443"]),
+    ("a closing tail that reopens an anonymous quoted value keeps continuing",
+     'SECRET="aaa\nbbb" "ccc\nddd"\nproxy_pass http://x;\n',
+     ["aaa", "bbb", "ccc", "ddd"], ["proxy_pass http://x"]),
+    # ...and config after the closing quote on the same line is still readable.
+    ("config after a closing quote on the same line survives",
+     'SECRET="aaa\nbbb"; proxy_pass http://127.0.0.1:3500;\nclient_max_body_size 25m;\n',
+     ["aaa", "bbb"], ["proxy_pass http://127.0.0.1:3500", "25m"]),
     # A PEM private key is a multi-line value. mask_text only ever saw the BEGIN
     # line; the base64 body fell to LONG_TOKEN, which cannot match a 64-char
     # base64 line broken up by `+` and `/`. Two of these three body lines were
