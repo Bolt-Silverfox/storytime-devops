@@ -101,6 +101,17 @@ PM2_CASES = [
      {"pm2_env": {"pm_id": 0}}, None, '"pm_id": 0'),
     ("pm2_env.autorestart keeps its boolean",
      {"pm2_env": {"autorestart": True}}, None, '"autorestart": true'),
+    # An env* key holding a SCALAR directly, not a map. This goes through a
+    # different branch of _walk than the container cases above, and it kept
+    # leaking numbers/booleans after the container path was fixed.
+    ("scalar env container: number masked",
+     {"apps": [{"env_production": 123456}]}, "123456", None),
+    ("scalar env container: boolean masked",
+     {"apps": [{"env_staging": True}]}, "true", None),
+    ("scalar env container: null becomes <null>",
+     {"apps": [{"environment": None}]}, None, "<null>"),
+    ("scalar env container: string masked",
+     {"apps": [{"env": "a-string-secret"}]}, "a-string-secret", None),
 ]
 
 

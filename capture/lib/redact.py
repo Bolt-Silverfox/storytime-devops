@@ -337,8 +337,13 @@ def _walk(node):
                     v, preserve_pm2_metadata=(k.lower() == "pm2_env")
                 )
             elif ENV_CONTAINER_RE.match(k):
-                # An env key holding a scalar: mask it rather than pass it through.
-                out[k] = _mask_scalar(v)
+                # An env key holding a scalar directly (`"env_production": 12345`)
+                # rather than a map. Same contract as the dict/list branch above,
+                # so it needs the same masker: _mask_scalar passes numbers,
+                # booleans and None through, so `env_production: 123456` and
+                # `env_staging: true` survived here even after the container path
+                # was fixed. Names out, values never — including this branch.
+                out[k] = _mask_env_scalar(v)
             else:
                 out[k] = _walk(v)
         return out
