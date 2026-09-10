@@ -73,11 +73,19 @@ IDENTIFIER = re.compile(r"[A-Za-z_$][A-Za-z0-9_.\-]*")
 # `PGPASSWORD=<redacted> secret <redacted> phrase'`. That violates this module's
 # one hard rule — never emit a configuration value — and it is not recovered
 # later, because the quoted-string sweep below can no longer see a balanced pair.
+#
+# An UNTERMINATED quote needs its own alternative, tried after the balanced pair
+# and before the bare-token fallback. `JWT_SECRET="hunter2 with spaces` (no
+# closing quote) matched neither quoted form, fell through to `[^\s;#,]+`, and
+# emitted `JWT_SECRET=<redacted> with spaces` — the tail of a real secret, into
+# an artefact meant to be committable. `"[^"]*$` consumes to end of line, which
+# is the only safe reading: if the quote never closes, everything after it is
+# part of the value.
 KV_ANY = re.compile(
     r"""(?x)
     ([A-Za-z_$][A-Za-z0-9_.\-]*)
     (\s*[:=]\s*)
-    ("[^"]*"|'[^']*'|[^\s;#,]+)
+    ("[^"]*"|'[^']*'|"[^"]*$|'[^']*$|[^\s;#,]+)
     """
 )
 
@@ -95,7 +103,7 @@ ASSIGNMENT = re.compile(
     r"""(?x)
     (?P<name>[A-Za-z_][A-Za-z0-9_.\-]*)
     (?P<sep>\s*[:=]\s*|\s+)
-    (?P<value>"[^"]*"|'[^']*'|[^\s;#]+)
+    (?P<value>"[^"]*"|'[^']*'|"[^"]*$|'[^']*$|[^\s;#]+)
     """
 )
 
