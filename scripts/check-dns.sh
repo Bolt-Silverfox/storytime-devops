@@ -25,9 +25,12 @@
 # Exit codes: 0 = every expected record matches everywhere it was checked.
 #             1 = drift (a mismatch, a missing record, or a CNAME where an A is
 #                 expected).
-#             2 = could not perform the check at all (no dig, no terraform, bad
-#                 JSON). Deliberately NOT 0: "I could not look" must never be
-#                 reported as "nothing is wrong".
+#             2 = could not perform the check, or could not perform ALL of it (no
+#                 dig, no terraform, bad JSON, or any lookup that did not
+#                 return). Deliberately NOT 0: "I could not look" must never be
+#                 reported as "nothing is wrong" — and deliberately not 1
+#                 either, because an unreachable resolver is a network fault, not
+#                 a zone that disagrees with Terraform.
 #
 # Run it from anywhere; paths are resolved relative to the repo.
 
@@ -94,6 +97,7 @@ fi
 # Compare.
 # ---------------------------------------------------------------------------
 drift=""
+unreachable=""
 checked=0
 
 # `read -r` over a TSV of host<TAB>value. Hostnames and IPv4 addresses contain no
@@ -103,8 +107,14 @@ while IFS=$'\t' read -r host want; do
   for resolver in "${RESOLVERS[@]}"; do
     # +short prints a CNAME target on its own line before the A records, so
     # filter to things that look like IPv4 rather than assuming line 1.
+    # A resolver that did not answer is NOT drift. It used to be appended to
+    # $drift, which meant one dead resolver made the script exit 1 and announce
+    # "the zone does not match" while every record it COULD check matched — a
+    # false zone alarm for a network fault. Counting only successful lookups fixed
+    # the total-outage case (checked stays 0 -> exit 2); a PARTIAL outage still
+    # left checked > 0 and reported drift. Keep the two apart instead.
     if ! raw=$(dig +short +time=5 +tries=2 A "$host" "@$resolver" 2>/dev/null); then
-      drift+="  $host via $resolver: dig failed (resolver unreachable?)"$'\n'
+      unreachable+="  $host via $resolver: dig failed (resolver unreachable?)"$'\n'
       continue
     fi
 
@@ -147,12 +157,28 @@ if [ "$checked" -eq 0 ]; then
   exit 2
 fi
 
+# Real drift wins over an incomplete check: a mismatch is still a mismatch even
+# if another resolver was unreachable, and exit 1 is the actionable answer.
 if [ -n "$drift" ]; then
   echo "::error::DNS drift — the zone does not match 'terraform output dns_records_required':" >&2
   printf '%s' "$drift" >&2
+  if [ -n "$unreachable" ]; then
+    echo "Additionally, some lookups did not complete (the drift above is from the ones that did):" >&2
+    printf '%s' "$unreachable" >&2
+  fi
   echo "Fix at Namecheap -> Domain List -> Manage -> Advanced DNS -> Host Records," >&2
   echo "or re-check which stack currently holds the Elastic IP (terraform output service_address)." >&2
   exit 1
+fi
+
+# Everything that answered matched, but not everything answered. That is "could
+# not perform the check", i.e. 2 — not 0, because a record that was never
+# resolved has not been shown to be right.
+if [ -n "$unreachable" ]; then
+  echo "::error::$checked lookup(s) matched, but some did not complete, so this is not a clean pass:" >&2
+  printf '%s' "$unreachable" >&2
+  echo "::error::Re-run once the resolver is reachable. Exiting 2 (could not fully check), not 0." >&2
+  exit 2
 fi
 
 echo "check-dns: OK — $count record(s) match across ${#RESOLVERS[@]} resolver(s) ($checked lookup(s))."

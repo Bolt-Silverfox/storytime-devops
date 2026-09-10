@@ -222,6 +222,21 @@ diff \
 `secret_keys` / `config_plain` and re-apply — **do not** hand-create parameters on
 the side, or the next apply will not know about them.
 
+A name alone is not enough for a secret: `guards.tf` and `ssm-config.tf` both
+refuse an apply where a name in `var.secret_keys` has no non-empty value in
+`var.secret_values` ("Missing values would blank the corresponding SSM
+parameter"). So for each missing SECRET name, also add its value to the new
+stack's **gitignored** `secret_values` — read it from the old stack with
+`aws ssm get-parameter --name "$OLD/<service>/<KEY>" --with-decryption
+--query Parameter.Value --output text` and paste it straight into
+the gitignored `terraform.all-v2.tfvars` you are already passing with
+`-var-file` (or export it as `TF_VAR_secret_values` — `infra/README.md` →
+*What is committed* documents both). `infra/.gitignore` ignores every `*.tfvars`
+except the `.example` templates, so that file is never committed; do not write the
+value anywhere else, and prefer a command substitution or an editor over echoing it
+to the terminal and into shell history. Non-secret names go to `config_plain` with
+their values, which ARE committed.
+
 ---
 
 ## 5. Restore the data into the new stack

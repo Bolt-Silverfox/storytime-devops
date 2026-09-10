@@ -44,6 +44,27 @@ LEAKS = [
     # nginx idiom where the apparent name is the directive, not the key.
     ('set $upstream_token "abc123";', "abc123"),
     ("env REDIS_PASSWORD=x9y8z7;", "x9y8z7"),
+    # Secret-ish argument in the MIDDLE of a whitespace-separated statement with
+    # an UNQUOTED value. The quoted twin (`set $upstream_token "abc123";`) was
+    # already caught above; without a quote every one of these was emitted
+    # verbatim, because ASSIGNMENT judges the line on the leading directive and
+    # then resumes past the real value.
+    ("proxy_set_header X-Api-Key abc123SECRET;", "abc123SECRET"),
+    ("fastcgi_param HTTP_AUTHORIZATION topsecretvalue;", "topsecretvalue"),
+    ("add_header X-Webhook-Token wh_topsecret;", "wh_topsecret"),
+    ("set $api_key abc123SECRET;", "abc123SECRET"),
+    # Two tokens after the name: masking only the first would leave the rest.
+    ("proxy_set_header Authorization Bearer abc123SECRET;", "abc123SECRET"),
+    # Crontabs go through this filter too, and an inline flag is the usual shape.
+    ("0 3 * * * /usr/bin/backup.sh --password sekrit2", "sekrit2"),
+    # INDENTED, which is how nginx -T actually prints them. The first attempt at
+    # the fix above passed every unindented case and leaked every indented one:
+    # leading whitespace let a regex match start at the directive and consume the
+    # value. Assert the real shape, not the convenient one.
+    ("    proxy_set_header X-Api-Key live_abc123;", "live_abc123"),
+    ("\tfastcgi_param HTTP_AUTHORIZATION topsecretvalue;", "topsecretvalue"),
+    ("      set $api_key abc123SECRET;", "abc123SECRET"),
+    ("    proxy_set_header Authorization Bearer abc123SECRET;", "abc123SECRET"),
 ]
 
 # (line, substring that MUST still be visible)
@@ -54,6 +75,63 @@ VISIBLE = [
     ("proxy_read_timeout 3600s;", "3600s"),
     ("proxy_buffering off;", "off"),
     ("listen 443 ssl;", "443"),
+    # The mid-statement masking above must not swallow these. Each one exists
+    # because it is a plausible way to over-mask: a secret-ish word inside a
+    # hostname or a path, a secret-ish token that is not a name at all, and a
+    # second directive after the masked one on the same line.
+    ("server_name auth.storytimeapp.me api.storytimeapp.me;", "api.storytimeapp.me"),
+    ("location /auth { proxy_pass http://backend; }", "proxy_pass http://backend"),
+    ("auth_basic_user_file /etc/nginx/.htpasswd;", "/etc/nginx/.htpasswd"),
+    ("error_log /var/log/nginx/auth_error.log warn;", "warn"),
+    ("set $api_key abc; proxy_pass http://x;", "proxy_pass http://x"),
+    ("proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;",
+     "$proxy_add_x_forwarded_for"),
+    ("*/5 * * * * /usr/bin/certbot renew --quiet", "/usr/bin/certbot renew --quiet"),
+    # Indented, for the same reason as the indented leak cases.
+    ("    proxy_pass http://127.0.0.1:3500;", "proxy_pass http://127.0.0.1:3500"),
+    ("    proxy_read_timeout 3600s;", "3600s"),
+    ("    proxy_buffering off;", "off"),
+    ("  server_name auth.storytimeapp.me api.storytimeapp.me;", "auth.storytimeapp.me api.storytimeapp.me"),
+    ("  ssl_certificate_key /etc/letsencrypt/live/x/privkey.pem;",
+     "/etc/letsencrypt/live/x/privkey.pem"),
+]
+
+# mask_stream: a quoted value may CONTINUE on the next line, and mask_text sees
+# one line at a time. (text, must-be-absent list, must-be-present list)
+STREAM_CASES = [
+    ("multi-line quoted secret",
+     'JWT_SECRET="first part\nsecond part"\nproxy_pass http://x;\n',
+     ["second part"], ["proxy_pass http://x"]),
+    ("three-line quoted secret",
+     "API_KEY='aaa\nbbb\nccc'\nlisten 443 ssl;\n",
+     ["aaa", "bbb", "ccc"], ["443"]),
+    ("config after the closing quote is still masked-then-kept",
+     'SECRET="aaa\nbbb" ; proxy_pass http://y;\n',
+     ["aaa", "bbb"], ["proxy_pass http://y"]),
+    # The other direction, and the reason continuation mode is gated on the line
+    # actually being rewritten: an apostrophe in a comment must NOT blank the
+    # rest of the file, even when the comment mentions something secret-ish.
+    # A PEM private key is a multi-line value. mask_text only ever saw the BEGIN
+    # line; the base64 body fell to LONG_TOKEN, which cannot match a 64-char
+    # base64 line broken up by `+` and `/`. Two of these three body lines were
+    # emitted verbatim before the fix.
+    ("PEM body lines never reach the output",
+     "ssl_certificate_key /etc/x/privkey.pem;\n"
+     "-----BEGIN RSA PRIVATE KEY-----\n"
+     "MIIEowIBAAKCAQEA1x/9abc+def/ghijklmnopqrstuvwxyz0123456789ABCDEFGH\n"
+     "short+line/here==\n"
+     "MIIEowIBAAKCAQEA1xabcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKL\n"
+     "-----END RSA PRIVATE KEY-----\n"
+     "proxy_pass http://127.0.0.1:3500;\n",
+     ["MIIEowIBAAKCAQEA", "short+line/here"],
+     ["<redacted: PRIVATE KEY BLOCK>", "proxy_pass http://127.0.0.1:3500"]),
+    ("PEM block truncated at EOF is still suppressed",
+     "-----BEGIN PRIVATE KEY-----\nMIIEow+abc/def==\n",
+     ["MIIEow+abc/def"], ["<redacted: PRIVATE KEY BLOCK"]),
+    ("apostrophe in a comment does not swallow the file",
+     "# the token doesn't matter\nproxy_pass http://127.0.0.1:3500;\n"
+     "client_max_body_size 25m;\n",
+     [], ["proxy_pass http://127.0.0.1:3500", "25m"]),
 ]
 
 # filter_pm2_json: PM2_SAFE_KEYS may be honoured ONLY inside pm2_env.
@@ -131,6 +209,15 @@ def main() -> int:
             failed += 1
         else:
             print(f"pass visible {line!r} -> {out!r}")
+    for label, text, absent_list, present_list in STREAM_CASES:
+        out = redact.mask_stream(text)
+        problems = [f"leaked {a!r}" for a in absent_list if a in out]
+        problems += [f"lost {p!r}" for p in present_list if p not in out]
+        if problems:
+            print(f"FAIL stream {label}: {'; '.join(problems)} in {out!r}")
+            failed += 1
+        else:
+            print(f"pass stream {label}")
     for label, payload, absent, present in PM2_CASES:
         out = redact.filter_pm2_json(json.dumps(payload))
         if absent is not None and absent in out:
@@ -142,7 +229,8 @@ def main() -> int:
         else:
             print(f"pass pm2    {label}")
     print(f"\n{len(LEAKS)} leak cases, {len(VISIBLE)} visibility cases, "
-          f"{len(PM2_CASES)} pm2 cases, {failed} failed")
+          f"{len(STREAM_CASES)} stream cases, {len(PM2_CASES)} pm2 cases, "
+          f"{failed} failed")
     return 1 if failed else 0
 
 if __name__ == "__main__":

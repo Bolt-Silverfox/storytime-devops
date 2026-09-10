@@ -94,6 +94,30 @@ jobs:
           # make this gate noisy enough to get ignored.
           shellcheck --severity=warning --external-sources --source-path=SCRIPTDIR "${files[@]}"
 
+  redact-tests:
+    name: redactor tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # capture/lib/redact.py is the one file in this repo whose failure writes a
+      # secret into a committable artefact, and six separate leaks have been found
+      # in it. Its regression suite existed but nothing ran it, so those guards
+      # could rot silently — which is the same class of problem as a scanner that
+      # reports success without scanning. python3 is preinstalled on the runner,
+      # the suite has no third-party dependencies, and it needs no credentials.
+      - name: redact.py regression suite
+        run: |
+          set -euo pipefail
+          python3 --version
+          python3 capture/lib/redact_test.py
+
   actionlint:
     name: actionlint
     runs-on: ubuntu-latest

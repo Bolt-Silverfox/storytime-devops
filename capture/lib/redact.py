@@ -138,6 +138,80 @@ KNOWN_SECRET = re.compile(
 QUOTED = re.compile(r"\"[^\"]*\"|'[^']*'")
 JWT = re.compile(r"\beyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\b")
 PEM_BEGIN = re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")
+PEM_END = re.compile(r"-----END [A-Z ]*PRIVATE KEY-----")
+
+# A secret-ish argument in the MIDDLE of a whitespace-separated statement, whose
+# value is NOT quoted. This is the gap left by every grammar above, and it is a
+# plain leak in both artefacts the `text` filter exists for:
+#
+#   proxy_set_header X-Api-Key abc123;      -> emitted VERBATIM
+#   fastcgi_param HTTP_AUTHORIZATION tok;   -> emitted VERBATIM
+#   add_header X-Webhook-Token wh_abc;      -> emitted VERBATIM
+#   set $api_key abc123;                    -> emitted VERBATIM
+#   */5 * * * * backup.sh --password pw     -> emitted VERBATIM
+#
+# ASSIGNMENT cannot see these: it matches `<directive> <second-token>` as
+# name+value, judges it on the directive (`proxy_set_header`, not secret-ish) and
+# then resumes AFTER the second token — so the real value is never even a
+# candidate. The QUOTED sweep only fires on quoted strings, which is why
+# `set $upstream_token "abc123";` was already caught and the unquoted twin was
+# not. One character of quoting was the whole difference.
+#
+# Deliberately a token walk and NOT a regex substitution. The first attempt here
+# was `re.sub` with a callback that returned the match unchanged when the name was
+# not secret-ish — and returning a match still CONSUMES it, so on a realistically
+# indented line the leading whitespace let the match start at the directive,
+# swallow `X-Api-Key live_abc123`, and resume past the value: the exact bug being
+# fixed, reintroduced by the fix. It passed the unit tests because they had no
+# leading indentation. Every case below is therefore also asserted indented.
+_ARG_NAME = re.compile(r"-{0,2}[A-Za-z_$][A-Za-z0-9_$.\-]*")
+_TOKEN = re.compile(r"\S+")
+
+
+def _mask_secret_args(line: str) -> str:
+    """Mask the value after a secret-ish, name-shaped argument token.
+
+    Scope is kept narrow, because over-masking this file has regressed
+    `proxy_pass` before. The candidate must be a WHOLE whitespace-delimited token
+    that looks like a name (optionally `-`/`--` prefixed, no slashes, no `(`, no
+    `=`), which is what keeps `/auth` in `location /auth { proxy_pass ...; }` and
+    `($http_authorization` in `if ($http_authorization != "")` out of it.
+    SAFE_DIRECTIVE still wins, so `proxy_pass http://127.0.0.1:3500;` is
+    untouched, and a SAFE_LONG hostname is never treated as a name, so
+    `server_name auth.storytimeapp.me api.storytimeapp.me;` keeps both hostnames.
+
+    Masking runs to the end of the STATEMENT (`;`, `#` or end of line), not one
+    token: `Authorization Bearer abc;` needs both tokens gone, and stopping at the
+    first would leave `abc` on the line. `;` bounds it, so
+    `set $api_key abc; proxy_pass http://x;` keeps its proxy_pass.
+    """
+    out = []
+    pos = 0
+    for m in _TOKEN.finditer(line):
+        if m.start() < pos:
+            continue
+        name = m.group(0).rstrip(";,")
+        if not _ARG_NAME.fullmatch(name):
+            continue
+        if not _is_secretish(name.lstrip("-")) or SAFE_LONG.match(name):
+            continue
+        rest = line[m.end():]
+        stop = len(rest)
+        for i, ch in enumerate(rest):
+            if ch in ";#":
+                stop = i
+                break
+        value = rest[:stop]
+        gap = len(value) - len(value.lstrip(" \t"))
+        # No separator means this token was not "<name> <value>" at all, and a
+        # value with no alphanumeric is punctuation (`!=`, `""`), not a secret.
+        if gap == 0 or not any(c.isalnum() for c in value):
+            continue
+        out.append(line[pos:m.end()] + value[:gap] + "<redacted>")
+        pos = m.end() + stop
+    out.append(line[pos:])
+    return "".join(out)
+
 
 # Known-safe long strings we do NOT want to mangle into uselessness.
 SAFE_LONG = re.compile(
@@ -175,6 +249,10 @@ def mask_text(line: str) -> str:
     if _line_mentions_secret(line):
         line = QUOTED.sub("<redacted>", line)
 
+    # Secret-ish argument mid-statement with an unquoted value. After the QUOTED
+    # sweep, so a quoted value is already `<redacted>` here and this is a no-op.
+    line = _mask_secret_args(line)
+
     def _assign(m: "re.Match[str]") -> str:
         if _is_secretish(m.group("name")):
             return f"{m.group('name')}{m.group('sep')}<redacted>"
@@ -187,6 +265,98 @@ def mask_text(line: str) -> str:
         return tok if SAFE_LONG.match(tok) else "<redacted:long-token>"
 
     return LONG_TOKEN.sub(_long, line)
+
+
+# ---------------------------------------------------------------------------
+# Line-by-line masking is not enough on its own: a quoted value may CONTINUE on
+# the next line, and `mask_text` sees one line at a time.
+#
+#   JWT_SECRET="first part
+#   second part"
+#
+# The first line is masked correctly (the unterminated-quote alternative runs to
+# end of line), and then `second part"` arrives as a line that mentions nothing
+# secret-ish and matches no assignment grammar — so it is emitted VERBATIM. The
+# tail of a secret, in an artefact meant to be committable. nginx accepts a
+# newline inside a quoted string, so `nginx -T` really can produce this.
+#
+# `mask_stream` therefore carries one bit of state: which quote character we are
+# inside. While inside, whole lines are replaced, up to and including the closing
+# quote; the remainder of the closing line is masked normally.
+#
+# The entry condition is deliberately narrow, because the failure mode of getting
+# it wrong is blanking a whole file: continuation mode starts ONLY when the line
+# mentions something secret-ish AND has an unbalanced quote AND was actually
+# rewritten by `mask_text`. A crontab comment like `# don't do this` has an
+# unbalanced apostrophe and must not swallow everything after it — it mentions no
+# secret, so it does not.
+# If the closing quote never arrives, every remaining line is masked. That is
+# deliberate: the alternative is guessing where a secret ends, and 99-WARNINGS.txt
+# already tells the operator to read the artefact before committing it.
+
+
+def _unbalanced_quote(line: str):
+    """Return the quote character left open at end of line, or None.
+
+    A left-to-right scan rather than a regex: the regex form of this
+    ("balanced pairs, then a lone quote") needs nested quantifiers and can
+    backtrack quadratically on a long line with many quotes. One pass, no
+    backtracking, and easier to audit — which matters more here than brevity.
+
+    The quote must OPEN A VALUE — preceded by `=`, `:` or whitespace, or at the
+    start of the line. Without that test an apostrophe inside a word qualified,
+    and `# the token doesn't matter` (a line that mentions something secret-ish
+    and does get rewritten) started continuation mode and blanked every following
+    line to the end of the file. That is not a leak, but it is a capture that
+    tells the operator nothing.
+    """
+    quote = None
+    for i, ch in enumerate(line):
+        if quote is None:
+            if ch in "\"'" and (i == 0 or line[i - 1] in "=: \t"):
+                quote = ch
+        elif ch == quote:
+            quote = None
+    return quote
+
+
+def mask_stream(text: str) -> str:
+    out = []
+    pending = None
+    in_pem = False
+    for raw in text.splitlines():
+        # A PEM private key is a MULTI-LINE value, and mask_text only ever saw the
+        # BEGIN line. The base64 body was left to LONG_TOKEN, which matches
+        # [A-Za-z0-9_-]{40,} — and base64 contains `+` and `/`, which break a
+        # 64-character line into runs shorter than 40. Measured: of a three-line
+        # body, two lines were emitted VERBATIM. Private key material, in an
+        # artefact meant to be committable. Suppress from BEGIN to END instead.
+        if in_pem:
+            if PEM_END.search(raw):
+                in_pem = False
+            continue
+        if PEM_BEGIN.search(raw):
+            in_pem = True
+            out.append("<redacted: PRIVATE KEY BLOCK>")
+            continue
+        if pending is not None:
+            end = raw.find(pending)
+            if end == -1:
+                out.append("<redacted: continuation of a quoted value>")
+                continue
+            pending = None
+            out.append("<redacted: continuation of a quoted value>"
+                       + mask_text(raw[end + 1:]))
+            continue
+        masked = mask_text(raw)
+        if masked != raw and _line_mentions_secret(raw):
+            pending = _unbalanced_quote(raw)
+        out.append(masked)
+    if in_pem:
+        # EOF inside a key block: the END line never arrived. Say so rather than
+        # leave the reader wondering whether the capture was truncated.
+        out.append("<redacted: PRIVATE KEY BLOCK — no END line before end of input>")
+    return "".join(line + "\n" for line in out)
 
 
 # ---------------------------------------------------------------------------
@@ -252,19 +422,17 @@ PM2_SAFE_KEYS = {
 ENV_CONTAINER_RE = re.compile(r"^(pm2_)?(env|environment)(_.+)?$", re.IGNORECASE)
 
 
-def _mask_scalar(value):
-    # Non-string scalars carry no secret material (ports, flags, counts, nulls).
-    if isinstance(value, bool) or value is None or isinstance(value, (int, float)):
-        return value
-    if isinstance(value, str):
-        return "<empty>" if value == "" else "<set>"
-    return "<set>"
-
-
 def _mask_env_scalar(value):
-    # Inside an environment container, a NON-STRING scalar is still a candidate
-    # secret. `_mask_scalar` deliberately passes numbers/bools through — that is
-    # right for PM2 bookkeeping (instances, pm_id, autorestart) but wrong here:
+    # The ONE scalar masker. There used to be a second, permissive one
+    # (`_mask_scalar`) that passed numbers, booleans and None through on the
+    # theory that they "carry no secret material". Both of its call sites turned
+    # out to be leaks and were fixed one after the other, leaving it unused; it is
+    # deleted rather than kept, because a spare permissive masker in this file is
+    # a trap for the next edit. PM2's own bookkeeping keeps its real values
+    # through the PM2_SAFE_KEYS allowlist in `_mask_env_value`, not by having a
+    # masker that lets scalars past.
+    #
+    # A NON-STRING scalar is a candidate secret like any other:
     #   "env_production": {"OTP_SECRET": 123456, "LEGACY_PIN": 9876}
     # was emitted verbatim, because the values happen to be ints. A numeric OTP
     # seed, PIN or account id is exactly as sensitive as a string one.
@@ -339,10 +507,11 @@ def _walk(node):
             elif ENV_CONTAINER_RE.match(k):
                 # An env key holding a scalar directly (`"env_production": 12345`)
                 # rather than a map. Same contract as the dict/list branch above,
-                # so it needs the same masker: _mask_scalar passes numbers,
-                # booleans and None through, so `env_production: 123456` and
-                # `env_staging: true` survived here even after the container path
-                # was fixed. Names out, values never — including this branch.
+                # so it needs the same masker. This branch used to call a
+                # permissive masker that passed numbers, booleans and None
+                # through, so `env_production: 123456` and `env_staging: true`
+                # survived here even after the container path was fixed.
+                # Names out, values never — including this branch.
                 out[k] = _mask_env_scalar(v)
             else:
                 out[k] = _walk(v)
@@ -371,7 +540,7 @@ def main() -> int:
     elif mode == "pm2-json":
         sys.stdout.write(filter_pm2_json(text))
     else:
-        sys.stdout.write("".join(mask_text(l) + "\n" for l in text.splitlines()))
+        sys.stdout.write(mask_stream(text))
     return 0
 
 
