@@ -320,6 +320,26 @@ def _unbalanced_quote(line: str):
     return quote
 
 
+def _continuation_quote(raw: str, masked: str):
+    """The quote this line leaves open, if it opened a value we just masked.
+
+    Shared by both places that can start continuation mode — the ordinary line
+    and the REMAINDER of a line that closed a previous one. Keeping it in one
+    place is not tidiness: the remainder path originally cleared the state and
+    never recomputed it, so
+
+        SECRET="aaa
+        bbb" PASSWORD="ccc
+        ddd"
+
+    left continuation mode on the middle line and emitted `ddd"` verbatim — the
+    same tail-of-a-secret this function exists to prevent, one branch over.
+    """
+    if masked == raw or not _line_mentions_secret(raw):
+        return None
+    return _unbalanced_quote(raw)
+
+
 def mask_stream(text: str) -> str:
     out = []
     pending = None
@@ -344,13 +364,13 @@ def mask_stream(text: str) -> str:
             if end == -1:
                 out.append("<redacted: continuation of a quoted value>")
                 continue
-            pending = None
-            out.append("<redacted: continuation of a quoted value>"
-                       + mask_text(raw[end + 1:]))
+            tail = raw[end + 1:]
+            masked_tail = mask_text(tail)
+            pending = _continuation_quote(tail, masked_tail)
+            out.append("<redacted: continuation of a quoted value>" + masked_tail)
             continue
         masked = mask_text(raw)
-        if masked != raw and _line_mentions_secret(raw):
-            pending = _unbalanced_quote(raw)
+        pending = _continuation_quote(raw, masked)
         out.append(masked)
     if in_pem:
         # EOF inside a key block: the END line never arrived. Say so rather than
@@ -421,6 +441,18 @@ PM2_SAFE_KEYS = {
 # through the fail-closed masker rather than verbatim recursion.
 ENV_CONTAINER_RE = re.compile(r"^(pm2_)?(env|environment)(_.+)?$", re.IGNORECASE)
 
+# Command-line arguments are configuration values too, and `capture-host.sh` feeds
+# `~/.pm2/dump.pm2` through this filter as well as `pm2 jlist`. dump.pm2 is FLAT —
+# `args` sits at the top level of each app object, not inside `pm2_env` — so
+# `"args": "--admin-token=SEKRIT"` was emitted verbatim while the identical value
+# inside `pm2_env` was masked. A token on a command line is a token.
+#
+# The cost is that the flags themselves stop being readable, which is accepted:
+# the KEY and the shape (a string, or a list of N items) still tell the reader an
+# argument list exists and how long it is, and nothing in 30-pm2/summary.txt is
+# built from it.
+ARG_CONTAINER_RE = re.compile(r"^(node_|interpreter_)?args$", re.IGNORECASE)
+
 
 def _mask_env_scalar(value):
     # The ONE scalar masker. There used to be a second, permissive one
@@ -488,7 +520,15 @@ def _walk(node):
     if isinstance(node, dict):
         out = {}
         for k, v in node.items():
-            if ENV_CONTAINER_RE.match(k) and isinstance(v, (dict, list)):
+            if ARG_CONTAINER_RE.match(k):
+                # Same contract as an env container, at any depth: names out,
+                # values never.
+                out[k] = (
+                    _mask_env_value(v)
+                    if isinstance(v, (dict, list))
+                    else _mask_env_scalar(v)
+                )
+            elif ENV_CONTAINER_RE.match(k) and isinstance(v, (dict, list)):
                 # PM2_SAFE_KEYS may be honoured ONLY inside `pm2_env`, which is the
                 # single map carrying PM2's own bookkeeping (exec_mode, status,
                 # pm_cwd — 30-pm2/summary.txt is built from them).

@@ -111,6 +111,12 @@ STREAM_CASES = [
     # The other direction, and the reason continuation mode is gated on the line
     # actually being rewritten: an apostrophe in a comment must NOT blank the
     # rest of the file, even when the comment mentions something secret-ish.
+    # A line that CLOSES one quoted value and opens another unterminated one.
+    # The remainder path used to clear continuation state without recomputing it,
+    # so `ddd"` was emitted verbatim (CodeRabbit round 3 on this branch).
+    ("a closing line that opens a second unterminated value stays in continuation",
+     'SECRET="aaa\nbbb" PASSWORD="ccc\nddd"\nproxy_pass http://x;\n',
+     ["aaa", "bbb", "ccc", "ddd"], ["proxy_pass http://x"]),
     # A PEM private key is a multi-line value. mask_text only ever saw the BEGIN
     # line; the base64 body fell to LONG_TOKEN, which cannot match a 64-char
     # base64 line broken up by `+` and `/`. Two of these three body lines were
@@ -190,6 +196,22 @@ PM2_CASES = [
      {"apps": [{"environment": None}]}, None, "<null>"),
     ("scalar env container: string masked",
      {"apps": [{"env": "a-string-secret"}]}, "a-string-secret", None),
+    # dump.pm2 is FLAT: `args` sits at the top level of each app object, outside
+    # any env container, so it was emitted verbatim while the identical value
+    # inside pm2_env was masked. capture-host.sh feeds dump.pm2 through this
+    # filter as well as `pm2 jlist`.
+    ("top-level args is masked (dump.pm2 shape)",
+     [{"name": "api", "args": "--admin-token=SEKRIT123"}], "SEKRIT123", None),
+    ("node_args list items are masked",
+     [{"node_args": ["--require", "./x.js", "--token=SEKRIT"]}], "SEKRIT", None),
+    ("interpreter_args is masked",
+     [{"interpreter_args": "--secret=NOPE"}], "NOPE", None),
+    # ...and the keys plus the useful non-argument fields survive, so the artefact
+    # still says what runs where.
+    ("args masking keeps the key and the sibling fields",
+     [{"name": "api", "script": "dist/main.js", "cwd": "/opt/api",
+       "args": "--admin-token=SEKRIT123"}],
+     "SEKRIT123", '"args": "<set>"'),
 ]
 
 
