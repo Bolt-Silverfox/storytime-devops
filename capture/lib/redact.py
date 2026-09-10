@@ -261,6 +261,29 @@ def _mask_scalar(value):
     return "<set>"
 
 
+def _mask_env_scalar(value):
+    # Inside an environment container, a NON-STRING scalar is still a candidate
+    # secret. `_mask_scalar` deliberately passes numbers/bools through — that is
+    # right for PM2 bookkeeping (instances, pm_id, autorestart) but wrong here:
+    #   "env_production": {"OTP_SECRET": 123456, "LEGACY_PIN": 9876}
+    # was emitted verbatim, because the values happen to be ints. A numeric OTP
+    # seed, PIN or account id is exactly as sensitive as a string one.
+    #
+    # Cost, accepted deliberately: numeric PORT values in an env map now read
+    # <set> rather than 3500. That is recoverable from the capture without any
+    # secret exposure — 70-network/listening-sockets.txt records what is actually
+    # bound, which is better evidence than what an env file claims anyway.
+    #
+    # null is kept as <null> rather than <set>: it cannot carry a secret, and
+    # "explicitly null" vs "set to something" is a real distinction when
+    # reconstructing config.
+    if value is None:
+        return "<null>"
+    if isinstance(value, str):
+        return "<empty>" if value == "" else "<set>"
+    return "<set>"
+
+
 def _mask_env_value(node, preserve_pm2_metadata: bool = False):
     """Mask a value found INSIDE an environment container.
 
@@ -290,7 +313,7 @@ def _mask_env_value(node, preserve_pm2_metadata: bool = False):
         }
     if isinstance(node, list):
         return [_mask_env_value(v) for v in node]
-    return _mask_scalar(node)
+    return _mask_env_scalar(node)
 
 
 def _walk(node):

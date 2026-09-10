@@ -79,6 +79,28 @@ PM2_CASES = [
      {"pm2_env": {"exec_mode": "cluster_mode"}}, None, "cluster_mode"),
     ("pm2_env.pm_cwd preserved",
      {"pm2_env": {"pm_cwd": "/home/ubuntu/storytime"}}, None, "/home/ubuntu/storytime"),
+    # Non-string scalars inside an env container are still candidate secrets:
+    # a numeric OTP seed, PIN or account id is as sensitive as a string one.
+    # _mask_scalar passes numbers/bools through (right for PM2 bookkeeping,
+    # wrong for application config), so env values go through _mask_env_scalar.
+    ("numeric env value is masked",
+     {"env_production": {"OTP_SECRET": 123456}}, "123456", None),
+    ("numeric env value is masked (2)",
+     {"env_production": {"LEGACY_PIN": 9876}}, "9876", None),
+    ("boolean env value is masked",
+     {"env_production": {"DEBUG": True}}, "true", None),
+    ("null env value becomes <null>",
+     {"env_production": {"NOTHING": None}}, None, "<null>"),
+    ("numeric secret inside pm2_env is masked (not allowlisted)",
+     {"pm2_env": {"SOME_NUMBER_SECRET": 424242}}, "424242", None),
+    # ...while genuine PM2 bookkeeping keeps its real numeric/boolean values,
+    # because 30-pm2/summary.txt is built from them.
+    ("pm2_env.instances keeps its number",
+     {"pm2_env": {"instances": 3}}, None, '"instances": 3'),
+    ("pm2_env.pm_id keeps zero",
+     {"pm2_env": {"pm_id": 0}}, None, '"pm_id": 0'),
+    ("pm2_env.autorestart keeps its boolean",
+     {"pm2_env": {"autorestart": True}}, None, '"autorestart": true'),
 ]
 
 
