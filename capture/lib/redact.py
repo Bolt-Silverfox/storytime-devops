@@ -108,7 +108,14 @@ ASSIGNMENT = re.compile(
 )
 
 # Connection strings: keep the scheme and host, drop the credentials.
-URL_CREDS = re.compile(r"(?i)\b([a-z][a-z0-9+.\-]*://)([^\s:@/]+)(:[^\s@/]*)?@")
+#
+# The userinfo is `*`, not `+`. Requiring a non-empty username meant the
+# password-only form matched NOTHING — and that form is the normal one for Redis,
+# which has no username:
+#   REDIS_URL=redis://:hunter2@localhost:6379
+# `REDIS_URL` is not secret-ish by name either (no pass/secret/token/key in it),
+# so nothing else looked at the line and the whole thing was emitted verbatim.
+URL_CREDS = re.compile(r"(?i)\b([a-z][a-z0-9+.\-]*://)([^\s:@/]*)(:[^\s@/]*)?@")
 
 # Long opaque blobs that are almost certainly key material.
 LONG_TOKEN = re.compile(r"\b[A-Za-z0-9_\-]{40,}\b")
@@ -164,6 +171,12 @@ PEM_END = re.compile(r"-----END [A-Z ]*PRIVATE KEY-----")
 # swallow `X-Api-Key live_abc123`, and resume past the value: the exact bug being
 # fixed, reintroduced by the fix. It passed the unit tests because they had no
 # leading indentation. Every case below is therefore also asserted indented.
+# Credential-bearing CLI flags whose NAME is not secret-ish on its own. `-u` /
+# `--user` is the one that matters: `curl -u user:pass https://x` in a crontab
+# passed every other test on this line. Deliberately short — `-p` is left out
+# because it is `--port` at least as often as `--password`, and masking a port
+# mapping out of a crontab costs real information for no privacy gain.
+SECRET_FLAG = {"-u", "--user", "--username"}
 _ARG_NAME = re.compile(r"-{0,2}[A-Za-z_$][A-Za-z0-9_$.\-]*")
 _TOKEN = re.compile(r"\S+")
 
@@ -193,7 +206,9 @@ def _mask_secret_args(line: str) -> str:
         name = m.group(0).rstrip(";,")
         if not _ARG_NAME.fullmatch(name):
             continue
-        if not _is_secretish(name.lstrip("-")) or SAFE_LONG.match(name):
+        if name not in SECRET_FLAG and (
+            not _is_secretish(name.lstrip("-")) or SAFE_LONG.match(name)
+        ):
             continue
         rest = line[m.end():]
         stop = len(rest)
@@ -231,7 +246,17 @@ def mask_text(line: str) -> str:
 
     line = JWT.sub("<redacted:jwt>", line)
     line = KNOWN_SECRET.sub("<redacted:credential>", line)
-    line = URL_CREDS.sub(lambda m: f"{m.group(1)}<redacted:user>:<redacted:pass>@", line)
+    # Emit a marker only for the parts that were actually there, so
+    # `redis://:pw@h` stays recognisably password-only rather than growing a user.
+    line = URL_CREDS.sub(
+        lambda m: (
+            m.group(1)
+            + ("<redacted:user>" if m.group(2) else "")
+            + (":<redacted:pass>" if m.group(3) else "")
+            + "@"
+        ),
+        line,
+    )
 
     # KEY=value / KEY: value, judged on the KEY. Runs before the whitespace-separated
     # grammar below, which would otherwise treat a leading keyword (`env`, `set`,

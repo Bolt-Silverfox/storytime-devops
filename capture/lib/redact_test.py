@@ -57,6 +57,13 @@ LEAKS = [
     ("proxy_set_header Authorization Bearer abc123SECRET;", "abc123SECRET"),
     # Crontabs go through this filter too, and an inline flag is the usual shape.
     ("0 3 * * * /usr/bin/backup.sh --password sekrit2", "sekrit2"),
+    # A password-only connection string. URL_CREDS required a NON-EMPTY username,
+    # so the standard Redis form matched nothing — and REDIS_URL is not secret-ish
+    # by name, so nothing else looked at the line either.
+    ("REDIS_URL=redis://:hunter2@localhost:6379", "hunter2"),
+    ("redis_url redis://:hunter2@10.0.0.5:6379", "hunter2"),
+    # `-u` is a credential flag whose name is not secret-ish on its own.
+    ("0 4 * * * /usr/bin/curl -u admin:sekritpw https://x/y", "sekritpw"),
     # INDENTED, which is how nginx -T actually prints them. The first attempt at
     # the fix above passed every unindented case and leaked every indented one:
     # leading whitespace let a regex match start at the directive and consume the
@@ -87,6 +94,12 @@ VISIBLE = [
     ("proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;",
      "$proxy_add_x_forwarded_for"),
     ("*/5 * * * * /usr/bin/certbot renew --quiet", "/usr/bin/certbot renew --quiet"),
+    # nginx's `user` directive has no dash, so the SECRET_FLAG set must not touch
+    # it, and a connection string still keeps its host and database.
+    ("user www-data;", "www-data"),
+    ("REDIS_URL=redis://:hunter2@localhost:6379", "@localhost:6379"),
+    ("MONGO_URL=mongodb+srv://u:p@cluster.mongodb.net/storytime",
+     "@cluster.mongodb.net/storytime"),
     # Indented, for the same reason as the indented leak cases.
     ("    proxy_pass http://127.0.0.1:3500;", "proxy_pass http://127.0.0.1:3500"),
     ("    proxy_read_timeout 3600s;", "3600s"),
