@@ -1,0 +1,281 @@
+# compute.tf
+# ---------------------------------------------------------------------------
+# TOPOLOGY DECISION: ONE INSTANCE PER ENVIRONMENT, SEVERAL CONTAINERS ON IT.
+#
+# FateRound runs one container on one box, so instance == app. Storytime is six
+# services (backend API, web, superadmin, waitlist API, waitlist web, log viewer)
+# across four environments. The two candidate shapes were:
+#
+#   (a) one instance per environment, several containers  <-- CHOSEN
+#   (b) one instance per service per environment          (~20 instances)
+#
+# (a) because:
+#   - It is what the boxes already do (one host serves many hostnames), so this
+#     is a like-for-like codification rather than a re-architecture bundled into
+#     the same change.
+#   - (b) is ~20 EC2 instances and ~20 Elastic IPs for a platform whose total
+#     traffic fits comfortably on two boxes. The cost is not justified by the
+#     isolation gained, given there is still no ALB or ASG.
+#   - Multiple hostnames must terminate somewhere; an on-box reverse proxy is
+#     needed either way, and with (a) it is the only extra moving part.
+#
+# What (a) costs us, stated plainly:
+#   - No per-service blast-radius isolation: one box down takes the environment
+#     down. Same as today.
+#   - Noisy-neighbour risk between containers. Mitigated by per-service memory
+#     limits (var.services[*].memory_mb), which the current PM2 setup lacks.
+#   - Redeploying one service via `terraform apply` replaces the whole instance
+#     (user_data changes). Mitigated: the normal deploy path is CI calling
+#     /usr/local/bin/redeploy.sh <service> <tag> over SSM Run Command, which
+#     touches one container and never involves Terraform.
+#
+# If a single service later outgrows this, promote just that service to its own
+# workspace rather than splitting everything.
+#
+# Replicas replace PM2 cluster mode: the prod API runs max(2, cpus-1) workers
+# today, which becomes replicas = N containers on consecutive host ports, round
+# robin behind the proxy.
+# ---------------------------------------------------------------------------
+
+# The AMI architecture is DERIVED from instance_type, not hardcoded. locals.tf
+# offers Graviton sizes (t4g.*, m7g.*) in the RAM table and variables.tf requires
+# an arm64 Caddy checksum, so an arm64 instance_type has to actually work. With a
+# hardcoded x86_64 filter it passed every plan-time guard and then failed at
+# RunInstances with an architecture mismatch — the most expensive place to find out.
+#
+# AWS spells Graviton as a "g" in the family's capability letters (t4g, m7g, m7gd,
+# c6gn, x2gd); "a1" is the pre-naming-convention Graviton1 family, hence the
+# explicit case. Anything else — t3, m6i, m5, c5 — is x86_64.
+locals {
+  instance_family = split(".", var.instance_type)[0]
+
+  instance_arch = (
+    local.instance_family == "a1" || can(regex("^[a-z]+[0-9]+[a-z]*g", local.instance_family))
+    ? "arm64"
+    : "x86_64"
+  )
+}
+
+data "aws_ami" "al2023" {
+  most_recent = true
+  owners      = ["amazon"]
+
+  filter {
+    name   = "name"
+    values = ["al2023-ami-2023.*-${local.instance_arch}"]
+  }
+
+  filter {
+    name   = "virtualization-type"
+    values = ["hvm"]
+  }
+}
+
+resource "aws_instance" "app" {
+  count = var.create_instance ? 1 : 0
+
+  ami           = data.aws_ami.al2023.id
+  instance_type = var.instance_type
+
+  subnet_id              = aws_subnet.public[0].id
+  vpc_security_group_ids = [aws_security_group.app[0].id]
+  iam_instance_profile   = aws_iam_instance_profile.app[0].name
+
+  # The EIP only attaches after the instance exists, so it needs a launch-time
+  # public IP or user_data has no egress (dnf/curl/ecr/ssm all fail).
+  associate_public_ip_address = true
+
+  # No key_name: there is no SSH key for this instance, by design.
+
+  metadata_options {
+    http_endpoint = "enabled"
+    http_tokens   = "required" # IMDSv2 only
+    # Hop limit 1 keeps IMDS unreachable from inside the containers, so a
+    # compromised app process cannot mint instance-role credentials.
+    http_put_response_hop_limit = 1
+  }
+
+  root_block_device {
+    encrypted   = true
+    volume_size = var.root_volume_size
+    volume_type = "gp3"
+  }
+
+  # Plain templatefile: aws_instance.user_data takes raw text and Terraform does
+  # the encoding. Do NOT base64encode here.
+  user_data = templatefile("${path.module}/templates/user-data.sh.tftpl", {
+    aws_region      = var.aws_region
+    prefix          = local.prefix
+    environment     = var.environment
+    tls_mode        = var.tls_mode
+    redis_mode      = var.redis_mode
+    redis_image     = var.redis_container_image
+    redis_policy    = var.redis_maxmemory_policy
+    redis_memory_mb = var.redis_memory_mb
+    caddyfile       = local.caddyfile
+
+    # Pinned, checksum-verified reverse-proxy binary (see var.caddy_sha512).
+    caddy_version      = var.caddy_version
+    caddy_sha512_amd64 = var.caddy_sha512["amd64"]
+    caddy_sha512_arm64 = var.caddy_sha512["arm64"]
+
+    # Database: container or managed.
+    use_managed_database = var.use_managed_database
+    postgres_image       = var.postgres_image
+    postgres_memory_mb   = var.postgres_memory_mb
+    db_name              = var.db_name
+    db_username          = var.db_username
+
+    # Backups. Not optional — see backups.tf.
+    backup_bucket               = local.backup_bucket
+    backup_prefix               = local.backup_prefix
+    backup_schedule_calendar    = var.backup_schedule_calendar
+    enable_restore_verification = var.enable_restore_verification
+    restore_verify_min_tables   = var.restore_verify_min_tables
+    containers = [
+      for c in local.containers : {
+        service        = c.service
+        container_name = c.container_name
+        image          = "${local.ecr_repo_urls[c.service]}:${var.services[c.service].image_tag}"
+        host_port      = c.host_port
+        container_port = c.container_port
+        memory_mb      = c.memory_mb
+        extra_env      = c.extra_env
+      }
+    ]
+  })
+
+  # A user_data change alone updates in place WITHOUT re-running it, so the
+  # instance must be replaced for bootstrap changes to take effect.
+  user_data_replace_on_change = true
+
+  tags = { Name = "${local.prefix}-app" }
+
+  lifecycle {
+    # `data.aws_ami.al2023` uses most_recent, so a newer AL2023 publish would
+    # otherwise force a full instance rebuild on every `terraform apply` (a plan
+    # would show aws_instance.app "must be replaced" purely because AWS shipped a
+    # new AMI). Pin to the launched AMI and rebuild deliberately (taint /
+    # -replace) instead. New instances created for other reasons (e.g.
+    # user_data_replace_on_change) still get the current AMI.
+    #
+    # Note what is NOT here: a hardcoded AMI id. A migration to another region
+    # would have to hunt one down, and it would silently rot.
+    ignore_changes = [ami]
+  }
+
+  # The instance must not be replaceable out from under a database that lives on
+  # its volume. With use_managed_database = false, replacing this instance
+  # destroys the Postgres volume with it — restore from S3 is the only recovery.
+  # Read the plan: if it says "must be replaced", make sure that is intended.
+  # The bootstrap reads its ENTIRE configuration from SSM, but `templatefile`
+  # only receives locals and variables — so Terraform sees no dependency edge and
+  # is free to launch the instance before the parameters exist. user-data runs
+  # once, under `set -euo pipefail`, so losing that race does not retry itself: it
+  # leaves a box with no containers on it. Declare the edges explicitly.
+  depends_on = [
+    aws_ssm_parameter.plain,
+    aws_ssm_parameter.secret,
+    aws_ssm_parameter.tls_certificate,
+    aws_ssm_parameter.tls_private_key,
+    aws_ssm_parameter.db_password,
+    aws_ssm_parameter.db_host,
+    aws_ssm_parameter.db_name,
+    aws_ssm_parameter.db_username,
+    # The backup bucket and its lifecycle/encryption/TLS rules must exist before
+    # the nightly timer can ever fire against it.
+    aws_s3_bucket_lifecycle_configuration.backups,
+    aws_s3_bucket_public_access_block.backups,
+    aws_s3_bucket_policy.backups,
+    # Without this edge the first nightly dump could land before the default
+    # AES256 rule exists. The upload passes --sse AES256 explicitly too, so this
+    # is belt-and-braces — but the bucket's own default should be in place first.
+    # aws_s3_bucket_versioning is deliberately absent: the lifecycle
+    # configuration already depends on it, so the edge is transitive.
+    aws_s3_bucket_server_side_encryption_configuration.backups,
+  ]
+}
+
+# ---------------------------------------------------------------------------
+# THE ELASTIC IP: the address the world knows, and the cutover lever.
+#
+# Allocation and association are SEPARATE resources on purpose. An `aws_eip` with
+# an `instance` argument welds the address to one instance for the life of that
+# resource; splitting them means the address is a durable, independent object
+# that can be pointed at a different instance in ONE API call, atomically, in a
+# couple of seconds — with no DNS change, so Namecheap's TTL never enters into a
+# cutover or a rollback. It also lets a replacement stack be built and tested on
+# its own auto-assigned public IPv4 (associate_eip = false) while the live
+# address stays exactly where it is.
+#
+# Constraint that shapes the whole runbook: THIS ONLY WORKS INSIDE ONE AWS
+# ACCOUNT. The legacy Storytime boxes are in a different account from this one,
+# so the first migration still needs one Namecheap A-record edit. Every migration
+# after that is a remap. See docs/migration.md.
+# ---------------------------------------------------------------------------
+
+resource "aws_eip" "app" {
+  # Not created when this stack is adopting an address that already exists.
+  count  = var.create_instance && var.eip_allocation_id == "" ? 1 : 0
+  domain = "vpc"
+
+  tags = { Name = "${local.prefix}-eip" }
+
+  lifecycle {
+    # A released Elastic IP is gone for good — AWS will not give the same address
+    # back, and anything still resolving to it (a cached DNS answer, a partner's
+    # allowlist, the legacy dev-deploy workflow) breaks permanently. Decommission
+    # deliberately: `terraform state rm aws_eip.app[0]` first if the address must
+    # outlive this workspace, which during a migration it must. See
+    # docs/migration.md step 9.
+    prevent_destroy = true
+  }
+}
+
+data "aws_eip" "adopted" {
+  count = var.create_instance && var.eip_allocation_id != "" ? 1 : 0
+  id    = var.eip_allocation_id
+}
+
+resource "aws_eip_association" "app" {
+  count = var.create_instance && var.associate_eip ? 1 : 0
+
+  allocation_id = local.eip_allocation_id
+  instance_id   = aws_instance.app[0].id
+
+  # This is what makes a cutover one step instead of two. Without it, moving the
+  # address means disassociating from the old instance first, and the gap between
+  # the two calls is a gap in service. With it, AWS moves the address in a single
+  # operation.
+  allow_reassociation = true
+}
+
+locals {
+  # The address itself, regardless of who currently holds it. This is the lever's
+  # handle, so it is always reported: a cutover and a rollback both need it.
+  eip_allocation_id = (
+    var.eip_allocation_id != ""
+    ? var.eip_allocation_id
+    : try(aws_eip.app[0].id, null)
+  )
+
+  eip_address = (
+    var.eip_allocation_id != ""
+    ? try(data.aws_eip.adopted[0].public_ip, null)
+    : try(aws_eip.app[0].public_ip, null)
+  )
+
+  # THIS STACK'S SERVICE ADDRESS — null unless this stack actually holds it.
+  #
+  # With associate_eip = false there is no association, and the allocation is
+  # either unattached (freshly created) or still attached to the PREVIOUS
+  # instance (adopted). Reporting it as this stack's address then would be a lie
+  # in the one situation where being wrong is expensive: a pre-cutover
+  # verification pass, where it would send someone to type an A record — or to
+  # curl a health check — against a box that is not this one.
+  service_address = var.associate_eip ? local.eip_address : null
+
+  # Where to reach a stack that has not taken the address yet: the auto-assigned
+  # public IPv4 the instance boots with.
+  instance_direct_ip = try(aws_instance.app[0].public_ip, null)
+}

@@ -1,0 +1,187 @@
+# terraform.all.tfvars — THE DEFAULT STACK. Start here.
+#
+#   terraform workspace new all       # or: terraform workspace select all
+#   cp terraform.all.tfvars.example terraform.all.tfvars
+#   terraform plan -var-file=terraform.all.tfvars
+#
+# ONE t3.small box, running Postgres and Redis as containers alongside the
+# applications, facing the internet directly (no CDN, no edge proxy: DNS is
+# Namecheap, edited by hand, and TLS is Caddy + Let's Encrypt on the box).
+# ~$24/mo all in. Storytime has fewer than 100
+# monthly users; one instance per environment was ~$225/mo and was rejected as
+# overbuilt. See README -> "Cost" and "One box, and when to stop using one box".
+
+environment   = "all"
+aws_region    = "eu-west-1" # children's data + GDPR: a compliance choice, not a default
+instance_type = "t3.small"  # 2 GiB. Bump to t3.medium (4 GiB) to enable more services.
+
+root_volume_size = 30
+
+# Data tier: containers on the same box.
+use_managed_database = false      # true -> RDS instead (~+$12.41/mo)
+redis_mode           = "container" # BullMQ queues + cache + guest sessions
+
+# REQUIRED — and deliberately NOT assigned here.
+#
+# Terraform ranks a -var-file above an environment variable, so an explicit
+# `db_password = ""` in this file would OUTRANK (and silently discard) your
+# exported value, and the plan would then fail on the "db_password is required"
+# guard for no visible reason. Supply it from the environment:
+#
+#   export TF_VAR_db_password='...'
+
+
+# ---------------------------------------------------------------------------
+# MEMORY BUDGET — guards.tf fails the plan if this does not fit.
+#
+#   t3.small total                     2048 MiB
+#   - host reserve (OS, docker, SSM)   -400
+#   - postgres container               -512
+#   - redis container                  -192
+#   ------------------------------------------
+#   available for applications          944 MiB
+#
+# So: two application containers on a t3.small. The API and the web frontend are
+# the two that have to exist. Everything else is defined below but DISABLED, with
+# the instance size it needs noted — turning one on without resizing will fail the
+# plan with the arithmetic, which is the intended behaviour.
+# ---------------------------------------------------------------------------
+services = {
+  "api" = {
+    container_port = 3000
+    host_port      = 3000
+    hostnames      = ["api.example.invalid"] # <-- replace with the real hostname
+    sse            = true                    # story generation + TTS progress stream
+    max_body_size  = "25m"
+    read_timeout   = "3600s"
+    health_path    = "/health"
+    image_tag      = "latest" # switch to the commit SHA once CI pushes images
+    memory_mb      = 512
+  }
+
+  "web" = {
+    container_port = 3000
+    host_port      = 3100
+    hostnames      = ["web.example.invalid"] # <-- replace
+    memory_mb      = 384
+  }
+
+  # --- needs t3.medium or larger -------------------------------------------
+
+  "admin" = {
+    container_port = 3000
+    host_port      = 3200
+    hostnames      = []
+    enabled        = false
+    memory_mb      = 320
+  }
+
+  "waitlist-web" = {
+    container_port = 3000
+    host_port      = 3300
+    hostnames      = []
+    enabled        = false
+    memory_mb      = 256
+  }
+
+  # Port never recorded on the live box (the PM2 process defaults to 3000).
+  # Confirm from the capture output's 70-network/listening-sockets.txt first.
+  "waitlist-api" = {
+    container_port = 3000
+    host_port      = 3400
+    hostnames      = []
+    enabled        = false
+    memory_mb      = 256
+  }
+}
+
+# Non-secret config -> SSM String parameters. Committed on purpose.
+# NOTE: if you set PORT here it must equal that service's container_port, or the
+# plan fails — the reverse proxy routes to container_port.
+config_plain = {
+  "api" = {
+    NODE_ENV = "production"
+  }
+  "web" = {
+    NODE_ENV = "production"
+  }
+}
+
+# NAMES of the secrets each service needs -> SSM SecureString parameters.
+# Committed on purpose: this is the shape of the configuration, and reviewing it is
+# how you notice a missing key. Fill from the capture output's
+# 90-apps/env-keys/*.keys.txt, which emits names only.
+secret_keys = {
+  "api" = [
+    # "DATABASE_URL",
+    # "REDIS_URL",
+    # "JWT_SECRET",
+  ]
+}
+
+# VALUES. Never committed (this file is gitignored). Prefer TF_VAR_secret_values.
+secret_values = {}
+
+# ---------------------------------------------------------------------------
+# TLS. There is no Cloudflare and no edge proxy: if Caddy has no certificate,
+# the platform is down. tls_mode defaults to "acme".
+#
+# THIS EXAMPLE STILL FAILS THE PLAN as-is, on purpose: acme_email is empty, and
+# the hostnames above are .invalid placeholders. Both must be real before Let's
+# Encrypt can issue anything.
+#
+#   acme_email  -> a MONITORED alias. It is the only warning you get that
+#                  renewal has been failing before the certificate expires.
+#   the A records for every hostname must already point at this stack's Elastic
+#   IP (`terraform output dns_records_required`), because ACME validates by
+#   connecting to them. Namecheap is edited by hand — see infra/dns.tf.
+# ---------------------------------------------------------------------------
+tls_mode   = "acme"
+acme_email = "" # <-- REQUIRED, e.g. "ops@storytimeapp.me"
+# acme_ca_directory = "https://acme-staging-v02.api.letsencrypt.org/directory"
+#   ^ use the staging directory when REHEARSING a cutover: production Let's
+#     Encrypt allows only 5 duplicate certificates per week for the same names.
+
+# tls_mode = "static" instead, if a certificate is issued elsewhere:
+# tls_certificate = ""   # via TF_VAR_tls_certificate; never commit it
+# tls_private_key = ""   # via TF_VAR_tls_private_key
+
+allow_plaintext_origin = false # only true pre-cutover, with no real traffic
+
+# ---------------------------------------------------------------------------
+# Addressing. The Elastic IP is the cutover lever, not DNS.
+# ---------------------------------------------------------------------------
+# eip_allocation_id = ""    # "" = allocate a new one. Set to another stack's
+#                           #   allocation id to TAKE OVER the live address —
+#                           #   that is a cutover, and it needs no DNS change.
+#                           #   Only works within ONE AWS account.
+# associate_eip     = true  # false while building a replacement stack: it then
+#                           #   runs on its own auto-assigned public IP until you
+#                           #   deliberately move the live address to it.
+# namecheap_dns_ttl = 1800  # what the hand-written A records use. Drop to 300 a
+#                           #   day before the ONE cutover that needs DNS.
+
+# ---------------------------------------------------------------------------
+# Backups. Do not switch these off — this stack has no managed database, so these
+# ARE the backups. See README -> "Backups".
+# ---------------------------------------------------------------------------
+# backup_bucket_name        = ""     # defaults to storytime-all-backups
+backup_retention_days       = 30
+enable_ebs_snapshots        = true
+enable_restore_verification = true
+restore_verify_min_tables   = 5
+
+# The legacy shared instance, looked up READ-ONLY so its endpoint shows in outputs
+# during the migration. Terraform never modifies it.
+shared_db_identifier = "" # e.g. the legacy shared RDS identifier, or "" to skip
+
+# The `all` stack owns the ECR repositories, because in this layout it is the only
+# stack there is. MUTUALLY EXCLUSIVE with the `shared` workspace, which sets the
+# same variable true in terraform.shared.tfvars.example: exactly one workspace may
+# create the repositories, and applying both makes the second fail with
+# RepositoryAlreadyExistsException. Pick the `all` layout OR `shared` + per-env.
+manage_shared_ecr = true
+# MUST STAY FALSE in account 772316781095: the FateRound stack already created
+# the token.actions.githubusercontent.com OIDC provider there, and AWS allows one
+# per URL per account. Verify: aws iam list-open-id-connect-providers
+manage_github_oidc = false

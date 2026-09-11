@@ -1,4 +1,22 @@
-temp_auto_push.bat
-temp_interactive_push.bat
-.gitignore
-branch_structure.json
+# Editor / OS noise
+.DS_Store
+*.swp
+*~
+
+# Local scratch
+tmp/
+*.log
+
+# Terraform: see infra/.gitignore for the authoritative rules
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+!*.tfvars.example
+
+# Host captures are opt-in; see capture/.gitignore
+capture/captures/
+
+# Python bytecode (redact.py is executed in place on the target host)
+__pycache__/
+*.pyc

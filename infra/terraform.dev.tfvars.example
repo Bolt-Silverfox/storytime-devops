@@ -1,0 +1,82 @@
+# terraform.dev.tfvars — dev PEELED OFF onto its own box.
+#
+# NOT the starting point: start with terraform.all.tfvars.example, which puts every
+# environment on one box for ~$24/mo. Use this file only once dev has earned its own
+# instance — see README -> "Split it out when one of these is true".
+#
+#   terraform workspace new dev
+#   cp terraform.dev.tfvars.example terraform.dev.tfvars
+#   terraform plan -var-file=terraform.dev.tfvars
+#
+# Cost of doing this: about +$24/mo.
+
+environment   = "dev"
+aws_region    = "eu-west-1"
+vpc_cidr      = "10.41.0.0/16" # must not overlap the other stacks
+instance_type = "t3.small"
+
+# Dev tolerates losing queued jobs when the box is replaced, and a ~24h backup RPO.
+use_managed_database = false
+redis_mode           = "container"
+
+# Required — and deliberately NOT assigned here: a -var-file value outranks the
+# environment, so assigning "" would discard your export and fail the guard.
+#
+#   export TF_VAR_db_password='...'
+
+
+# Dev has no real users yet, so plaintext is defensible here while the hostname
+# still points at the legacy box and ACME therefore cannot validate. It is an
+# explicit choice, not an omission — switch to tls_mode = "acme" (and set
+# acme_email) the moment the record points at this stack.
+tls_mode               = "none"
+allow_plaintext_origin = true
+# tls_mode   = "acme"
+# acme_email = "ops@storytimeapp.me"
+
+# Budget on t3.small: 2048 - 400 host - 512 postgres - 192 redis = 944 MiB for apps.
+services = {
+  "api" = {
+    container_port = 3000
+    host_port      = 3000
+    hostnames      = ["dev.api.example.invalid"] # <-- replace
+    sse            = true
+    max_body_size  = "25m"
+    read_timeout   = "3600s"
+    health_path    = "/health"
+    memory_mb      = 512
+  }
+
+  "web" = {
+    container_port = 3000
+    host_port      = 3100
+    hostnames      = ["dev.example.invalid"] # <-- replace
+    memory_mb      = 384
+  }
+
+  # Needs t3.medium.
+  "admin" = {
+    container_port = 3000
+    host_port      = 3200
+    hostnames      = []
+    enabled        = false
+    memory_mb      = 320
+  }
+}
+
+config_plain = {
+  "api" = { NODE_ENV = "development" }
+}
+
+# Names only — fill from the capture output's 90-apps/env-keys/*.keys.txt.
+secret_keys   = {}
+secret_values = {}
+
+# Account-global resources belong to whichever stack already owns them. In
+# account 772316781095 the GitHub OIDC provider is FateRound's and is reused, not
+# recreated — see infra/github-oidc.tf.
+manage_shared_ecr  = false
+manage_github_oidc = false
+
+# Legacy instance, read-only, during the migration. "" to skip.
+shared_db_identifier = ""

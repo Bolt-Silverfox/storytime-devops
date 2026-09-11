@@ -1,0 +1,19 @@
+# Local Terraform state, provider plugins, and REAL secrets.
+# Note: .terraform.lock.hcl is intentionally NOT ignored — it pins provider
+# versions and must be committed.
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log
+crash.*.log
+
+# tfvars hold secret_values. Only the .example templates are committed.
+*.tfvars
+*.tfvars.json
+!*.tfvars.example
+
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
