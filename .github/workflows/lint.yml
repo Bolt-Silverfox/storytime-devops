@@ -46,12 +46,14 @@ jobs:
           #    valid shell, so shellcheck cannot parse it and would only emit noise.
           #  * empty placeholder scripts are skipped — a 0-byte file has no shell
           #    to check, and shellcheck reports SC2148 (no shebang) on it.
-          #  * scripts/scan-injection.sh is EXCLUDED because it is a vendored,
-          #    byte-for-byte copy of the canonical detector in
-          #    Bolt-Silverfox/storytime-ci, locked by SCAN_SCRIPT_SHA256. It must
-          #    not be edited here (that would fail the malware-scan drift guard),
-          #    so linting it here could only produce findings that are
-          #    unfixable-in-this-repo. It is linted at its source instead.
+          #  * scripts/scan-injection.sh is EXCLUDED because it is maintained in
+          #    Bolt-Silverfox/storytime-ci, not here. Since storytime-ci@5f4e23d
+          #    the malware-scan workflow fetches the detector at its own pinned
+          #    SCANNER_REF, so this repo's copy is ONLY the local .githooks/
+          #    pre-commit early warning: it carries no SCAN_SCRIPT_SHA256, CI does
+          #    not read it, and it is allowed to drift. Linting it here would
+          #    still only produce findings that belong upstream, so it stays
+          #    excluded and is linted at its source. (Do not add a drift check.)
           # Extension globs alone miss shell scripts with no extension, e.g.
           # .githooks/pre-commit. Select by extension OR by shell shebang, so a
           # hook added later is covered automatically instead of silently skipped.
