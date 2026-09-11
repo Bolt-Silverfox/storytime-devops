@@ -70,8 +70,14 @@ LEAKS = [
     ("curl --username=admin:sekritpw https://x", "sekritpw"),
     # A `#` ATTACHED to a value is part of it, in the grammars as well as in
     # _statement_end — the shell only starts a comment at the start of a word.
+    # Assert the WHOLE value, not just the suffix: rejecting only `#part2` would
+    # pass while `sekrit` stayed visible.
+    ("*/5 * * * * PGPASSWORD=sekrit#part2 /usr/bin/psql", "sekrit"),
     ("*/5 * * * * PGPASSWORD=sekrit#part2 /usr/bin/psql", "#part2"),
+    ("env JWT_SECRET=aaa#bbb node app.js", "aaa"),
     ("env JWT_SECRET=aaa#bbb node app.js", "#bbb"),
+    # A `#` ATTACHED to the separator is the value, not a comment.
+    ("API_KEY=#secretstartinghash", "secretstartinghash"),
     # `#` and `;` INSIDE a credential are content, not a statement boundary
     # (CodeRabbit round 6 on this branch).
     ("curl --user=admin:sekrit#suffix https://x", "suffix"),
@@ -114,6 +120,10 @@ VISIBLE = [
     # second directive after the masked one is still readable.
     ("proxy_set_header X-Api-Key abc; # a real comment", "# a real comment"),
     ("API_KEY=abc # a real trailing comment", "# a real trailing comment"),
+    # An EMPTY assignment must not let the separator step over the whitespace and
+    # eat the comment: there is no value there to hide.
+    ("API_KEY= # trailing comment", "# trailing comment"),
+    ("password # a comment", "# a comment"),
     ("set $api_key abc; proxy_pass http://x;", "proxy_pass http://x"),
     # nginx's `user` directive has no dash, so the SECRET_FLAG set must not touch
     # it, and a connection string still keeps its host and database.

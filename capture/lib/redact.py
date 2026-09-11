@@ -80,6 +80,13 @@ IDENTIFIER = re.compile(r"[A-Za-z_$][A-Za-z0-9_.\-]*")
 # rest of a real secret. The alternatives start with distinct characters, so there
 # is no ambiguity for the engine to backtrack over.
 #
+# The separator will not step OVER whitespace to reach a `#`, which is the other
+# half of the same rule: in `API_KEY= # trailing comment` the `#` introduces a
+# comment (it is preceded by whitespace) and the value is empty, so masking it
+# deleted a comment from the artefact for nothing. In `API_KEY=#secret` the `#` is
+# attached to the separator and IS the value, so it is still masked — a password
+# that starts with a hash must not be the price of keeping a comment.
+#
 # The bare-token fallbacks stop at whitespace and `;` but NOT at `#`. A `#`
 # attached to a token is part of it — `PGPASSWORD=sekrit#part2` in a crontab is a
 # password containing a hash, not a value plus a comment, and the shell agrees:
@@ -98,7 +105,7 @@ IDENTIFIER = re.compile(r"[A-Za-z_$][A-Za-z0-9_.\-]*")
 KV_ANY = re.compile(
     r"""(?x)
     ([A-Za-z_$][A-Za-z0-9_.\-]*)
-    (\s*[:=]\s*)
+    (\s*[:=](?![ \t]+\#)[ \t]*)
     ("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|"(?:\\.|[^"\\])*$|'(?:\\.|[^'\\])*$|[^\s;,]+)
     """
 )
@@ -116,7 +123,7 @@ def _line_mentions_secret(line: str) -> bool:
 ASSIGNMENT = re.compile(
     r"""(?x)
     (?P<name>[A-Za-z_][A-Za-z0-9_.\-]*)
-    (?P<sep>\s*[:=]\s*|\s+)
+    (?P<sep>\s*[:=](?![ \t]+\#)[ \t]*|[ \t]+(?!\#))
     (?P<value>"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|"(?:\\.|[^"\\])*$|'(?:\\.|[^'\\])*$|[^\s;]+)
     """
 )
