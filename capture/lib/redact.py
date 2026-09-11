@@ -74,6 +74,12 @@ IDENTIFIER = re.compile(r"[A-Za-z_$][A-Za-z0-9_.\-]*")
 # one hard rule — never emit a configuration value — and it is not recovered
 # later, because the quoted-string sweep below can no longer see a balanced pair.
 #
+# Every quoted alternative is ESCAPE-AWARE — `"(?:\\.|[^"\\])*"`, not `"[^"]*"`.
+# With the simple form a backslash-escaped quote closed the value early:
+# `SECRET="one \" two"` matched `"one \"` and left ` two"` on the line, i.e. the
+# rest of a real secret. The alternatives start with distinct characters, so there
+# is no ambiguity for the engine to backtrack over.
+#
 # An UNTERMINATED quote needs its own alternative, tried after the balanced pair
 # and before the bare-token fallback. `JWT_SECRET="hunter2 with spaces` (no
 # closing quote) matched neither quoted form, fell through to `[^\s;#,]+`, and
@@ -85,7 +91,7 @@ KV_ANY = re.compile(
     r"""(?x)
     ([A-Za-z_$][A-Za-z0-9_.\-]*)
     (\s*[:=]\s*)
-    ("[^"]*"|'[^']*'|"[^"]*$|'[^']*$|[^\s;#,]+)
+    ("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|"(?:\\.|[^"\\])*$|'(?:\\.|[^'\\])*$|[^\s;#,]+)
     """
 )
 
@@ -103,7 +109,7 @@ ASSIGNMENT = re.compile(
     r"""(?x)
     (?P<name>[A-Za-z_][A-Za-z0-9_.\-]*)
     (?P<sep>\s*[:=]\s*|\s+)
-    (?P<value>"[^"]*"|'[^']*'|"[^"]*$|'[^']*$|[^\s;#]+)
+    (?P<value>"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|"(?:\\.|[^"\\])*$|'(?:\\.|[^'\\])*$|[^\s;#]+)
     """
 )
 
@@ -142,7 +148,7 @@ KNOWN_SECRET = re.compile(
 # what catches idioms the name=value grammar cannot see, e.g. nginx's
 #   set $upstream_token "…";
 # where the assignment's apparent "name" is the directive `set`, not the token.
-QUOTED = re.compile(r"\"[^\"]*\"|'[^']*'")
+QUOTED = re.compile(r"""(?x) "(?:\\.|[^"\\])*" | '(?:\\.|[^'\\])*' """)
 JWT = re.compile(r"\beyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\b")
 PEM_BEGIN = re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")
 PEM_END = re.compile(r"-----END [A-Z ]*PRIVATE KEY-----")
@@ -182,9 +188,31 @@ _TOKEN = re.compile(r"\S+")
 
 
 def _statement_end(text: str) -> int:
-    """Index where the current statement stops (`;` or `#`), else len(text)."""
+    """Index where the current statement stops, else len(text).
+
+    Quote-aware, and `#` must be preceded by whitespace. Both are about not
+    stopping INSIDE a credential:
+
+      --user=admin:sekrit#suffix     -> `#suffix` was emitted as if it were a
+                                        comment; it is part of the password.
+      --user="admin:sekrit;suffix"   -> same, for a `;` inside a quoted value.
+
+    An nginx statement still ends at its `;`, and a real trailing comment still
+    ends it, because a comment is introduced by whitespace-then-`#`. A `#` with no
+    space before it (a URL fragment, a password) is content, and treating it as
+    content only ever extends masking.
+    """
+    quote = None
     for i, ch in enumerate(text):
-        if ch in ";#":
+        if quote is not None:
+            if ch == quote and not _escaped(text, i):
+                quote = None
+            continue
+        if ch in "\"'" and not _escaped(text, i):
+            quote = ch
+        elif ch == ";":
+            return i
+        elif ch == "#" and (i == 0 or text[i - 1] in " \t"):
             return i
     return len(text)
 

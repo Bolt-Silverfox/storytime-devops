@@ -68,6 +68,14 @@ LEAKS = [
     # path skips entirely (CodeRabbit round 5 on this branch).
     ("0 4 * * * /usr/bin/curl --user=admin:sekritpw https://x/y", "sekritpw"),
     ("curl --username=admin:sekritpw https://x", "sekritpw"),
+    # `#` and `;` INSIDE a credential are content, not a statement boundary
+    # (CodeRabbit round 6 on this branch).
+    ("curl --user=admin:sekrit#suffix https://x", "suffix"),
+    ('curl --user="admin:sekrit;suffix" https://x', "suffix"),
+    # An escaped quote inside a BALANCED quoted value: KV_ANY took it as the
+    # closing delimiter and left the rest of the value on the line.
+    ('SECRET="one \\" two"', "two"),
+    ("API_KEY='a \\' b'", "b"),
     # INDENTED, which is how nginx -T actually prints them. The first attempt at
     # the fix above passed every unindented case and leaked every indented one:
     # leading whitespace let a regex match start at the directive and consume the
@@ -98,6 +106,10 @@ VISIBLE = [
     ("proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;",
      "$proxy_add_x_forwarded_for"),
     ("*/5 * * * * /usr/bin/certbot renew --quiet", "/usr/bin/certbot renew --quiet"),
+    # A REAL trailing comment (whitespace then #) still ends the statement, and a
+    # second directive after the masked one is still readable.
+    ("proxy_set_header X-Api-Key abc; # a real comment", "# a real comment"),
+    ("set $api_key abc; proxy_pass http://x;", "proxy_pass http://x"),
     # nginx's `user` directive has no dash, so the SECRET_FLAG set must not touch
     # it, and a connection string still keeps its host and database.
     ("user www-data;", "www-data"),
