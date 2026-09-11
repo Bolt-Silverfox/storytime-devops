@@ -64,6 +64,10 @@ LEAKS = [
     ("redis_url redis://:hunter2@10.0.0.5:6379", "hunter2"),
     # `-u` is a credential flag whose name is not secret-ish on its own.
     ("0 4 * * * /usr/bin/curl -u admin:sekritpw https://x/y", "sekritpw"),
+    # ...and the value may be INSIDE the token, which the "mask what follows"
+    # path skips entirely (CodeRabbit round 5 on this branch).
+    ("0 4 * * * /usr/bin/curl --user=admin:sekritpw https://x/y", "sekritpw"),
+    ("curl --username=admin:sekritpw https://x", "sekritpw"),
     # INDENTED, which is how nginx -T actually prints them. The first attempt at
     # the fix above passed every unindented case and leaked every indented one:
     # leading whitespace let a regex match start at the directive and consume the
@@ -144,6 +148,12 @@ STREAM_CASES = [
     ("config after a closing quote on the same line survives",
      'SECRET="aaa\nbbb"; proxy_pass http://127.0.0.1:3500;\nclient_max_body_size 25m;\n',
      ["aaa", "bbb"], ["proxy_pass http://127.0.0.1:3500", "25m"]),
+    # An ESCAPED quote is not a delimiter. Treating `\\"` as one closed the value
+    # early, emitting the rest of the first line and then the whole next line
+    # (CodeRabbit round 5 on this branch).
+    ("an escaped quote does not close a multi-line value",
+     'SECRET="one \\" two\nthree"\nproxy_pass http://x;\n',
+     ["two", "three"], ["proxy_pass http://x"]),
     # A PEM private key is a multi-line value. mask_text only ever saw the BEGIN
     # line; the base64 body fell to LONG_TOKEN, which cannot match a 64-char
     # base64 line broken up by `+` and `/`. Two of these three body lines were

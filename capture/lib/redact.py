@@ -181,6 +181,24 @@ _ARG_NAME = re.compile(r"-{0,2}[A-Za-z_$][A-Za-z0-9_$.\-]*")
 _TOKEN = re.compile(r"\S+")
 
 
+def _statement_end(text: str) -> int:
+    """Index where the current statement stops (`;` or `#`), else len(text)."""
+    for i, ch in enumerate(text):
+        if ch in ";#":
+            return i
+    return len(text)
+
+
+def _escaped(line: str, i: int) -> bool:
+    """Is line[i] preceded by an ODD number of backslashes (i.e. escaped)?"""
+    n = 0
+    j = i - 1
+    while j >= 0 and line[j] == "\\":
+        n += 1
+        j -= 1
+    return n % 2 == 1
+
+
 def _mask_secret_args(line: str) -> str:
     """Mask the value after a secret-ish, name-shaped argument token.
 
@@ -203,7 +221,25 @@ def _mask_secret_args(line: str) -> str:
     for m in _TOKEN.finditer(line):
         if m.start() < pos:
             continue
-        name = m.group(0).rstrip(";,")
+        tok = m.group(0)
+
+        # `--user=admin:pw` carries its value INSIDE the token, so the
+        # "mask what follows this token" path below skips it entirely: the token
+        # compared against SECRET_FLAG was the whole `--user=admin:pw`, and
+        # neither `user` nor the rest is secret-ish by the general rules.
+        # (The `--token=abc` shape is already covered — KV_ANY sees `token=abc`
+        # inside it — but `--user=` is not, which is the whole reason
+        # SECRET_FLAG exists.)
+        flag, sep, _inline = tok.partition("=")
+        if sep and flag in SECRET_FLAG:
+            cut = m.start() + len(flag) + 1
+            stop = _statement_end(line[cut:])
+            if any(c.isalnum() for c in line[cut:cut + stop]):
+                out.append(line[pos:cut] + "<redacted>")
+                pos = cut + stop
+            continue
+
+        name = tok.rstrip(";,")
         if not _ARG_NAME.fullmatch(name):
             continue
         if name not in SECRET_FLAG and (
@@ -211,11 +247,7 @@ def _mask_secret_args(line: str) -> str:
         ):
             continue
         rest = line[m.end():]
-        stop = len(rest)
-        for i, ch in enumerate(rest):
-            if ch in ";#":
-                stop = i
-                break
+        stop = _statement_end(rest)
         value = rest[:stop]
         gap = len(value) - len(value.lstrip(" \t"))
         # No separator means this token was not "<name> <value>" at all, and a
@@ -338,12 +370,25 @@ def _unbalanced_quote(line: str):
     quote = None
     at = -1
     for i, ch in enumerate(line):
+        if ch not in "\"'" or _escaped(line, i):
+            # An ESCAPED quote is not a delimiter. Treating `\"` as one closed the
+            # value early: `SECRET="one \" two` emitted ` two`, and the next line
+            # of the value came out verbatim behind it.
+            continue
         if quote is None:
-            if ch in "\"'" and (i == 0 or line[i - 1] in "=: \t"):
+            if i == 0 or line[i - 1] in "=: \t":
                 quote, at = ch, i
         elif ch == quote:
             quote, at = None, -1
     return quote, at
+
+
+def _find_unescaped(line: str, ch: str) -> int:
+    """Index of the first UNESCAPED `ch` in line, or -1."""
+    i = line.find(ch)
+    while i != -1 and _escaped(line, i):
+        i = line.find(ch, i + 1)
+    return i
 
 
 def _mask_line_and_quote(raw: str, strict: bool = False):
@@ -407,7 +452,7 @@ def mask_stream(text: str) -> str:
             out.append("<redacted: PRIVATE KEY BLOCK>")
             continue
         if pending is not None:
-            end = raw.find(pending)
+            end = _find_unescaped(raw, pending)
             if end == -1:
                 out.append("<redacted: continuation of a quoted value>")
                 continue
