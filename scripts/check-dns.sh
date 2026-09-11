@@ -26,8 +26,11 @@
 #             1 = drift (a mismatch, a missing record, or a CNAME where an A is
 #                 expected).
 #             2 = could not perform the check, or could not perform ALL of it (no
-#                 dig, no terraform, bad JSON, or any lookup that did not
-#                 return). Deliberately NOT 0: "I could not look" must never be
+#                 dig, no terraform, bad JSON, or any lookup that did not return
+#                 a definitive NOERROR/NXDOMAIN answer — a SERVFAIL or REFUSED
+#                 reply is a resolver fault, not a zone that disagrees, and an
+#                 unanswered lookup proves nothing about the record it was for).
+#                 Deliberately NOT 0: "I could not look" must never be
 #                 reported as "nothing is wrong" — and deliberately not 1
 #                 either, because an unreachable resolver is a network fault, not
 #                 a zone that disagrees with Terraform.
@@ -46,7 +49,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --from-json) FROM_JSON="${2:?--from-json needs a path}"; shift 2 ;;
     --resolver)  RESOLVERS+=("${2:?--resolver needs an address}"); shift 2 ;;
-    -h|--help)   sed -n '2,34p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help)   sed -n '2,37p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
@@ -105,30 +108,63 @@ checked=0
 while IFS=$'\t' read -r host want; do
   [ -n "${host:-}" ] || continue
   for resolver in "${RESOLVERS[@]}"; do
-    # +short prints a CNAME target on its own line before the A records, so
-    # filter to things that look like IPv4 rather than assuming line 1.
     # A resolver that did not answer is NOT drift. It used to be appended to
     # $drift, which meant one dead resolver made the script exit 1 and announce
     # "the zone does not match" while every record it COULD check matched — a
     # false zone alarm for a network fault. Counting only successful lookups fixed
     # the total-outage case (checked stays 0 -> exit 2); a PARTIAL outage still
     # left checked > 0 and reported drift. Keep the two apart instead.
-    if ! raw=$(dig +short +time=5 +tries=2 A "$host" "@$resolver" 2>/dev/null); then
+    #
+    # NOT +short: an error REPLY is not the same as no reply, and +short hides the
+    # difference. `dig +short` exits 0 and prints nothing for SERVFAIL and for
+    # REFUSED exactly as it does for a genuinely empty NOERROR answer, so a broken
+    # or refusing resolver read as "this host resolves to NOTHING" — drift, exit 1,
+    # a zone alarm for a resolver fault. One invocation of +comments +answer keeps
+    # the rcode and the records consistent with each other (asking twice could get
+    # two different answers); the answer section is then reduced to the same
+    # one-record-per-line shape +short produced.
+    if ! raw=$(dig +noall +comments +answer +time=5 +tries=2 A "$host" "@$resolver" 2>/dev/null); then
       unreachable+="  $host via $resolver: dig failed (resolver unreachable?)"$'\n'
       continue
     fi
 
-    # Count only lookups that actually RETURNED. `checked` is the guard that
-    # separates "everything matched" from "nothing could be checked": counting
-    # attempts meant a total resolver outage left checked > 0, skipped the
-    # refuse-to-report-success branch, and exited 1 (DNS drift) on the strength
-    # of "dig failed" lines — reporting a zone problem when the real fault was
-    # the network. Counting successes makes that case exit 2 as documented.
+    # [A-Z0-9] because a reserved rcode dig does not name prints as e.g.
+    # RESERVED11 — [A-Z]* would stop at the digit and show "status RESERVED" to
+    # the operator. Routing is unaffected (anything but NOERROR/NXDOMAIN is
+    # incomplete either way); this only keeps the diagnostic honest. `head -1`
+    # rather than tail: BIND 9.18 prints exactly one header per invocation, which
+    # was verified under TCP retry after UDP truncation, timeout retry and EDNS
+    # fallback — considered, not overlooked.
+    status=$(printf '%s\n' "$raw" | sed -n 's/^;;.*status: \([A-Z0-9]*\).*/\1/p' | head -1)
+
+    # NOERROR and NXDOMAIN are the only DEFINITIVE answers: "here is the record"
+    # and "that name does not exist". Both are real evidence about the zone, so
+    # both feed the drift decision. Every other rcode (SERVFAIL, REFUSED, and a
+    # missing header, which means dig returned 0 without a reply we can read) says
+    # something about the resolver, not about the zone — incomplete, never drift.
+    case "$status" in
+      NOERROR|NXDOMAIN) ;;
+      "") unreachable+="  $host via $resolver: no DNS response status in reply (lookup incomplete)"$'\n'; continue ;;
+      *)  unreachable+="  $host via $resolver: DNS response status $status (lookup incomplete, not drift)"$'\n'; continue ;;
+    esac
+
+    # Count only lookups that actually RETURNED a definitive answer. `checked` is
+    # the guard that separates "everything matched" from "nothing could be
+    # checked": counting attempts meant a total resolver outage left checked > 0,
+    # skipped the refuse-to-report-success branch, and exited 1 (DNS drift) on the
+    # strength of "dig failed" lines — reporting a zone problem when the real fault
+    # was the network. Counting definitive answers makes that case exit 2 as
+    # documented, and does the same for a resolver that answers only errors.
     checked=$((checked + 1))
 
-    got=$(printf '%s\n' "$raw" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | sort -u | tr '\n' ' ')
+    # Answer section only (comments start with ';'), as "<data>" per record: an A
+    # gives an address, a CNAME gives a target ending in a dot. Same two shapes
+    # +short printed, so the tests below are unchanged.
+    records=$(printf '%s\n' "$raw" | awk '/^;/ { next } $4 == "A" || $4 == "CNAME" { print $5 }')
+
+    got=$(printf '%s\n' "$records" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | sort -u | tr '\n' ' ')
     got="${got% }"
-    cname=$(printf '%s\n' "$raw" | grep -E '\.$' | head -1)
+    cname=$(printf '%s\n' "$records" | grep -E '\.$' | head -1)
 
     # A CNAME is drift even when it happens to resolve to the right address.
     # dig returns the CNAME AND the address it resolves to, so testing $got first
@@ -154,6 +190,9 @@ done < <(echo "$intent" | jq -r '.[] | select(.type == "A") | [.host, .value] | 
 
 if [ "$checked" -eq 0 ]; then
   echo "::error::there were $count expected record(s) but none were checked — refusing to report success." >&2
+  # Say WHY nothing could be checked. Without this, a zone-wide SERVFAIL and an
+  # unplugged network produce the same one-line message.
+  [ -n "$unreachable" ] && printf '%s' "$unreachable" >&2
   exit 2
 fi
 
