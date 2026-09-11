@@ -80,6 +80,14 @@ IDENTIFIER = re.compile(r"[A-Za-z_$][A-Za-z0-9_.\-]*")
 # rest of a real secret. The alternatives start with distinct characters, so there
 # is no ambiguity for the engine to backtrack over.
 #
+# The bare-token fallbacks stop at whitespace and `;` but NOT at `#`. A `#`
+# attached to a token is part of it — `PGPASSWORD=sekrit#part2` in a crontab is a
+# password containing a hash, not a value plus a comment, and the shell agrees:
+# `#` only starts a comment at the beginning of a word. Stopping there emitted
+# `#part2`, i.e. half a real password. A real trailing comment is preceded by
+# whitespace, so the token ends before it anyway. (_statement_end applies the same
+# rule; these two places had to agree and did not.)
+#
 # An UNTERMINATED quote needs its own alternative, tried after the balanced pair
 # and before the bare-token fallback. `JWT_SECRET="hunter2 with spaces` (no
 # closing quote) matched neither quoted form, fell through to `[^\s;#,]+`, and
@@ -91,7 +99,7 @@ KV_ANY = re.compile(
     r"""(?x)
     ([A-Za-z_$][A-Za-z0-9_.\-]*)
     (\s*[:=]\s*)
-    ("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|"(?:\\.|[^"\\])*$|'(?:\\.|[^'\\])*$|[^\s;#,]+)
+    ("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|"(?:\\.|[^"\\])*$|'(?:\\.|[^'\\])*$|[^\s;,]+)
     """
 )
 
@@ -109,7 +117,7 @@ ASSIGNMENT = re.compile(
     r"""(?x)
     (?P<name>[A-Za-z_][A-Za-z0-9_.\-]*)
     (?P<sep>\s*[:=]\s*|\s+)
-    (?P<value>"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|"(?:\\.|[^"\\])*$|'(?:\\.|[^'\\])*$|[^\s;#]+)
+    (?P<value>"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|"(?:\\.|[^"\\])*$|'(?:\\.|[^'\\])*$|[^\s;]+)
     """
 )
 

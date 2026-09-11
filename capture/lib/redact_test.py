@@ -68,6 +68,10 @@ LEAKS = [
     # path skips entirely (CodeRabbit round 5 on this branch).
     ("0 4 * * * /usr/bin/curl --user=admin:sekritpw https://x/y", "sekritpw"),
     ("curl --username=admin:sekritpw https://x", "sekritpw"),
+    # A `#` ATTACHED to a value is part of it, in the grammars as well as in
+    # _statement_end — the shell only starts a comment at the start of a word.
+    ("*/5 * * * * PGPASSWORD=sekrit#part2 /usr/bin/psql", "#part2"),
+    ("env JWT_SECRET=aaa#bbb node app.js", "#bbb"),
     # `#` and `;` INSIDE a credential are content, not a statement boundary
     # (CodeRabbit round 6 on this branch).
     ("curl --user=admin:sekrit#suffix https://x", "suffix"),
@@ -109,6 +113,7 @@ VISIBLE = [
     # A REAL trailing comment (whitespace then #) still ends the statement, and a
     # second directive after the masked one is still readable.
     ("proxy_set_header X-Api-Key abc; # a real comment", "# a real comment"),
+    ("API_KEY=abc # a real trailing comment", "# a real trailing comment"),
     ("set $api_key abc; proxy_pass http://x;", "proxy_pass http://x"),
     # nginx's `user` directive has no dash, so the SECRET_FLAG set must not touch
     # it, and a connection string still keeps its host and database.
