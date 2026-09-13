@@ -169,10 +169,14 @@ jobs:
                   i += 1
                   if not line.strip() or line.lstrip().startswith("#"):
                       continue
+                  # Every other ambiguity here fails loudly -- an unterminated
+                  # quote, text after a closing quote. A skipped line would be
+                  # the one that stays silent, and since every value is masked
+                  # the run would report success having written an incomplete
+                  # production configuration. Fail closed instead.
                   m = KEY.match(line.strip())
                   if not m:
-                      print(f"::warning::line {lineno} is not KEY=VALUE and was skipped")
-                      continue
+                      fail(f"line {lineno} is not KEY=VALUE — refusing to skip it")
                   key, rest = m.group(1), m.group(2).strip()
                   # Backtick is dotenv's third quote form. It takes no escapes,
                   # so close_index treats it like a single quote.

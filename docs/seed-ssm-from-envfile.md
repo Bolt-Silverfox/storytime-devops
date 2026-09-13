@@ -122,6 +122,19 @@ jobs:
 `secrets: ENV_FILE:` must be passed explicitly — a reusable workflow inherits
 nothing unless it is named, which is the behaviour you want here.
 
+### MUST BE CONFIRMED ON THE FIRST DRY RUN: is `ENV_FILE` even visible here?
+
+In four of the five repos `ENV_FILE` is an **environment** secret, not a
+repository secret, so `${{ secrets.ENV_FILE }}` in the caller above may resolve
+to an empty string unless the job is bound to the environment that holds it.
+A job that calls a reusable workflow with `uses:` cannot carry an
+`environment:` key of its own, so the binding cannot just be added to the
+caller job. This is unverified — treat it as the first thing to check: **if the
+dry run reports zero keys, this is why.** Two candidate remedies, neither yet
+chosen: declare the environment on the job *inside* the reusable workflow, or
+promote `ENV_FILE` to a repository secret for the duration of the seed and
+delete it afterwards.
+
 The `@main` on the `uses:` line is **load-bearing**, not a default. The role's
 trust policy pins the OIDC `job_workflow_ref` claim to
 `...seed-ssm-from-envfile.yml@refs/heads/main`, so a caller pointing at a tag,
@@ -208,9 +221,20 @@ actually have to be read.
 
 ## After seeding
 
-`ENV_FILE` has now been copied into a system with real access control. The repo
-secret becomes a second, unaudited copy of production credentials sitting
-behind whatever GitHub permissions happen to exist — and right now every
-`production` environment across these repos has `protection_rules: []`, meaning
-any workflow on any branch can declare `environment: production` and read it.
-Fix the protection rules, then delete the `ENV_FILE` secrets.
+`ENV_FILE` has now been copied into a system with real access control. What is
+left behind is a second, unaudited copy of production credentials, and how
+exposed it is depends on where it is stored. Verified on 2026-09-13: `ENV_FILE`
+exists as an **environment** secret (`development` / `staging` / `production`)
+in all five repos, and *additionally* as a **repository** secret in
+`storytime_be` only. Every one of those environments has
+`protection_rules: []`.
+
+That distinction matters, because environment protection rules gate environment
+secrets and nothing else. They do not apply to a repository secret. So
+`storytime_be`'s repo-level `ENV_FILE` is readable by any workflow on any
+branch no matter what protection rules are added to its environments later —
+there is no rule that would fix it, and it simply has to be deleted. For the
+other four, adding protection rules to `production` is genuinely worth doing
+and closes the "any branch can declare `environment: production`" hole in the
+meantime, but it is a stopgap: once the seed is verified, deleting `ENV_FILE`
+is the actual fix everywhere.
