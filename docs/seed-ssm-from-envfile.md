@@ -122,18 +122,69 @@ jobs:
 `secrets: ENV_FILE:` must be passed explicitly — a reusable workflow inherits
 nothing unless it is named, which is the behaviour you want here.
 
-### MUST BE CONFIRMED ON THE FIRST DRY RUN: is `ENV_FILE` even visible here?
+### Four of the five repos need `ENV_FILE` promoted for the run
 
-In four of the five repos `ENV_FILE` is an **environment** secret, not a
-repository secret, so `${{ secrets.ENV_FILE }}` in the caller above may resolve
-to an empty string unless the job is bound to the environment that holds it.
-A job that calls a reusable workflow with `uses:` cannot carry an
-`environment:` key of its own, so the binding cannot just be added to the
-caller job. This is unverified — treat it as the first thing to check: **if the
-dry run reports zero keys, this is why.** Two candidate remedies, neither yet
-chosen: declare the environment on the job *inside* the reusable workflow, or
-promote `ENV_FILE` to a repository secret for the duration of the seed and
-delete it afterwards.
+`ENV_FILE` is an **environment** secret (`development` / `staging` /
+`production`) in all five repos, and a **repository** secret additionally in
+`storytime_be` only. So in the other four, `${{ secrets.ENV_FILE }}` in the
+caller above resolves to an empty string and the seed job fails with
+`ENV_FILE parsed to zero usable keys` before it writes anything.
+
+There is no way to pass an environment secret through `workflow_call`:
+
+- A job that calls a reusable workflow with `uses:` cannot carry an
+  `environment:` key of its own, so the caller job can never be bound to the
+  environment that holds the secret.
+- Putting `environment:` on the job *inside* the reusable workflow does not fix
+  it. That selects an environment in **storytime-devops**, the called repo — not
+  in the app repo whose secret we need. Worth naming, because it looks like it
+  should work and it binds to the wrong place silently.
+- Handing the value between jobs as a job **output** is not a workaround either.
+  Outputs are not masked storage; that would write production credentials into
+  the workflow run's metadata in clear.
+
+The promotion cannot be done by hand, for the same reason this whole workflow
+exists: GitHub will not give the value back to a person, only to a job. So it is
+a one-off job in the app repo, bound to the environment, that copies the value
+across without printing it. For `storytime-fe`, `storytime_superadmin`,
+`storytime-waitlist-be` and `storytime-waitlist-fe`:
+
+1. Add a temporary `workflow_dispatch` workflow on the repo's default branch
+   with a single environment-bound job, and run it:
+
+   ```yaml
+   jobs:
+     promote:
+       runs-on: ubuntu-latest
+       environment: production        # the environment holding ENV_FILE
+       steps:
+         - run: printenv ENV_FILE | gh secret set ENV_FILE --repo "$GITHUB_REPOSITORY"
+           env:
+             ENV_FILE: ${{ secrets.ENV_FILE }}
+             GH_TOKEN: ${{ secrets.SEED_ADMIN_TOKEN }}
+   ```
+
+   `gh secret set` with no `--body` reads stdin, so the value is never an argv
+   element, and it is encrypted with the repo's public key in transit. The
+   default `GITHUB_TOKEN` cannot write Actions secrets, so `SEED_ADMIN_TOKEN` is
+   a short-lived admin PAT with `secrets: write`, added just before this run.
+2. Run the seed with `dry_run: true` and check the key list.
+3. Re-run with `dry_run: false`.
+4. **Delete the repository-level `ENV_FILE` immediately** — plus the promote
+   workflow and `SEED_ADMIN_TOKEN`, and revoke the PAT. Not at the end of the
+   day, not after the next repo: as the last step of that repo's seed.
+
+Step 4 is not optional. A repository secret is readable by any workflow on any
+branch, which is precisely the exposure the "After seeding" section below is
+about. This procedure is only acceptable because it is a one-time recovery with
+a deletion step attached, and not a pipeline anyone runs again.
+
+The alternative we did not take: converting the reusable workflow into a
+composite action would let an environment-bound job call it directly, secret and
+all. But a composite action runs inside the caller's job, which changes the OIDC
+`job_workflow_ref` claim, so every role's trust policy in
+`infra/github-oidc-ssm-seed.tf` would have to be rewritten to match. That is a
+lot of machinery to build for an operation that runs five times, once.
 
 The `@main` on the `uses:` line is **load-bearing**, not a default. The role's
 trust policy pins the OIDC `job_workflow_ref` claim to
@@ -160,7 +211,8 @@ These match the ECR repository names already created in the `shared` workspace.
 Run once per repo with `dry_run: true` and read the key list. It is the first
 honest inventory of what production actually had — compare it against
 `.env.example` and `src/shared/config/env.validation.ts`, both of which are
-known to be incomplete. Then re-run with `dry_run: false`.
+known to be incomplete. Then re-run with `dry_run: false`. For the four
+environment-secret repos, that run is wrapped in the promote/delete steps above.
 
 ## Multi-line values do not survive the boot
 
@@ -233,8 +285,15 @@ That distinction matters, because environment protection rules gate environment
 secrets and nothing else. They do not apply to a repository secret. So
 `storytime_be`'s repo-level `ENV_FILE` is readable by any workflow on any
 branch no matter what protection rules are added to its environments later —
-there is no rule that would fix it, and it simply has to be deleted. For the
-other four, adding protection rules to `production` is genuinely worth doing
-and closes the "any branch can declare `environment: production`" hole in the
-meantime, but it is a stopgap: once the seed is verified, deleting `ENV_FILE`
-is the actual fix everywhere.
+there is no rule that would fix it, and it simply has to be deleted. The same
+applies to the temporary repository-level copies the seed procedure above
+creates in the other four repos: delete each one as the last step of that repo's
+seed, so it never outlives the run.
+
+For the environment secrets that remain, adding protection rules to `production`
+is genuinely worth doing and closes the "any branch can declare
+`environment: production`" hole in the meantime, but it is a stopgap.
+
+The end state is the same either way: no repository-level `ENV_FILE` in any of
+the five repos, and once the seeded values are verified in SSM, no `ENV_FILE`
+at all.
