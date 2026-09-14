@@ -1,0 +1,337 @@
+# ---------------------------------------------------------------------------
+# Reusable workflow: copy a repo's ENV_FILE secret into AWS SSM Parameter Store.
+#
+# The point of this workflow is that NOBODY READS THE VALUES. Not a person, not
+# a transcript, not a log. GitHub will not hand a secret back over the API, and
+# the .env files left on laptops are older than the ENV_FILE secrets, so the
+# only correct move is to let a machine carry them across without ever
+# surfacing them.
+#
+# What that costs, concretely:
+#   * every parsed value is fed to ::add-mask:: BEFORE it is used for anything
+#   * `set -x` appears nowhere, and no step echoes, cats or diffs a value
+#   * the script is fed to `python3 -` on stdin, so a traceback prints
+#     `File "<stdin>", line N` and never the offending source line
+#   * values reach the AWS CLI through --cli-input-json on a 0600 temp file,
+#     never through argv, so they are not visible in `ps` on the runner
+#   * the AWS role can PutParameter and nothing else — see
+#     infra/github-oidc-ssm-seed.tf. It cannot read a parameter back, so a
+#     compromised run cannot dump what is already there
+#   * dry_run is the DEFAULT. The first run tells you which keys it found and
+#     writes nothing
+#
+# Because everything is masked, a PARSING mistake is invisible — you would find
+# out when production failed to boot. So the parser refuses to guess: it stores
+# the bytes between the quotes verbatim, and it fails loudly rather than
+# silently dropping a key.
+#
+# COLLISION WARNING: these parameters live at exactly the paths Terraform's
+# infra/ssm-config.tf manages. Read docs/seed-ssm-from-envfile.md before a
+# non-dry run.
+#
+# Called from each app repo — the ENV_FILE secrets live there, not here. See
+# docs/seed-ssm-from-envfile.md for the caller snippet.
+# ---------------------------------------------------------------------------
+name: Seed SSM from ENV_FILE
+
+on:
+  workflow_call:
+    inputs:
+      service:
+        description: 'Service key in the SSM path: /storytime-<environment>/<service>/<KEY>. Must match a key in var.services.'
+        required: true
+        type: string
+      environment:
+        description: 'Target stack: dev | staging | blue | prod | all. Becomes the -<environment> half of the SSM prefix.'
+        required: true
+        type: string
+      role_arn:
+        description: 'This repo''s entry in the gha_ssm_seed_role_arns Terraform output (a map, repo name => role ARN). Must be a role in account 772316781095.'
+        required: true
+        type: string
+      aws_region:
+        description: 'Region holding the parameters. MUST match the Terraform stack region — the role''s policy pins the parameter ARN to it, so any other region fails every write with AccessDenied.'
+        required: false
+        type: string
+        default: eu-west-1
+      dry_run:
+        description: 'List the keys that WOULD be written and stop. Leave true until the key list looks right.'
+        required: false
+        type: boolean
+        default: true
+    secrets:
+      ENV_FILE:
+        description: 'The whole .env, exactly as the dead host had it.'
+        required: true
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  seed:
+    runs-on: ubuntu-latest
+    steps:
+      # Both inputs land inside an SSM path and a session name. Reject anything
+      # that is not a plain identifier before it gets near either, rather than
+      # trusting every future caller to pass something sane.
+      - name: Validate inputs
+        env:
+          SERVICE: ${{ inputs.service }}
+          ENVIRONMENT: ${{ inputs.environment }}
+          ROLE_ARN: ${{ inputs.role_arn }}
+        run: |
+          set -euo pipefail
+          [[ "$SERVICE" =~ ^[a-z0-9][a-z0-9-]{0,39}$ ]] \
+            || { echo "::error::service must be lowercase alphanumeric/dash"; exit 1; }
+          case "$ENVIRONMENT" in
+            dev|staging|blue|prod|all|shared) ;;
+            *) echo "::error::environment must be one of dev staging blue prod all shared"; exit 1 ;;
+          esac
+          # Pin the account. role_arn is caller-supplied, and a typo pointing at
+          # a role in someone else's account would write the whole ENV_FILE into
+          # that account's SSM and report success.
+          [[ "$ROLE_ARN" =~ ^arn:aws:iam::772316781095:role/[A-Za-z0-9+=,.@_-]{1,64}$ ]] \
+            || { echo "::error::role_arn must be a role in account 772316781095"; exit 1; }
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@b47578312673ae6fa5b5096b330d9fbac3d116df # v4.2.1
+        with:
+          role-to-assume: ${{ inputs.role_arn }}
+          role-session-name: seed-ssm-${{ inputs.service }}-${{ inputs.environment }}
+          aws-region: ${{ inputs.aws_region }}
+
+      - name: Parse ENV_FILE and write SSM parameters
+        env:
+          ENV_FILE: ${{ secrets.ENV_FILE }}
+          SERVICE: ${{ inputs.service }}
+          ENVIRONMENT: ${{ inputs.environment }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, re, subprocess, sys, tempfile
+
+          raw = os.environ["ENV_FILE"].lstrip("\ufeff")  # a Windows-authored .env
+          service = os.environ["SERVICE"]
+          environment = os.environ["ENVIRONMENT"]
+          dry_run = os.environ["DRY_RUN"].lower() == "true"
+          # "storytime" is Terraform's var.name_prefix default, hardcoded here
+          # because a reusable workflow cannot read tfvars. Change one and the
+          # other must follow — it fails closed (AccessDenied on the first
+          # PutParameter, nothing written to a wrong path), but it fails.
+          prefix = f"/storytime-{environment}/{service}"
+
+          KEY = re.compile(r"^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=(.*)$")
+
+          def fail(msg):
+              print(f"::error::{msg}")
+              sys.exit(1)
+
+          def close_index(s, q):
+              """Index of the quote that TERMINATES s, or -1 if there isn't one.
+
+              Scanning for the terminator rather than testing endswith() is the
+              whole difference between correct and quietly wrong. `K="abc" # note`
+              does not end in a quote, so an endswith() test keeps reading, eats
+              the next line -- which usually does end in a quote -- and produces
+              one corrupt value and one vanished key, with no diagnostic at all.
+              """
+              j = 0
+              while j < len(s):
+                  # Backslash escapes exist inside "..." only; '...' is literal.
+                  if s[j] == "\\" and q == '"':
+                      j += 2
+                      continue
+                  if s[j] == q:
+                      return j
+                  j += 1
+              return -1
+
+          def parse(text):
+              """dotenv, including PEM-style values quoted across several lines.
+
+              Deliberately literal. Whatever sits between the quotes is stored
+              byte for byte -- no \\n expansion, no inline-comment stripping
+              inside the value. The dead host fed this file to dotenv and booted;
+              re-interpreting it now would corrupt exactly the values that are
+              hardest to notice, such as a service-account JSON whose embedded
+              \\n must stay escaped to remain valid JSON.
+              """
+              # split("\n"), not splitlines(): splitlines() also breaks on U+2028,
+              # U+2029, U+0085, \x0b and \x0c, rewriting them as \n inside a value
+              # and silently truncating unquoted ones. "Verbatim" has to mean it.
+              lines = [ln[:-1] if ln.endswith("\r") else ln for ln in text.split("\n")]
+              out, unquoted, i = {}, set(), 0
+              while i < len(lines):
+                  line = lines[i]
+                  lineno = i + 1
+                  i += 1
+                  if not line.strip() or line.lstrip().startswith("#"):
+                      continue
+                  # Every other ambiguity here fails loudly -- an unterminated
+                  # quote, text after a closing quote. A skipped line would be
+                  # the one that stays silent, and since every value is masked
+                  # the run would report success having written an incomplete
+                  # production configuration. Fail closed instead.
+                  m = KEY.match(line.strip())
+                  if not m:
+                      fail(f"line {lineno} is not KEY=VALUE — refusing to skip it")
+                  key, rest = m.group(1), m.group(2).strip()
+                  # Backtick is dotenv's third quote form. It takes no escapes,
+                  # so close_index treats it like a single quote.
+                  if rest[:1] in ("'", '"', "`"):
+                      q, body = rest[0], rest[1:]
+                      idx = close_index(body, q)
+                      while idx < 0:
+                          if i >= len(lines):
+                              fail(f"unterminated {q} quote for {key} at line {lineno} — "
+                                   "the rest of the file would be swallowed into it")
+                          body += "\n" + lines[i]
+                          i += 1
+                          idx = close_index(body, q)
+                      # Anything after the closing quote is a comment or a
+                      # mistake. A comment is unambiguous -- it is outside the
+                      # quotes -- so allow it; refuse to guess about the rest.
+                      tail = body[idx + 1:].strip()
+                      if tail and not tail.startswith("#"):
+                          fail(f"{key} at line {lineno} has text after its closing "
+                               f"{q} quote — refusing to guess where the value ends")
+                      body = body[:idx]
+                      # A later quoted definition overrides an earlier unquoted
+                      # one, so the flag below tracks the value we actually keep.
+                      unquoted.discard(key)
+                  else:
+                      body = rest
+                      unquoted.add(key)
+                  if key in out:
+                      print(f"::warning::{key} redefined at line {lineno} — last one wins")
+                  out[key] = body
+              return out, unquoted
+
+          params, unquoted = parse(raw)
+
+          # Mask everything before it can reach a log by any route. 3 is GitHub's
+          # own floor: it refuses to mask anything shorter.
+          for value in params.values():
+              for chunk in str(value).splitlines():
+                  if len(chunk.strip()) >= 3:
+                      print(f"::add-mask::{chunk}")
+
+          # SSM rejects an empty value outright. Drop those rather than fail the
+          # run halfway through — a blank in the .env carried no information.
+          for key in sorted(k for k, v in params.items() if v == ""):
+              del params[key]
+              print(f"::warning::{key} is empty in ENV_FILE — skipped")
+
+          if not params:
+              fail("ENV_FILE parsed to zero usable keys. Wrong secret, or an unexpected format.")
+
+          # A multi-line value seeds perfectly and is then thrown away at boot:
+          # user-data.sh.tftpl builds a docker --env-file, which cannot represent
+          # a newline, so it skips those keys with a WARN nobody reads and the
+          # container starts without them. Say so here, where someone is looking.
+          multiline = sorted(k for k, v in params.items() if "\n" in v or "\r" in v)
+
+          # An UNQUOTED value keeps everything from a `#` onwards, because there
+          # is no way to tell a trailing comment from a password containing a
+          # hash -- and dotenv, which the dead host used, stopped at the `#`
+          # whether or not a space preceded it. We will not guess, but this is
+          # the one remaining silent divergence, so flag the shape and let the
+          # mandatory dry run put it in front of a person.
+          #
+          # Keyed on the parse branch, not on the text: a `#` inside a QUOTED
+          # value is not a divergence at all (dotenv keeps it too), and flagging
+          # those would be noise that teaches people to ignore the warning.
+          suspect = sorted(k for k in unquoted
+                           if k in params and k not in multiline and "#" in params[k])
+
+          # Names only. This list is the ONLY thing this workflow ever prints.
+          print(f"{len(params)} keys for {prefix}:")
+          for key in sorted(params):
+              note = "   <-- MULTI-LINE" if key in multiline else (
+                     '   <-- CHECK: unquoted, contains #' if key in suspect else "")
+              print(f"  {key}{note}")
+          if suspect:
+              print(f"::warning::{len(suspect)} unquoted value(s) ({', '.join(suspect)}) "
+                    "contain a '#'. If that was an inline comment it is now PART OF THE VALUE — "
+                    "dotenv stopped at the '#'. Quote the value in ENV_FILE, or fix it in SSM "
+                    "by hand afterwards.")
+          if multiline:
+              print(f"::warning::{len(multiline)} multi-line value(s) ({', '.join(multiline)}) "
+                    "will be SKIPPED at boot — docker --env-file cannot hold a newline. Store "
+                    "them base64-encoded and decode in the app; see infra/README.md.")
+
+          if dry_run:
+              print("::notice::dry_run=true — nothing written. Re-run with dry_run=false to seed.")
+              sys.exit(0)
+
+          print("::warning::writing outside Terraform. These paths are the same ones "
+                "infra/ssm-config.tf manages — see docs/seed-ssm-from-envfile.md.")
+
+          # botocore's own error strings always start this way. Anchoring means an
+          # unexpected stderr degrades to "unknown" instead of being echoed.
+          AWS_ERR = re.compile(r"^An error occurred \(([A-Za-z]+)\)")
+
+          # A 0700 directory, so a job cancelled between write and unlink leaves
+          # the file unreadable to anything else rather than merely 0600 in /tmp.
+          workdir = tempfile.mkdtemp()
+
+          written, failed = 0, []
+          for key in sorted(params):
+              body = {
+                  "Name": f"{prefix}/{key}",
+                  "Value": params[key],
+                  "Type": "SecureString",
+                  "Overwrite": True,
+                  # Standard caps a value at 4096 chars, which a service-account
+                  # JSON blob can exceed. Intelligent-Tiering only upgrades (and
+                  # only charges) for the parameters that actually need it.
+                  "Tier": "Intelligent-Tiering",
+              }
+              # --cli-input-json, not --value: argv is world-readable via /proc.
+              # NamedTemporaryFile creates at 0600 regardless of umask.
+              with tempfile.NamedTemporaryFile("w", suffix=".json", dir=workdir, delete=False) as fh:
+                  json.dump(body, fh)
+                  path = fh.name
+              try:
+                  r = subprocess.run(
+                      ["aws", "ssm", "put-parameter", "--cli-input-json", f"file://{path}"],
+                      capture_output=True, text=True,
+                  )
+                  if r.returncode == 0:
+                      written += 1
+                  else:
+                      # stderr can quote the offending value back at us. Report
+                      # the key and the AWS error code, never the body.
+                      m = AWS_ERR.search(r.stderr or "")
+                      failed.append((key, m.group(1) if m else "unknown"))
+              finally:
+                  os.unlink(path)
+
+          os.rmdir(workdir)
+
+          print(f"wrote {written}/{len(params)} parameters under {prefix}")
+          if failed:
+              for key, code in failed:
+                  print(f"::error::{key}: {code}")
+              sys.exit(1)
+          PY
+
+      - name: Summary
+        if: always()
+        env:
+          SERVICE: ${{ inputs.service }}
+          ENVIRONMENT: ${{ inputs.environment }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          STATUS: ${{ job.status }}
+        run: |
+          {
+            echo "### SSM seed"
+            echo ""
+            echo "- Path: \`/storytime-${ENVIRONMENT}/${SERVICE}/\`"
+            echo "- Dry run: \`${DRY_RUN}\`"
+            echo "- Result: \`${STATUS}\`"
+            echo ""
+            echo "Key names are in the job log. Values are not, anywhere."
+          } >> "$GITHUB_STEP_SUMMARY"
