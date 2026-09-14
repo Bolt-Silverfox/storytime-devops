@@ -124,9 +124,10 @@ nothing unless it is named, which is the behaviour you want here.
 
 ### Four of the five repos need `ENV_FILE` promoted for the run
 
-`ENV_FILE` is an **environment** secret (`development` / `staging` /
-`production`) in all five repos, and a **repository** secret additionally in
-`storytime_be` only. So in the other four, `${{ secrets.ENV_FILE }}` in the
+`ENV_FILE` is an **environment** secret in all five repos, and a **repository**
+secret additionally in `storytime_be` only. It is not present in every
+environment — see the coverage table below — but wherever it does exist it is
+environment-scoped. So in the other four, `${{ secrets.ENV_FILE }}` in the
 caller above resolves to an empty string and the seed job fails with
 `ENV_FILE parsed to zero usable keys` before it writes anything.
 
@@ -156,7 +157,13 @@ across without printing it. For `storytime-fe`, `storytime_superadmin`,
    jobs:
      promote:
        runs-on: ubuntu-latest
-       environment: production        # the environment holding ENV_FILE
+       environment: production      # <-- the GitHub environment holding the
+                                    #     ENV_FILE for the stack you are about
+                                    #     to seed. `production` is right for the
+                                    #     default `all` recovery run and for
+                                    #     `prod`; it is wrong for `dev` and
+                                    #     `staging`. Pick it from the pairing
+                                    #     table below, deliberately.
        steps:
          - run: printenv ENV_FILE | gh secret set ENV_FILE --repo "$GITHUB_REPOSITORY"
            env:
@@ -168,11 +175,70 @@ across without printing it. For `storytime-fe`, `storytime_superadmin`,
    element, and it is encrypted with the repo's public key in transit. The
    default `GITHUB_TOKEN` cannot write Actions secrets, so `SEED_ADMIN_TOKEN` is
    a short-lived admin PAT with `secrets: write`, added just before this run.
-2. Run the seed with `dry_run: true` and check the key list.
+2. Run the seed with `dry_run: true`, passing the `environment` input that
+   **pairs with** the GitHub environment used in step 1, and check the key list.
 3. Re-run with `dry_run: false`.
 4. **Delete the repository-level `ENV_FILE` immediately** — plus the promote
    workflow and `SEED_ADMIN_TOKEN`, and revoke the PAT. Not at the end of the
    day, not after the next repo: as the last step of that repo's seed.
+
+The two environments in steps 1 and 2 are **different namespaces that must be
+chosen together**, and nothing in the workflow can check that you did. Step 1
+names a GitHub *deployment environment* (which copy of `ENV_FILE` gets read);
+step 2's `environment` input names a *Terraform stack* (which
+`/storytime-<stack>/` prefix gets written). Promote from `production` and then
+seed `dev` and you have written production credentials into the dev namespace,
+with a green run and no warning. Pair them:
+
+| Seed `environment` input | Promote from GitHub environment | Notes |
+|---|---|---|
+| `all` | `production` | The default single-stack layout, and the recovery case this document is written for. `terraform.all.tfvars.example` defines one `api` and one `web` at `NODE_ENV=production`, so `/storytime-all/` holds production values. Note that `variables.tf` describes `all` more loosely, as one box hosting every environment's containers side by side; if that layout is ever actually built, a single `/storytime-all/<service>/` namespace cannot hold dev and prod values at once and this row stops being true. |
+| `prod` | `production` | Only if prod has been peeled off onto its own stack. |
+| `staging` | `staging` | Not available in every repo — check the coverage table. |
+| `blue` | n/a | `storytime_be` only, and that repo does not promote at all — it seeds from its repository-level copy. Not a faithful copy of blue either; see below. |
+| `dev` | `development` | |
+| `shared` | — | Account-global resources, no `ENV_FILE`. Do not seed it. The reusable workflow and the IAM policy both accept `shared`, but the caller snippet above deliberately does not offer it. |
+
+`storytime_be` is the exception that still needs care: it skips promotion
+entirely because it already carries a repository-level `ENV_FILE`, and a
+repository secret has no source environment, so there is nothing to pair
+against. Which stack's values that copy holds is not recorded anywhere —
+confirm it with a `dry_run` key list before writing, and do not assume it
+matches the `environment` you are seeding.
+
+Seed one pair per run. If a repo needs values in two stacks, repeat the whole
+promote / seed / delete cycle for each, rather than promoting once and seeding
+twice — the repository-level copy must not outlive a single stack's run.
+
+**The source environment does not always exist.** Verified 2026-09-13:
+
+| Repo | `development` | `staging` | `production` |
+|---|---|---|---|
+| `storytime_be` | yes | yes | yes |
+| `storytime-fe` | yes | yes | yes |
+| `storytime_superadmin` | yes | yes | yes |
+| `storytime-waitlist-be` | yes | **no** — the `staging` environment exists but holds no secrets at all | yes |
+| `storytime-waitlist-fe` | yes | **no** — there is no `staging` environment | yes |
+
+Promoting from an environment with no `ENV_FILE` yields an empty string and the
+seed fails with `ENV_FILE parsed to zero usable keys`, which is the safe
+outcome but a confusing one if you were not expecting it. Do not seed the
+`staging` stack for the two waitlist repos until someone decides what their
+staging configuration should be.
+
+**`blue` is a `storytime_be`-only stack, and seeding it is not a faithful
+copy.** Blue has no GitHub environment of its own: `blue-deploy.yml` binds to
+`development` and builds blue's `.env` from green's `ENV_FILE` with a
+substantial set of overrides — `PORT`, `DATABASE_URL` (a different database,
+and its `connection_limit` query parameter capped), `REDIS_URL` (a separate
+logical DB), `DEPLOYMENT_ENV`, and the whole `OTEL_*` / `GRAFANA_CLOUD_*`
+block. That last group is the trap: green's
+`ENV_FILE` carries no Grafana variables at all, and `GRAFANA_CLOUD_API_TOKEN`
+is a repo-level secret in `storytime_be` injected by the workflow. So a `blue`
+seed from `development` writes green's values and silently omits every
+observability key. Reconcile the full override list against `blue-deploy.yml`
+before treating a blue seed as complete — it is around a dozen keys, not
+three.
 
 Step 4 is not optional. A repository secret is readable by any workflow on any
 branch, which is precisely the exposure the "After seeding" section below is
@@ -276,8 +342,9 @@ actually have to be read.
 `ENV_FILE` has now been copied into a system with real access control. What is
 left behind is a second, unaudited copy of production credentials, and how
 exposed it is depends on where it is stored. Verified on 2026-09-13: `ENV_FILE`
-exists as an **environment** secret (`development` / `staging` / `production`)
-in all five repos, and *additionally* as a **repository** secret in
+exists as an **environment** secret in all five repos — in `development` and
+`production` everywhere, and in `staging` in `storytime_be`, `storytime-fe` and
+`storytime_superadmin` only — and *additionally* as a **repository** secret in
 `storytime_be` only. Every one of those environments has
 `protection_rules: []`.
 
@@ -295,5 +362,54 @@ is genuinely worth doing and closes the "any branch can declare
 `environment: production`" hole in the meantime, but it is a stopgap.
 
 The end state is the same either way: no repository-level `ENV_FILE` in any of
-the five repos, and once the seeded values are verified in SSM, no `ENV_FILE`
-at all.
+the five repos, and — once the seeded values are verified in SSM **and every
+consumer has been cut over** — no `ENV_FILE` at all.
+
+### Seeding SSM is not the cutover — do not delete the environment secrets yet
+
+Verified on 2026-09-13: all five repos still read `secrets.ENV_FILE` in their
+deploy workflows, so deleting the environment-scoped secrets now breaks every
+deployment. The consumers, on each repo's default branch:
+
+| Repo | Workflows reading `ENV_FILE` | How it is consumed |
+|---|---|---|
+| `storytime_be` | `dev-deploy.yml`, `staging-deploy.yml`, `deploy-prod.yml`, `blue-deploy.yml` | `.env` written on the **runner**, used there for the build, then carried to the host by `rsync` (which does not exclude it) |
+| `storytime-fe` | `deploy-dev.yml`, `deploy-staging.yml`, `deploy-prod.yml` | `> .env` before the build — `NEXT_PUBLIC_*` is inlined into the bundle |
+| `storytime_superadmin` | `ci-cd.yml` (three jobs, bound to `development` / `staging` / `production`) | `.env` written per job, then `NEXT_PUBLIC_SENTRY_*` appended and the build run — build-time, like the other two front ends |
+| `storytime-waitlist-be` | `dev.yml`, `prod.yml` | `> .env` for the running service |
+| `storytime-waitlist-fe` | `deploy-frontend-dev.yml`, `deploy-frontend.yml` | `> .env` before the build |
+
+So the deletion order is:
+
+1. Seed, verify the key list, delete the temporary **repository-level** copy —
+   as the last step of that repo's seed, per step 4 above. This is the urgent
+   part and it does not depend on any cutover.
+2. Migrate that repo's consumers. There are **three** distinct ones and only the
+   first is solved by this work:
+   - *Runtime, on the host.* `infra/templates/user-data.sh.tftpl` already reads
+     the service's prefix from SSM recursively at boot. This is the case the
+     seed exists for.
+   - *Build time.* `NEXT_PUBLIC_*` is inlined into the bundle and cannot come
+     from SSM at runtime at all (see the `NEXT_PUBLIC_*` note under "Two things
+     this deliberately does not do" above). It has to become Docker build args
+     in the ECR image build — a real change to all three front-end repos, not a
+     config edit.
+   - *On the CI runner.* All four `storytime_be` workflows write the `.env` on
+     the **runner** and build there, so `ENV_FILE` is a build-time dependency
+     in Actions regardless of where the app later runs. `dev-deploy.yml`,
+     `staging-deploy.yml` and `deploy-prod.yml` go further and run
+     `pnpm db:migrate:deploy` and `pnpm db:seed` on the runner too — the boot
+     script cannot supply `DATABASE_URL` to a step running in Actions, so those
+     need their own answer: an SSM read in the workflow under an appropriately
+     scoped role, or migrations moved onto the host. `blue-deploy.yml` already
+     does the latter (it migrates and seeds over SSH, reading the rsynced
+     `.env` on the box) and is the closer model. Until this is settled,
+     deleting `ENV_FILE` breaks the backend pipeline even if runtime is fully
+     SSM-sourced.
+3. Deploy each migrated repo once per environment and confirm it boots on the
+   SSM-sourced values.
+4. Only then delete that repo's environment-scoped `ENV_FILE`.
+
+Steps 2-4 are per-repo and can lag; step 1 cannot. That lag is the reason to
+add `production` protection rules now: for as long as the environment secrets
+have to stay, those rules are the only control in front of them.
