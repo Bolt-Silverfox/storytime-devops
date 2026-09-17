@@ -195,9 +195,17 @@ jobs:
           # (1900s) the job stops watching while the box is still working and
           # reports a timeout on a deploy that then succeeds; above
           # timeout-minutes (7200s) the value is unreachable.
-          [[ "$RECONCILE_TIMEOUT" =~ ^[0-9]{4}$ ]] \
-            && [ "$RECONCILE_TIMEOUT" -ge 2100 ] && [ "$RECONCILE_TIMEOUT" -le 7200 ] \
-            || { echo "::error::reconcile_timeout_seconds must be an integer in 2100..7200"; exit 1; }
+          # Written as an explicit `if` rather than `A && B || { ... }`.
+          # SC2015 is right that the latter is not if-then-else, and chaining
+          # three tests into one `||` makes the reader verify that by hand.
+          # (A comment line here must not START with the word shellcheck --
+          # that prefix is parsed as a lint directive and fails the parse.)
+          if ! [[ "$RECONCILE_TIMEOUT" =~ ^[0-9]{4}$ ]] \
+             || [ "$RECONCILE_TIMEOUT" -lt 2100 ] \
+             || [ "$RECONCILE_TIMEOUT" -gt 7200 ]; then
+            echo "::error::reconcile_timeout_seconds must be an integer in 2100..7200"
+            exit 1
+          fi
           [[ "$ECR_PREFIX" =~ ^[a-z0-9][a-z0-9._/-]{0,39}$ ]] \
             || { echo "::error::ecr_repository_prefix must be a lowercase ECR namespace"; exit 1; }
           # No newlines, no '..', no leading '/' — a relative path inside the
