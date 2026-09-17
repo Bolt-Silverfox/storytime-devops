@@ -166,8 +166,21 @@ variable "services" {
                        `proxy_read_timeout 3600s` vhosts exist to do.
     - max_body_size  : request body cap; mirrors today's `client_max_body_size 25m`.
     - health_path    : path the proxy/bootstrap uses for a readiness probe.
-    - image_tag      : image tag to run. Prefer an immutable tag (the git SHA)
-                       over "latest" so a redeploy is deterministic.
+    - image_tag      : image tag to run. KEEP THIS "latest" for any service
+                       deployed by the build-and-deploy pipeline
+                       (.github/workflows/build-and-deploy.yml): that pipeline
+                       pushes latest + the git SHA and then reconciles, and it
+                       asserts the running containers are on the digest it just
+                       pushed. A SHA-pinned image_tag makes redeploy.sh pull the
+                       pinned tag instead, so unless that pin happens to equal
+                       the commit being deployed, the assertion cannot match and
+                       the deploy fails. Pinning a SHA is for a deliberate
+                       freeze or a forensic re-run only, and note it changes
+                       user-data, which REPLACES the instance
+                       (user_data_replace_on_change). Provenance comes from the
+                       git-SHA tag, which the pipeline never moves — the
+                       repository itself is deliberately MUTABLE so that
+                       "latest" can be, so it is "never moved", not "immutable".
     - enabled        : set false to keep a service defined but not deployed.
   EOT
   type = map(object({

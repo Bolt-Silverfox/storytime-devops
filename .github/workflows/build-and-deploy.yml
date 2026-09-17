@@ -1,0 +1,624 @@
+# ---------------------------------------------------------------------------
+# Reusable workflow: build a service's production image, push it to ECR, and
+# make the box adopt it.
+#
+# WHAT THIS REPLACES
+# Nothing — there was no automated path to production at all. Merging to `main`
+# ran tests and stopped; every production image was built by hand on a laptop
+# and pushed with a person's AWS credentials. So the running artifact had no
+# provenance and no link to a commit.
+#
+# THE CHAIN
+#   push/merge to the caller's deploy branch
+#     -> build linux/arm64
+#     -> push <registry>/<prefix>/<service>:latest AND :<full git SHA>
+#     -> ssm send-command: reconcile, then ASSERT the running containers are on
+#        the digest we just pushed
+#     -> POLL that command to a terminal state and fail the job if it failed
+#
+# The verification is the point. A fire-and-forget SendCommand returns a
+# CommandId immediately and the job goes green whether or not the box ever
+# pulled the image — indistinguishable from a working deploy until someone
+# notices production is on last week's code.
+#
+# Polling alone is not enough either, which is why the payload asserts digests
+# rather than trusting an exit status. See the Reconcile step for the reasoning
+# and its limits.
+#
+# WHY arm64, AND WHY THE DEFAULT RUNNER IS NOT ubuntu-latest
+# The host is a Graviton instance (t4g), so the AMI is arm64 and an amd64 image
+# does not execute at all — it dies with `exec format error`.
+#
+# `ubuntu-latest` is amd64, so building there means every instruction runs under
+# QEMU user-mode emulation. That is a brutal tax on THIS image specifically: two
+# full `pnpm install`s, two `prisma generate`s, an apt install of
+# build-essential, a nest build and a Python venv, all CPU-bound.
+#
+# So the default runner is `ubuntu-24.04-arm` — NATIVE arm64, no emulation.
+# Verified on 2026-09-16 by running a probe job in this repo: it reports
+# aarch64, 4 CPU, 16 GB, docker server arch arm64, and it scheduled instantly.
+# GitHub's own runner table lists `ubuntu-24.04-arm` under "Standard runners for
+# public repositories", where use is "free and unlimited"; Bolt-Silverfox is on
+# the free plan and both this repo and storytime_be are public, so it costs
+# nothing. See docs/build-and-deploy.md for the measured comparison.
+#
+# The emulated path is kept working rather than deleted: set `runner` to
+# `ubuntu-latest` and the QEMU step switches itself on. That matters if any of
+# these repos is ever made PRIVATE, because arm64 runners are not free there.
+#
+# BLAST RADIUS — READ BEFORE ENABLING FOR A SECOND SERVICE
+# `storytime-reconcile.service` runs /usr/local/bin/redeploy.sh with NO
+# arguments, and that script re-pulls and re-creates EVERY container on the box,
+# not just the one this workflow built. Each one is restarted onto whatever its
+# configured tag (Terraform's services.<name>.image_tag, default "latest")
+# currently points at. So deploying the api also bounces web, admin and the
+# waitlist services. That is acceptable for a single-box stack where a restart
+# is seconds, but it means a broken `latest` pushed by ANY repo goes live the
+# next time ANY repo deploys. redeploy.sh does accept a service name as $1; if
+# per-service reconcile becomes necessary, that is the hook, and it needs a
+# second systemd unit or a direct script invocation rather than this one.
+#
+# Called from each app repo. The caller snippet is in
+# docs/build-and-deploy.md — it is deliberately NOT installed in any app repo
+# by this change.
+# ---------------------------------------------------------------------------
+name: Build and deploy
+
+on:
+  workflow_call:
+    inputs:
+      service:
+        description: 'Service key. Selects the ECR repository (storytime/<service>) and must match a key in Terraform''s var.services.'
+        required: true
+        type: string
+      environment:
+        description: >-
+          Target stack label: dev | staging | blue | prod. This is an AUDIT
+          LABEL only — it names the role session and the SSM command comment.
+          It does NOT choose the target box (instance_id does) and it is NOT a
+          GitHub deployment environment: a job-level `environment:` inside a
+          reusable workflow resolves against THIS repo, not the caller, so it
+          cannot gate a caller's deploy behind the caller's approvals.
+        required: true
+        type: string
+      role_arn:
+        description: 'This repo''s entry in the gha_deploy_pipeline_role_arns Terraform output (a map, repo name => role ARN). Must be a role in account 772316781095.'
+        required: true
+        type: string
+      instance_id:
+        description: >-
+          The EC2 instance to reconcile, e.g. i-07cce36e829161c03. Must be the
+          same ID Terraform's github_deploy_instance_id pins the role to — the
+          policy names one instance ARN, so any other ID fails with
+          AccessDenied rather than deploying somewhere unexpected.
+        required: true
+        type: string
+      aws_region:
+        description: 'Region holding the ECR repository and the instance. MUST match the Terraform stack region — the role''s policy pins both ARNs to it.'
+        required: false
+        type: string
+        default: eu-west-1
+      dockerfile:
+        description: 'Path to the Dockerfile, relative to the caller repo root.'
+        required: false
+        type: string
+        default: Dockerfile
+      build_context:
+        description: 'Docker build context, relative to the caller repo root.'
+        required: false
+        type: string
+        default: '.'
+      ecr_repository_prefix:
+        description: >-
+          Namespace of the ECR repository: <prefix>/<service>. MUST match
+          Terraform's var.ecr_repository_prefix, which is what the IAM policy
+          builds its repository ARN from. A mismatch fails closed with
+          AccessDenied on push rather than writing to the wrong place.
+        required: false
+        type: string
+        default: storytime
+      runner:
+        description: >-
+          Runner label. Defaults to the NATIVE arm64 runner, which is free and
+          unlimited on public repositories. Set to `ubuntu-latest` to build
+          under QEMU emulation instead — correct, but far slower on this image.
+          The QEMU setup step enables itself automatically based on runner.arch.
+        required: false
+        type: string
+        default: ubuntu-24.04-arm
+      reconcile_timeout_seconds:
+        description: >-
+          How long to wait for the reconcile command to reach a terminal state
+          before failing the job. Must exceed the payload's own executionTimeout
+          of 1900s, so the box reports a terminal status before this job stops
+          watching; the validator enforces >= 2100. Upper bound 7200 matches the
+          job's timeout-minutes, beyond which the job is killed anyway.
+        required: false
+        type: number
+        default: 2400
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  build-and-deploy:
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 120
+
+    steps:
+      # Every input that reaches a SHELL, an ECR repository name, an IAM role
+      # session name or an SSM target is checked here, once, rather than
+      # trusting each future caller to pass something sane. Values arrive via
+      # `env:` and are quoted in the test, so a hostile value cannot break out
+      # of the condition.
+      #
+      # Two inputs are deliberately NOT covered, and it is worth being precise
+      # about why rather than implying blanket coverage:
+      #   * `runner` is consumed by `runs-on`, which is evaluated when the job
+      #     is scheduled — before any step, including this one, can run. It
+      #     cannot be validated here at all. An invalid label fails the job at
+      #     allocation with a clear error, and it never reaches a shell.
+      #   * `dockerfile` / `build_context` are passed to build-push-action as
+      #     action inputs, not interpolated into a shell. They are still
+      #     sanity-checked below to keep a path-traversal or newline-injection
+      #     attempt from reaching the builder.
+      - name: Validate inputs
+        env:
+          SERVICE: ${{ inputs.service }}
+          ENVIRONMENT: ${{ inputs.environment }}
+          ROLE_ARN: ${{ inputs.role_arn }}
+          INSTANCE_ID: ${{ inputs.instance_id }}
+          AWS_REGION_IN: ${{ inputs.aws_region }}
+          RECONCILE_TIMEOUT: ${{ inputs.reconcile_timeout_seconds }}
+          ECR_PREFIX: ${{ inputs.ecr_repository_prefix }}
+          DOCKERFILE: ${{ inputs.dockerfile }}
+          BUILD_CONTEXT: ${{ inputs.build_context }}
+        run: |
+          set -euo pipefail
+          [[ "$SERVICE" =~ ^[a-z0-9][a-z0-9-]{0,39}$ ]] \
+            || { echo "::error::service must be lowercase alphanumeric/dash"; exit 1; }
+          case "$ENVIRONMENT" in
+            dev|staging|blue|prod) ;;
+            *) echo "::error::environment must be one of dev staging blue prod"; exit 1 ;;
+          esac
+          # Pin the account. role_arn is caller-supplied, and a typo pointing at
+          # a role in another account would push this image into that account's
+          # registry and report success.
+          [[ "$ROLE_ARN" =~ ^arn:aws:iam::772316781095:role/[A-Za-z0-9+=,.@_-]{1,64}$ ]] \
+            || { echo "::error::role_arn must be a role in account 772316781095"; exit 1; }
+          [[ "$INSTANCE_ID" =~ ^i-[0-9a-f]{8,32}$ ]] \
+            || { echo "::error::instance_id must look like i-0123456789abcdef0"; exit 1; }
+          [[ "$AWS_REGION_IN" =~ ^[a-z]{2}(-gov)?-[a-z]+-[0-9]$ ]] \
+            || { echo "::error::aws_region is not a region name"; exit 1; }
+          # Bounds are not cosmetic. Below the payload's executionTimeout
+          # (1900s) the job stops watching while the box is still working and
+          # reports a timeout on a deploy that then succeeds; above
+          # timeout-minutes (7200s) the value is unreachable.
+          # Written as an explicit `if` rather than `A && B || { ... }`.
+          # SC2015 is right that the latter is not if-then-else, and chaining
+          # three tests into one `||` makes the reader verify that by hand.
+          # (A comment line here must not START with the word shellcheck --
+          # that prefix is parsed as a lint directive and fails the parse.)
+          if ! [[ "$RECONCILE_TIMEOUT" =~ ^[0-9]{4}$ ]] \
+             || [ "$RECONCILE_TIMEOUT" -lt 2100 ] \
+             || [ "$RECONCILE_TIMEOUT" -gt 7200 ]; then
+            echo "::error::reconcile_timeout_seconds must be an integer in 2100..7200"
+            exit 1
+          fi
+          [[ "$ECR_PREFIX" =~ ^[a-z0-9][a-z0-9._/-]{0,39}$ ]] \
+            || { echo "::error::ecr_repository_prefix must be a lowercase ECR namespace"; exit 1; }
+          # No newlines, no '..', no leading '/' — a relative path inside the
+          # checkout and nothing else.
+          for p in "$DOCKERFILE" "$BUILD_CONTEXT"; do
+            [[ "$p" =~ ^[A-Za-z0-9._/-]{1,200}$ ]] \
+              || { echo "::error::dockerfile/build_context must be a simple relative path"; exit 1; }
+            case "$p" in
+              /*|*..*) echo "::error::dockerfile/build_context must not be absolute or contain '..'"; exit 1 ;;
+            esac
+          done
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # binfmt_misc handlers so an amd64 runner can execute arm64 binaries.
+      # Without this, `--platform linux/arm64` on an amd64 runner fails the
+      # moment the build reaches its first RUN instruction.
+      #
+      # Skipped entirely on a native arm64 runner — registering an emulator for
+      # the architecture you already are is pure overhead. Gated on runner.arch
+      # rather than on the label string so a self-hosted arm64 runner (whose
+      # label will not end in `-arm`) is also handled correctly. runner.arch is
+      # one of X86, X64, ARM, ARM64.
+      - name: Set up QEMU (emulated builds only)
+        if: runner.arch != 'ARM64'
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+        with:
+          platforms: arm64
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@b47578312673ae6fa5b5096b330d9fbac3d116df # v4.2.1
+        with:
+          role-to-assume: ${{ inputs.role_arn }}
+          role-session-name: deploy-${{ inputs.service }}-${{ inputs.environment }}
+          aws-region: ${{ inputs.aws_region }}
+          # MUST be requested explicitly. This action defaults to 1 hour and
+          # never refreshes, so the role's 2-hour max_session_duration is inert
+          # without this line — and an emulated fallback build (measured at 40
+          # minutes on hardware faster than a hosted runner) can reach the
+          # reconcile step with expired credentials. Keep in step with
+          # max_session_duration in infra/github-oidc-deploy.tf; requesting
+          # more than the role allows fails the assume-role outright.
+          role-duration-seconds: 7200
+
+      # Deliberately the AWS CLI rather than aws-actions/amazon-ecr-login. The
+      # CLI is preinstalled on the runner and the call is two lines, so pulling
+      # in another third-party action would add supply-chain surface for no
+      # capability. The password reaches `docker login` on stdin, never argv,
+      # so it is not visible in `ps` on the runner.
+      - name: Log in to ECR
+        id: ecr
+        env:
+          AWS_REGION: ${{ inputs.aws_region }}
+        run: |
+          set -euo pipefail
+          account_id=$(aws sts get-caller-identity --query Account --output text)
+          registry="${account_id}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+          aws ecr get-login-password --region "$AWS_REGION" \
+            | docker login --username AWS --password-stdin "$registry"
+          echo "registry=${registry}" >> "$GITHUB_OUTPUT"
+
+      # Both tags are pushed from ONE build, so `latest` and the SHA tag are
+      # byte-identical by construction rather than by two builds agreeing.
+      #
+      # `latest` is what the box actually runs today: redeploy.sh pulls the tag
+      # in Terraform's services.<name>.image_tag, which defaults to "latest".
+      # The SHA tag is the immutable record — it is what makes "which commit is
+      # in production" answerable, and what the reconcile below verifies
+      # against.
+      #
+      # To ROLL BACK, do NOT set services.<name>.image_tag to a SHA and apply:
+      # image_tag is interpolated into user-data and compute.tf sets
+      # user_data_replace_on_change = true, so that REPLACES the instance (and
+      # its new instance ID then breaks this very deploy role). Instead
+      # re-point the `latest` tag at the old manifest and reconcile — no
+      # rebuild, no instance churn. See docs/build-and-deploy.md.
+      #
+      # Cache: the GitHub Actions cache backend. On an emulated arm64 build the
+      # apt/pnpm layers dominate, so a warm cache is the difference between a
+      # tolerable pipeline and an unusable one. `ignore-error=true` is a
+      # buildkit cache-export attribute (moby/buildkit control.go) that
+      # downgrades an export failure to a warning — a full or evicted cache must
+      # not fail a deploy that has already built successfully.
+      - name: Build and push linux/arm64
+        id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: ${{ inputs.build_context }}
+          file: ${{ inputs.dockerfile }}
+          platforms: linux/arm64
+          provenance: false
+          push: true
+          tags: |
+            ${{ steps.ecr.outputs.registry }}/${{ inputs.ecr_repository_prefix }}/${{ inputs.service }}:latest
+            ${{ steps.ecr.outputs.registry }}/${{ inputs.ecr_repository_prefix }}/${{ inputs.service }}:${{ github.sha }}
+          cache-from: type=gha,scope=${{ inputs.service }}-arm64
+          cache-to: type=gha,mode=max,scope=${{ inputs.service }}-arm64,ignore-error=true
+
+      # The digest of what was just pushed, taken from the build step's own
+      # output rather than read back from ECR.
+      #
+      # An earlier draft called `aws ecr batch-get-image` to resolve the tag.
+      # That is a latent fail-closed trap: BatchGetImage's documented
+      # acceptedMediaTypes are the two Docker manifest types and
+      # application/vnd.oci.image.manifest.v1+json — there is NO index /
+      # manifest-list type in the list. Today buildx emits a plain manifest
+      # (single platform, provenance off) so it would work, but re-enabling
+      # provenance or adding a second platform would make it emit an index and
+      # every deploy would start failing on a step that has nothing to do with
+      # the change. The build output has no such coupling, costs no API call,
+      # and needs no extra IAM.
+      #
+      # The equivalence this relies on was TESTED, not assumed: pushing a
+      # single-platform linux/arm64 image with buildx and pulling it back
+      # yields a `docker image inspect -f '{{join .RepoDigests ","}}'` value
+      # containing exactly the digest the registry reports for that tag.
+      # Checked with provenance both disabled and enabled — it matches either
+      # way, because a pull by tag records the digest of whatever manifest the
+      # tag resolves to.
+      - name: Check the pushed digest
+        id: digest
+        env:
+          BUILD_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          [[ "$BUILD_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] \
+            || { echo "::error::build step did not report a usable image digest (got '${BUILD_DIGEST}')"; exit 1; }
+          echo "digest=${BUILD_DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "pushed digest ${BUILD_DIGEST}"
+
+      # Reconcile, then PROVE it took effect, then poll to a terminal state.
+      #
+      # WHY A DIGEST CHECK AND NOT JUST `systemctl start`.
+      # `systemctl start` on a Type=oneshot unit does block, and it does
+      # propagate failure. What it does NOT do is guarantee a fresh run: if the
+      # unit is ACTIVELY RUNNING, systemd merges the new start request into the
+      # in-flight job, and this caller then blocks on and receives THAT job's
+      # result. So a success here can mean "someone else's earlier reconcile
+      # finished fine" rather than "your image was pulled".
+      #
+      # Scope of that race, stated honestly: the unit is Type=oneshot with no
+      # RemainAfterExit, so it returns to inactive as soon as it completes, and
+      # a start issued after that DOES run it again. The window is therefore
+      # only "while another reconcile is mid-flight" — but that window is
+      # minutes wide (it pulls images), GitHub `concurrency:` groups are
+      # per-repository so they cannot serialise two different app repos against
+      # the same box, and the whole point of this change is that a second
+      # service is coming.
+      #
+      # So the payload does not infer success from an exit status — it reports
+      # the status and then checks anyway. It asserts the observable end state:
+      # every container this service is supposed to have (by NAME, read out of
+      # the box's own redeploy.sh) exists, is running, is not restarting, and
+      # is on the exact manifest digest just pushed — retrying the reconcile
+      # once if not. That also catches the unit being killed at TimeoutStartSec
+      # after `docker rm -f` but before `docker run`, which leaves the service
+      # DOWN rather than merely stale.
+      #
+      # What it still does NOT verify: that the new image actually WORKS.
+      # A container can be running on the right digest and failing every
+      # request. var.services carries a health_path that nothing here probes;
+      # wiring a post-deploy health check is the obvious next increment.
+      #
+      # POSIX sh only (no `pipefail`, no `[[ ]]`, no arrays). AWS-RunShellScript
+      # executes the payload with /bin/sh; that is bash on this AL2023 AMI, but
+      # writing to sh keeps it correct if the AMI family ever changes.
+      #
+      # `aws ssm wait command-executed` is not used: its waiter caps at 20
+      # attempts x 5s = 100 seconds, so it would report failure on a deploy that
+      # was merely still running.
+      - name: Reconcile containers on the instance
+        env:
+          AWS_REGION: ${{ inputs.aws_region }}
+          INSTANCE_ID: ${{ inputs.instance_id }}
+          SERVICE: ${{ inputs.service }}
+          ENVIRONMENT: ${{ inputs.environment }}
+          IMAGE_SHA: ${{ github.sha }}
+          EXPECT_DIGEST: ${{ steps.digest.outputs.digest }}
+          POLL_TIMEOUT: ${{ inputs.reconcile_timeout_seconds }}
+        run: |
+          set -euo pipefail
+
+          # The remote payload, written to a file so it can be handed to jq
+          # verbatim. Quoted heredoc: nothing here is expanded by THIS shell.
+          cat > /tmp/reconcile.sh <<'REMOTE'
+          # WHICH containers should this service have, by name? Read straight
+          # out of the box's own redeploy.sh, which Terraform generates with one
+          # `run_service "<service>" "<container>" ...` line per container
+          # (replicas included). Using the real names rather than guessing them
+          # from the service name does three things: the expected COUNT and the
+          # expected NAMES come from one source that the same apply produced, a
+          # sibling service that merely looks like a replica (a service actually
+          # named `api-2` alongside `api`) cannot be mistaken for one, and there
+          # is no second place to keep in step with services.<name>.replicas.
+          names=$(sed -n "s/^[[:space:]]*run_service \"$SERVICE\" \"\([^\"]*\)\".*/\1/p" \
+                    /usr/local/bin/redeploy.sh || true)
+          if [ -z "$names" ]; then
+            echo "FATAL: no run_service line for $SERVICE in /usr/local/bin/redeploy.sh -- it is not deployed on this host" >&2
+            exit 1
+          fi
+          expected=$(printf '%s\n' "$names" | wc -l | tr -d ' ')
+          echo "expecting $expected container(s) for $SERVICE: $(printf '%s ' $names)"
+
+          attempt=1
+          while [ "$attempt" -le 2 ]; do
+            # `|| rc=$?`, NOT a bare command. The payload runs under `set -e`,
+            # so a bare `systemctl start` that fails would abort the script
+            # right here — skipping the whole check below. That would make the
+            # retry, and the "container is missing" verdict, unreachable in
+            # exactly the case they exist for: the unit being killed at
+            # TimeoutStartSec after `docker rm -f` but before `docker run`.
+            # The job went red either way, so this was never a false green, but
+            # the mechanism did not do what it claimed. The exit status is
+            # reported and then deliberately ignored — the verdict comes from
+            # the observed end state, which is the entire point.
+            rc=0
+            systemctl start storytime-reconcile.service || rc=$?
+            if [ "$rc" -ne 0 ]; then
+              echo "warn: systemctl start exited $rc; checking actual container state anyway"
+            fi
+
+            matched=0
+            bad=0
+            for c in $names; do
+              # ONE inspect, not three. Each `$(...)` assignment is a place
+              # errexit can kill the payload if the container disappears
+              # mid-sweep — and the reconcile this just triggered does
+              # `docker rm -f` on every service, so that is a live race, not a
+              # theoretical one. A failed inspect means "not there", which is a
+              # verdict, not a crash.
+              if ! info=$(docker inspect \
+                    -f '{{.State.Status}} {{.State.Restarting}} {{.Image}}' \
+                    "$c" 2>/dev/null); then
+                bad=$((bad + 1))
+                echo "bad: $c does not exist"
+                continue
+              fi
+
+              # shellcheck disable=SC2086
+              set -- $info
+              state=$1
+              restarting=$2
+              img=$3
+
+              if [ "$state" != "running" ] || [ "$restarting" = "true" ]; then
+                bad=$((bad + 1))
+                echo "bad: $c state=$state restarting=$restarting"
+              elif docker image inspect "$img" -f '{{join .RepoDigests ","}}' 2>/dev/null \
+                     | grep -qF "@$EXPECT_DIGEST"; then
+                matched=$((matched + 1))
+                echo "ok: $c running on $EXPECT_DIGEST"
+              else
+                bad=$((bad + 1))
+                echo "stale: $c is NOT on $EXPECT_DIGEST"
+              fi
+            done
+
+            if [ "$matched" -eq "$expected" ] && [ "$bad" -eq 0 ]; then
+              echo "reconciled: $matched/$expected container(s) of $SERVICE on $EXPECT_DIGEST"
+              exit 0
+            fi
+
+            echo "attempt $attempt: matched=$matched/$expected bad=$bad"
+            attempt=$((attempt + 1))
+            # Only between attempts, so the worst case stays 2x900 + 1x5.
+            # `if`, not `&&`: a failing `&&` as the loop body's last command
+            # would trip errexit.
+            if [ "$attempt" -le 2 ]; then
+              sleep 5
+            fi
+          done
+
+          echo "FATAL: $SERVICE did not converge: $matched/$expected on $EXPECT_DIGEST, $bad bad" >&2
+          exit 1
+          REMOTE
+
+          # Built with jq rather than string-interpolated into the shell: the
+          # parameters are JSON, and hand-quoting JSON inside bash inside YAML
+          # is how a stray character becomes a malformed API call. The two
+          # variable assignments prepended to the payload go through jq's `@sh`
+          # rather than hand-written quotes — a literal `'...'` inside this
+          # single-quoted jq program would close bash's quoting, not jq's.
+          #
+          # TIMEOUT LADDER, and the numbers have to actually admit the worst
+          # case rather than merely look ordered:
+          #   each `systemctl start`      <= 900s  (the unit's TimeoutStartSec)
+          #   payload worst case          = 2 x 900 + 1 x 5 sleep = 1805s
+          #                                 (the sleep runs BETWEEN attempts only)
+          #   executionTimeout            = 1900s  (> 1805, so SSM does not kill
+          #                                         a retry that was converging)
+          #   reconcile_timeout_seconds   >= 2100s (> 1900, so the box reports a
+          #                                         terminal status before this
+          #                                         job stops watching)
+          # An earlier draft used 1500s here, which sat BELOW the payload's own
+          # worst case: a slow first reconcile plus a retry that would have
+          # succeeded got killed at 1500s and reported TimedOut.
+          params=$(jq -nc \
+            --arg svc "$SERVICE" \
+            --arg digest "$EXPECT_DIGEST" \
+            --rawfile body /tmp/reconcile.sh \
+            '{
+              commands: [
+                "set -eu",
+                ("SERVICE=" + ($svc | @sh)),
+                ("EXPECT_DIGEST=" + ($digest | @sh)),
+                $body
+              ],
+              executionTimeout: ["1900"]
+            }')
+
+          command_id=$(aws ssm send-command \
+            --region "$AWS_REGION" \
+            --instance-ids "$INSTANCE_ID" \
+            --document-name AWS-RunShellScript \
+            --comment "deploy ${SERVICE} ${ENVIRONMENT} ${IMAGE_SHA}" \
+            --parameters "$params" \
+            --query 'Command.CommandId' --output text)
+
+          echo "SSM command: $command_id"
+
+          deadline=$(( SECONDS + POLL_TIMEOUT ))
+          status=""
+          while true; do
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              echo "::error::reconcile did not reach a terminal state within ${POLL_TIMEOUT}s (command ${command_id}, last status: ${status:-unknown})"
+              exit 1
+            fi
+
+            if ! invocation=$(aws ssm get-command-invocation \
+                  --region "$AWS_REGION" \
+                  --command-id "$command_id" \
+                  --instance-id "$INSTANCE_ID" \
+                  --output json 2>/tmp/ssm-err.txt); then
+              # Retry the races and the transient service errors; fail fast on
+              # anything that will never resolve by waiting.
+              #
+              # InvocationDoesNotExist: the invocation is not registered yet,
+              # for a moment after SendCommand returns.
+              # Throttling / RequestLimitExceeded / ServiceUnavailable: the box
+              # is still deploying and production WILL update, so exiting here
+              # would paint a successful deploy red.
+              # Everything else — AccessDenied (wrong instance_id, or the
+              # instance was replaced and the role's pinned ARN is stale),
+              # ExpiredToken — is surfaced immediately, because swallowing it
+              # turns a one-line policy problem into a silent wait that points
+              # the reader at the box instead of at the IAM.
+              if grep -qE 'InvocationDoesNotExist|ThrottlingException|RequestLimitExceeded|TooManyRequestsException|ServiceUnavailable' /tmp/ssm-err.txt; then
+                sleep 5
+                continue
+              fi
+              echo "::error::get-command-invocation failed"
+              cat /tmp/ssm-err.txt >&2
+              exit 1
+            fi
+
+            status=$(printf '%s' "$invocation" | jq -r '.Status')
+            case "$status" in
+              Pending|InProgress|Delayed)
+                sleep 10
+                ;;
+              Success)
+                echo "reconcile succeeded"
+                # NOTE: GetCommandInvocation returns only the FIRST 24,000
+                # characters of stdout. It is a head, not a tail — so on an
+                # over-long multi-service reconcile the part that gets cut is
+                # the END, which is exactly where the payload prints its
+                # ok:/stale:/reconciled verdicts. If this looks truncated, read
+                # the full output from the box instead of inferring from it.
+                printf '%s' "$invocation" | jq -r '.StandardOutputContent'
+                exit 0
+                ;;
+              *)
+                # Cancelled | TimedOut | Failed | Cancelling (the remaining
+                # Status values; Undeliverable and Terminated are StatusDetails,
+                # not Status, and `*)` catches them either way). Every one means
+                # the box did NOT adopt the image, so the job must go red.
+                echo "::error::reconcile ended in status ${status} (command ${command_id})"
+                # redeploy.sh and its SSM parser print key NAMES and docker
+                # progress only; neither ever echoes a parameter VALUE, so this
+                # output is safe to surface in a build log. First 24,000
+                # characters only, as above.
+                printf '%s' "$invocation" | jq -r '.StandardOutputContent'
+                printf '%s' "$invocation" | jq -r '.StandardErrorContent' >&2
+                exit 1
+                ;;
+            esac
+          done
+
+      - name: Summary
+        if: always()
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+          ECR_PREFIX: ${{ inputs.ecr_repository_prefix }}
+          SERVICE: ${{ inputs.service }}
+          IMAGE_SHA: ${{ github.sha }}
+          ENVIRONMENT: ${{ inputs.environment }}
+          INSTANCE_ID: ${{ inputs.instance_id }}
+          DIGEST: ${{ steps.digest.outputs.digest }}
+        run: |
+          set -euo pipefail
+          {
+            echo "### Deploy ${SERVICE} to ${ENVIRONMENT}"
+            echo
+            echo "| field | value |"
+            echo "| --- | --- |"
+            echo "| image | \`${REGISTRY:-<login failed>}/${ECR_PREFIX}/${SERVICE}\` |"
+            echo "| tags | \`latest\`, \`${IMAGE_SHA}\` |"
+            echo "| digest | \`${DIGEST:-<not built>}\` |"
+            echo "| instance | \`${INSTANCE_ID}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"

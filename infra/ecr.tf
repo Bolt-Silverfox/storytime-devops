@@ -12,9 +12,19 @@ resource "aws_ecr_repository" "svc" {
 
   name = "${var.ecr_repository_prefix}/${each.key}"
 
-  # MUTABLE so `latest` can be moved during bootstrap. Once deploys are driven
-  # by commit-SHA tags (the recommended path), flip this to IMMUTABLE so a tag
-  # can never be repointed under a running environment.
+  # MUTABLE, and it must STAY mutable. The build-and-deploy pipeline
+  # (.github/workflows/build-and-deploy.yml) moves `latest` on every deploy,
+  # and the documented rollback re-points `latest` at an older manifest with
+  # `docker buildx imagetools create`. Flipping this to IMMUTABLE breaks both.
+  #
+  # Every image also carries its git-SHA tag, which by CONVENTION is never
+  # moved — but note that is a convention, not a guarantee. In MUTABLE mode ECR
+  # will happily let anything with push rights overwrite a SHA tag too, so
+  # "which commit is this" is only as trustworthy as the pipeline that writes
+  # it. Do not describe these tags as immutable. (Note a MUTABLE repository can
+  # additionally carry per-tag mutability exclusions, so repo-level MUTABLE is
+  # not by itself proof that `latest` is movable — check the exclusion list if
+  # a re-tag is ever refused.)
   image_tag_mutability = "MUTABLE"
 
   # NOT force_delete. FateRound sets force_delete = true, which is fine for a

@@ -96,8 +96,12 @@ variable "github_ssm_seed_workflow_ref" {
 
 # The provider this stack does NOT manage. Data source, not a resource: if it is
 # missing the plan fails loudly rather than silently creating a duplicate.
+#
+# Shared with the deploy-pipeline roles in github-oidc-deploy.tf, which consume
+# the same provider — hence the count covers BOTH flags. It stays here rather
+# than moving to a neutral file so the existing state address is unchanged.
 data "aws_iam_openid_connect_provider" "github_existing" {
-  count = var.manage_github_ssm_seed_role ? 1 : 0
+  count = var.manage_github_ssm_seed_role || var.manage_github_deploy_roles ? 1 : 0
   url   = "https://token.actions.githubusercontent.com"
 }
 
