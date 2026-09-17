@@ -334,7 +334,12 @@ data "aws_iam_policy_document" "gha_deploy_pipeline" {
   statement {
     sid       = "SendCommandDocument"
     actions   = ["ssm:SendCommand"]
-    resources = ["arn:aws:ssm:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:document/AWS-RunShellScript"]
+    # AWS-OWNED documents carry an EMPTY account component: the ARN is
+    # arn:aws:ssm:<region>::document/AWS-RunShellScript, with two colons. AWS
+    # manages these, so no account owns them. Naming this account here produces
+    # an ARN that matches nothing, and every SendCommand is denied — the deploy
+    # would fail at its last step, after the image was already in ECR.
+    resources = ["arn:aws:ssm:${data.aws_region.current.name}::document/AWS-RunShellScript"]
   }
 
   # Polling the command to completion. The workflow must FAIL when the

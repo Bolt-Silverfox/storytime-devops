@@ -17,9 +17,11 @@ resource "aws_ecr_repository" "svc" {
   # and the documented rollback re-points `latest` at an older manifest with
   # `docker buildx imagetools create`. Flipping this to IMMUTABLE breaks both.
   #
-  # Immutability is still available where it matters: every image also carries
-  # its git-SHA tag, which is never moved, so "which commit is this" has an
-  # immutable answer without freezing `latest`. (Note a MUTABLE repository can
+  # Every image also carries its git-SHA tag, which by CONVENTION is never
+  # moved — but note that is a convention, not a guarantee. In MUTABLE mode ECR
+  # will happily let anything with push rights overwrite a SHA tag too, so
+  # "which commit is this" is only as trustworthy as the pipeline that writes
+  # it. Do not describe these tags as immutable. (Note a MUTABLE repository can
   # additionally carry per-tag mutability exclusions, so repo-level MUTABLE is
   # not by itself proof that `latest` is movable — check the exclusion list if
   # a re-tag is ever refused.)

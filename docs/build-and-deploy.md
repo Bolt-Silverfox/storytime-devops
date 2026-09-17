@@ -284,10 +284,16 @@ rebuild, no instance churn:
 docker buildx imagetools create \
   -t 772316781095.dkr.ecr.eu-west-1.amazonaws.com/storytime/api:latest \
      772316781095.dkr.ecr.eu-west-1.amazonaws.com/storytime/api:<good-sha>
-aws ssm send-command --instance-ids i-07cce36e829161c03 \
+aws ssm send-command --region eu-west-1 \
+  --instance-ids i-07cce36e829161c03 \
   --document-name AWS-RunShellScript \
   --parameters 'commands=["systemctl start storytime-reconcile.service"]'
 ```
+
+`--region` is explicit on purpose: without it the CLI falls back to the
+operator's default region, and a rollback aimed at the wrong region fails with
+an instance-not-found rather than doing anything dangerous — but it fails
+during an incident, which is the worst time to debug a missing flag.
 
 Caveats, all of them load-bearing:
 
