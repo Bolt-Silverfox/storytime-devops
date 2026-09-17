@@ -55,7 +55,7 @@ services = {
     max_body_size  = "25m"
     read_timeout   = "3600s"
     health_path    = "/health"
-    image_tag      = "latest" # switch to the commit SHA once CI pushes images
+    image_tag      = "latest" # keep "latest": the CI pipeline moves it and verifies the digest
     memory_mb      = 512
   }
 

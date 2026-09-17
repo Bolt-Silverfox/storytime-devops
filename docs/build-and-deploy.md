@@ -11,10 +11,13 @@ This document describes the chain that replaces it, built for **one service
 pieces once this one has run green.
 
 **It has not run yet.** The pieces are individually verified — Terraform plans
-clean, the workflow passes actionlint, the remote payload is tested against
-stubbed `docker`/`systemctl`, and the arm64 runner was confirmed with a live
-probe job — but the end-to-end chain cannot execute until the Dockerfile lands
-(see Ordering, next). Do not read "built" as "proven in production".
+clean in both affected workspaces, the workflow passes actionlint and its shell
+passes `bash -n` and `dash -n`, the remote payload is tested against stubbed
+`docker`/`systemctl` for the pass / stale / half-failed / service-down cases,
+the digest equivalence it depends on was tested against a real registry, and the
+arm64 runner was confirmed with a live probe job — but the end-to-end chain
+cannot execute until the Dockerfile lands (see Ordering, next). Do not read
+"built" as "proven in production".
 
 ```
 push/merge to main (app repo)
@@ -73,7 +76,7 @@ One role per repo, named `storytime-gha-deploy-<service>`:
 | push + read layers/manifests | **one** repository ARN, `storytime/api`, not `storytime/*` |
 | `ssm:SendCommand` | **one** instance ARN, `i-07cce36e829161c03` |
 | `ssm:SendCommand` | **one** document, `AWS-RunShellScript` |
-| `ssm:GetCommandInvocation`, `ssm:ListCommandInvocations` | `*` — neither supports resource-level permissions |
+| `ssm:GetCommandInvocation` | `*` — supports no resource types or condition keys, so this genuinely reads *any* Run Command output in the account. `ssm:ListCommandInvocations` is deliberately **not** granted. |
 
 Trust is pinned on three OIDC claims: `aud`, an **enumerated** `sub`
 (`repo:Bolt-Silverfox/storytime_be:ref:refs/heads/main`), and `job_workflow_ref`,
@@ -83,17 +86,22 @@ cannot assume the role.
 The `sub` is never wildcarded. `repo:<org>/<repo>:*` would match every branch
 and tag subject, every `environment:` subject, and `…:pull_request` for
 **same-repo** pull requests — reducing the trust boundary to "anyone who can
-push a branch". (It would *not* open a fork-PR hole: a `pull_request` run from a
-fork has its token permissions downgraded to read-only, and `id-token` has no
-read level, so it cannot mint an OIDC token at all. The wildcard is dangerous
-for the same-repo reason, not that one.)
+push a branch". A fork-PR hole is possible too, but the trust policy deliberately does not
+depend on settling that question: by default a fork `pull_request` run has its
+token downgraded to read-only and `id-token` has no read level, so it cannot
+mint a token — but that downgrade is conditional on the repo's "Send write
+tokens to workflows from pull requests" setting, and `pull_request_target` gets
+a read/write token regardless. Enumerating the ref makes both moot.
 
 **Subject-format trap:** these are the classic `repo:OWNER/REPO:…` subjects,
 which is what both repos emit today. GitHub's immutable format
 (`repo:OWNER@ID/REPO@ID:…`) applies to repos created after 2026-07-15 *and to
 any repo renamed or transferred after that date*. A rename or org move therefore
-silently stops matching the trust policy. Check with
-`gh api repos/<owner>/<repo>/actions/oidc/customization/sub`.
+silently stops matching the trust policy, and every deploy then fails with a
+bare STS `AccessDenied`. There is no clean API that reports which format a repo
+is on — read the `sub` claim out of a failing run rather than trusting a
+settings lookup — so if a deploy starts failing at assume-role right after a
+rename, this is the first thing to check.
 
 The OIDC **provider is a data source**, not a resource. `manage_github_oidc`
 stays `false`: the FateRound stack already created the
@@ -184,13 +192,34 @@ they cannot serialise `storytime_be` against `storytime-fe`; both reconcile the
 same box. Repo B's `systemctl start` would join repo A's run — a run that pulled
 `latest` *before* repo B pushed — and report success having adopted nothing.
 
-So the payload does not trust the exit status. It resolves the manifest digest
-the push actually produced (`aws ecr batch-get-image` on the SHA tag) and then
-asserts, on the box, that **every** running container for this service is on
-exactly that digest, retrying the reconcile once if not. Zero matching
-containers is also a failure, which catches the nastier variant: if systemd
-kills `redeploy.sh` at `TimeoutStartSec` after `docker rm -f` but before
-`docker run`, the service is *down*, not merely stale.
+Scope that race honestly: the unit is `Type=oneshot` with no `RemainAfterExit`,
+so it goes inactive the moment it finishes and a later `systemctl start` *does*
+run it again. The window is only "while another reconcile is mid-flight" — but
+that window is minutes wide, because it pulls images.
+
+So the payload does not infer success from an exit status. It asserts the
+observable end state on the box:
+
+1. read the expected container count out of `/usr/local/bin/redeploy.sh`, which
+   Terraform generates with one `run_service` line per container — so the number
+   comes from the same apply that created them, with no second place to keep in
+   step with `replicas`;
+2. enumerate matching containers with `docker ps -a`, **not** `docker ps`;
+3. require the count to equal the expected count, every one to be `running` and
+   not `restarting`, and every one to be on exactly the digest just pushed.
+
+Step 2 is the subtle one. `docker ps` lists only running containers, so with
+`replicas = 2`, a deploy where `api-0` came up and `api-1` died would show one
+container on the correct digest and nothing wrong — green, at half capacity.
+Counting against the expected total is what makes "the box adopted this image"
+mean all of it. It also catches the case where `redeploy.sh` is killed at
+`TimeoutStartSec` after `docker rm -f` but before `docker run`, leaving the
+service *down* rather than stale.
+
+**What this still does not verify is that the image works.** A container can be
+running on the right digest and failing every request. `var.services` carries a
+`health_path` that nothing in this pipeline probes; a post-deploy health check is
+the obvious next increment and is deliberately not in this change.
 
 `aws ssm wait command-executed` is not used: its waiter caps at 20 attempts ×
 5 s = 100 seconds, and a reconcile that pulls a fresh multi-hundred-MiB image
@@ -233,9 +262,21 @@ aws ssm send-command --instance-ids i-07cce36e829161c03 \
   --parameters 'commands=["systemctl start storytime-reconcile.service"]'
 ```
 
-(`imagetools create` copies the manifest server-side; it does not pull or
-rebuild. Note the ECR repositories are `MUTABLE` precisely so `latest` can be
-moved — see `infra/ecr.tf`.)
+Caveats, all of them load-bearing:
+
+- `imagetools create` copies the manifest within the **same registry**; source
+  and destination are both ECR here, so it is a server-side copy, not a pull and
+  rebuild.
+- The ECR repositories are `MUTABLE` precisely so `latest` can be moved
+  (`infra/ecr.tf`). Do not flip them to `IMMUTABLE` — it breaks both the deploy
+  and this rollback. A mutable repo can still carry per-tag mutability
+  exclusions, so if a re-tag is ever refused, check those before assuming a
+  permissions problem.
+- **Rollback depth is bounded by retention.** `ecr_keep_last_images` defaults to
+  20 with `tagStatus = any` (`infra/ecr.tf`), so an image roughly 20 deploys old
+  has already been expired and there is nothing to re-point `latest` at. If you
+  need a guaranteed rollback target further back than that, raise the retention
+  or tag the release separately so it is not swept.
 
 ---
 

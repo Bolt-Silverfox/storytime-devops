@@ -104,11 +104,16 @@ variable "github_deploy_repos" {
     branch to this repo", which for a public repo with outside collaborators is
     materially weaker than "a merge landed on main".
 
-    (It is NOT, as an earlier draft of this comment claimed, a fork-PR hole: a
-    `pull_request` run from a fork has its token permissions downgraded to
-    read-only, and `id-token` has no read level, so such a run cannot mint an
-    OIDC token at all. The wildcard is dangerous for the same-repo reason
-    above, not that one.)
+    A fork-PR hole is ALSO possible, but do not rely on either direction of
+    that argument. By default a `pull_request` run from a fork has its token
+    permissions downgraded to read-only, and since `id-token` has no read
+    level, such a run cannot mint an OIDC token — so by default the wildcard is
+    dangerous for the same-repo reason above rather than for forks. But that
+    downgrade is conditional on the repo-level "Send write tokens to workflows
+    from pull requests" setting being OFF, and `pull_request_target` gets a
+    read/write token regardless. Terraform cannot see either of those, so the
+    trust policy must not depend on them: enumerate the ref and the question
+    never arises.
 
     The subject is the CALLING repo's, not this one's: build-and-deploy.yml is
     a reusable workflow and GitHub mints the OIDC token against the caller.
@@ -119,8 +124,12 @@ variable "github_deploy_repos" {
     repos created after 2026-07-15 AND to any repo RENAMED or TRANSFERRED after
     that date. A rename of storytime_be, or a move between orgs, therefore
     silently stops matching this trust policy and every deploy fails with a
-    bare STS AccessDenied. Check with:
-      gh api repos/<owner>/<repo>/actions/oidc/customization/sub
+    bare STS AccessDenied. If that happens after a rename or transfer, the fix
+    is to switch these values to the immutable form. (There is no known API
+    that simply reports "is this repo on the immutable format"; the
+    actions/oidc/customization/sub endpoint returns the customization template,
+    not the format, so read the `sub` out of a failing run's token claims
+    instead of trusting a settings lookup.)
 
     Deliberately starts with storytime_be ONLY. The chain gets proven end to
     end for one service before the other four are added — a broken deploy role

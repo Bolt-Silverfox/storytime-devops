@@ -11,7 +11,7 @@
 # THE CHAIN
 #   push/merge to the caller's deploy branch
 #     -> build linux/arm64
-#     -> push <registry>/storytime/<service>:latest AND :<full git SHA>
+#     -> push <registry>/<prefix>/<service>:latest AND :<full git SHA>
 #     -> ssm send-command: reconcile, then ASSERT the running containers are on
 #        the digest we just pushed
 #     -> POLL that command to a terminal state and fail the job if it failed
@@ -21,11 +21,9 @@
 # pulled the image — indistinguishable from a working deploy until someone
 # notices production is on last week's code.
 #
-# Polling alone is not enough either, which is why the payload checks digests
-# rather than trusting an exit status: `systemctl start` on an already-running
-# oneshot unit JOINS the in-flight job and returns 0, so a second repo's deploy
-# can be reported successful by a reconcile that ran before its image existed.
-# See the Reconcile step for the full reasoning.
+# Polling alone is not enough either, which is why the payload asserts digests
+# rather than trusting an exit status. See the Reconcile step for the reasoning
+# and its limits.
 #
 # WHY arm64, AND WHY THE DEFAULT RUNNER IS NOT ubuntu-latest
 # The host is a Graviton instance (t4g), so the AMI is arm64 and an amd64 image
@@ -131,13 +129,13 @@ on:
       reconcile_timeout_seconds:
         description: >-
           How long to wait for the reconcile command to reach a terminal state
-          before failing the job. Must stay ABOVE the payload's executionTimeout
-          (1500s) so the box reports a terminal status before the job stops
-          watching. Each individual `systemctl start` is separately bounded by
-          the unit's own TimeoutStartSec of 900s.
+          before failing the job. Must exceed the payload's own executionTimeout
+          of 1900s, so the box reports a terminal status before this job stops
+          watching; the validator enforces >= 2100. Upper bound 7200 matches the
+          job's timeout-minutes, beyond which the job is killed anyway.
         required: false
         type: number
-        default: 1800
+        default: 2400
 
 permissions:
   contents: read
@@ -193,11 +191,13 @@ jobs:
             || { echo "::error::instance_id must look like i-0123456789abcdef0"; exit 1; }
           [[ "$AWS_REGION_IN" =~ ^[a-z]{2}(-gov)?-[a-z]+-[0-9]$ ]] \
             || { echo "::error::aws_region is not a region name"; exit 1; }
-          # Lower bound of 1500 is not cosmetic: below the payload's own
-          # executionTimeout the job would stop watching while the box is still
-          # working, and report a timeout on a deploy that then succeeds.
-          [[ "$RECONCILE_TIMEOUT" =~ ^[0-9]{4,5}$ ]] && [ "$RECONCILE_TIMEOUT" -ge 1500 ] \
-            || { echo "::error::reconcile_timeout_seconds must be an integer >= 1500"; exit 1; }
+          # Bounds are not cosmetic. Below the payload's executionTimeout
+          # (1900s) the job stops watching while the box is still working and
+          # reports a timeout on a deploy that then succeeds; above
+          # timeout-minutes (7200s) the value is unreachable.
+          [[ "$RECONCILE_TIMEOUT" =~ ^[0-9]{4}$ ]] \
+            && [ "$RECONCILE_TIMEOUT" -ge 2100 ] && [ "$RECONCILE_TIMEOUT" -le 7200 ] \
+            || { echo "::error::reconcile_timeout_seconds must be an integer in 2100..7200"; exit 1; }
           [[ "$ECR_PREFIX" =~ ^[a-z0-9][a-z0-9._/-]{0,39}$ ]] \
             || { echo "::error::ecr_repository_prefix must be a lowercase ECR namespace"; exit 1; }
           # No newlines, no '..', no leading '/' — a relative path inside the
@@ -302,48 +302,69 @@ jobs:
           cache-from: type=gha,scope=${{ inputs.service }}-arm64
           cache-to: type=gha,mode=max,scope=${{ inputs.service }}-arm64,ignore-error=true
 
-      # Resolve what the registry actually now holds for this commit. Both
-      # sides of the verification below then speak the same language — a
-      # registry MANIFEST digest — rather than relying on how buildx labels its
-      # own outputs. Uses ecr:BatchGetImage, which the push policy already
-      # grants; ecr:DescribeImages is deliberately not granted.
-      - name: Resolve pushed image digest
+      # The digest of what was just pushed, taken from the build step's own
+      # output rather than read back from ECR.
+      #
+      # An earlier draft called `aws ecr batch-get-image` to resolve the tag.
+      # That is a latent fail-closed trap: BatchGetImage's documented
+      # acceptedMediaTypes are the two Docker manifest types and
+      # application/vnd.oci.image.manifest.v1+json — there is NO index /
+      # manifest-list type in the list. Today buildx emits a plain manifest
+      # (single platform, provenance off) so it would work, but re-enabling
+      # provenance or adding a second platform would make it emit an index and
+      # every deploy would start failing on a step that has nothing to do with
+      # the change. The build output has no such coupling, costs no API call,
+      # and needs no extra IAM.
+      #
+      # The equivalence this relies on was TESTED, not assumed: pushing a
+      # single-platform linux/arm64 image with buildx and pulling it back
+      # yields a `docker image inspect -f '{{join .RepoDigests ","}}'` value
+      # containing exactly the digest the registry reports for that tag.
+      # Checked with provenance both disabled and enabled — it matches either
+      # way, because a pull by tag records the digest of whatever manifest the
+      # tag resolves to.
+      - name: Check the pushed digest
         id: digest
         env:
-          AWS_REGION: ${{ inputs.aws_region }}
-          REPO: ${{ inputs.ecr_repository_prefix }}/${{ inputs.service }}
-          IMAGE_SHA: ${{ github.sha }}
+          BUILD_DIGEST: ${{ steps.build.outputs.digest }}
         run: |
           set -euo pipefail
-          digest=$(aws ecr batch-get-image \
-            --region "$AWS_REGION" \
-            --repository-name "$REPO" \
-            --image-ids "imageTag=${IMAGE_SHA}" \
-            --query 'images[0].imageId.imageDigest' --output text)
-          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] \
-            || { echo "::error::could not resolve a digest for ${REPO}:${IMAGE_SHA} (got '${digest}')"; exit 1; }
-          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
-          echo "pushed ${REPO}:${IMAGE_SHA} = ${digest}"
+          [[ "$BUILD_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] \
+            || { echo "::error::build step did not report a usable image digest (got '${BUILD_DIGEST}')"; exit 1; }
+          echo "digest=${BUILD_DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "pushed digest ${BUILD_DIGEST}"
 
       # Reconcile, then PROVE it took effect, then poll to a terminal state.
       #
       # WHY A DIGEST CHECK AND NOT JUST `systemctl start`.
-      # `systemctl start` on a Type=oneshot unit does block and does propagate
-      # failure — but if the unit is ALREADY RUNNING, systemd merges the second
-      # request into the in-flight job and returns 0 when that job finishes.
-      # GitHub `concurrency:` groups are per-repository, so they cannot
-      # serialise two different app repos reconciling the SAME box. Repo B's
-      # start would then join repo A's run — a run that pulled `latest` before
-      # repo B pushed — and report success having adopted nothing. The job
-      # would go green on the previous image, which is precisely the silent
-      # failure the poll is supposed to eliminate.
+      # `systemctl start` on a Type=oneshot unit does block, and it does
+      # propagate failure. What it does NOT do is guarantee a fresh run: if the
+      # unit is ACTIVELY RUNNING, systemd merges the new start request into the
+      # in-flight job, and this caller then blocks on and receives THAT job's
+      # result. So a success here can mean "someone else's earlier reconcile
+      # finished fine" rather than "your image was pulled".
       #
-      # So the payload does not trust the exit status: it asserts that every
-      # running container for this service is on the exact manifest digest we
-      # just pushed, and retries the reconcile once if not. That also catches
-      # the case where the unit is killed at TimeoutStartSec after
+      # Scope of that race, stated honestly: the unit is Type=oneshot with no
+      # RemainAfterExit, so it returns to inactive as soon as it completes, and
+      # a start issued after that DOES run it again. The window is therefore
+      # only "while another reconcile is mid-flight" — but that window is
+      # minutes wide (it pulls images), GitHub `concurrency:` groups are
+      # per-repository so they cannot serialise two different app repos against
+      # the same box, and the whole point of this change is that a second
+      # service is coming.
+      #
+      # So the payload does not infer success from an exit status. It asserts
+      # the observable end state: every container this service is supposed to
+      # have exists, is running, is not restarting, and is on the exact
+      # manifest digest just pushed — retrying the reconcile once if not. That
+      # also catches the unit being killed at TimeoutStartSec after
       # `docker rm -f` but before `docker run`, which leaves the service DOWN
-      # rather than merely stale — zero matching containers fails the check.
+      # rather than merely stale.
+      #
+      # What it still does NOT verify: that the new image actually WORKS.
+      # A container can be running on the right digest and failing every
+      # request. var.services carries a health_path that nothing here probes;
+      # wiring a post-deploy health check is the obvious next increment.
       #
       # POSIX sh only (no `pipefail`, no `[[ ]]`, no arrays). AWS-RunShellScript
       # executes the payload with /bin/sh; that is bash on this AL2023 AMI, but
@@ -367,39 +388,68 @@ jobs:
           # The remote payload, written to a file so it can be handed to jq
           # verbatim. Quoted heredoc: nothing here is expanded by THIS shell.
           cat > /tmp/reconcile.sh <<'REMOTE'
+          # How many containers SHOULD this service have? Derived from the box's
+          # own redeploy.sh, which Terraform generates with one `run_service`
+          # line per container (replicas included). Reading it here rather than
+          # passing a count in from CI means there is no second place to keep in
+          # step with services.<name>.replicas — the number comes from the same
+          # apply that created the containers.
+          expected=$(grep -c "run_service \"$SERVICE\" " /usr/local/bin/redeploy.sh || true)
+          if [ "$expected" -lt 1 ]; then
+            echo "FATAL: $SERVICE has no run_service line in /usr/local/bin/redeploy.sh -- it is not deployed on this host" >&2
+            exit 1
+          fi
+          echo "expecting $expected container(s) for $SERVICE"
+
           attempt=1
           while [ "$attempt" -le 2 ]; do
             systemctl start storytime-reconcile.service
 
             matched=0
             mismatched=0
-            for c in $(docker ps --format '{{.Names}}'); do
+
+            # `docker ps -a`, NOT `docker ps`. A container that was created and
+            # then died is invisible to `docker ps`, so counting only running
+            # containers would let a half-failed deploy look clean: with
+            # replicas=2, if api-0 came up and api-1 exited, `docker ps` shows
+            # one matching container on the right digest and nothing wrong.
+            # Listing all of them, and requiring the count to equal `expected`
+            # AND every one of them to be running on the right digest, is what
+            # makes "the box adopted this image" mean all of it.
+            for c in $(docker ps -a --format '{{.Names}}'); do
               case "$c" in
                 "$SERVICE"|"$SERVICE"-[0-9]*) ;;
                 *) continue ;;
               esac
+
+              state=$(docker inspect -f '{{.State.Status}}' "$c")
+              restarting=$(docker inspect -f '{{.State.Restarting}}' "$c")
               img=$(docker inspect -f '{{.Image}}' "$c")
-              if docker image inspect "$img" -f '{{join .RepoDigests ","}}' \
-                   | grep -qF "@$EXPECT_DIGEST"; then
+
+              if [ "$state" != "running" ] || [ "$restarting" = "true" ]; then
+                mismatched=$((mismatched + 1))
+                echo "bad: $c is state=$state restarting=$restarting"
+              elif docker image inspect "$img" -f '{{join .RepoDigests ","}}' \
+                     | grep -qF "@$EXPECT_DIGEST"; then
                 matched=$((matched + 1))
-                echo "ok: $c is on $EXPECT_DIGEST"
+                echo "ok: $c running on $EXPECT_DIGEST"
               else
                 mismatched=$((mismatched + 1))
                 echo "stale: $c is NOT on $EXPECT_DIGEST"
               fi
             done
 
-            if [ "$matched" -gt 0 ] && [ "$mismatched" -eq 0 ]; then
-              echo "reconciled: $matched container(s) of $SERVICE on $EXPECT_DIGEST"
+            if [ "$matched" -eq "$expected" ] && [ "$mismatched" -eq 0 ]; then
+              echo "reconciled: $matched/$expected container(s) of $SERVICE on $EXPECT_DIGEST"
               exit 0
             fi
 
-            echo "attempt $attempt: matched=$matched mismatched=$mismatched; retrying"
+            echo "attempt $attempt: matched=$matched/$expected mismatched=$mismatched; retrying"
             attempt=$((attempt + 1))
             sleep 5
           done
 
-          echo "FATAL: $SERVICE did not converge on $EXPECT_DIGEST" >&2
+          echo "FATAL: $SERVICE did not converge: $matched/$expected on $EXPECT_DIGEST, $mismatched bad" >&2
           exit 1
           REMOTE
 
@@ -410,10 +460,18 @@ jobs:
           # rather than hand-written quotes — a literal `'...'` inside this
           # single-quoted jq program would close bash's quoting, not jq's.
           #
-          # executionTimeout (1500s) < reconcile_timeout_seconds (1800s default)
-          # so the box reports a terminal status before this job stops watching.
-          # Each individual `systemctl start` is separately bounded by the
-          # unit's own TimeoutStartSec of 900s.
+          # TIMEOUT LADDER, and the numbers have to actually admit the worst
+          # case rather than merely look ordered:
+          #   each `systemctl start`      <= 900s  (the unit's TimeoutStartSec)
+          #   payload worst case          = 2 x 900 + 5 sleep = 1805s
+          #   executionTimeout            = 1900s  (> 1805, so SSM does not kill
+          #                                         a retry that was converging)
+          #   reconcile_timeout_seconds   >= 2100s (> 1900, so the box reports a
+          #                                         terminal status before this
+          #                                         job stops watching)
+          # An earlier draft used 1500s here, which sat BELOW the payload's own
+          # worst case: a slow first reconcile plus a retry that would have
+          # succeeded got killed at 1500s and reported TimedOut.
           params=$(jq -nc \
             --arg svc "$SERVICE" \
             --arg digest "$EXPECT_DIGEST" \
@@ -425,7 +483,7 @@ jobs:
                 ("EXPECT_DIGEST=" + ($digest | @sh)),
                 $body
               ],
-              executionTimeout: ["1500"]
+              executionTimeout: ["1900"]
             }')
 
           command_id=$(aws ssm send-command \
@@ -446,18 +504,25 @@ jobs:
               exit 1
             fi
 
-            # Only the InvocationDoesNotExist race is retried. Everything else —
-            # AccessDenied (wrong instance_id, or the instance was replaced and
-            # the role's pinned ARN is stale), ExpiredToken, throttling — is
-            # surfaced immediately. Swallowing all errors here turns a one-line
-            # policy problem into a 20-minute silent hang that points the reader
-            # at the box instead of at the IAM.
             if ! invocation=$(aws ssm get-command-invocation \
                   --region "$AWS_REGION" \
                   --command-id "$command_id" \
                   --instance-id "$INSTANCE_ID" \
                   --output json 2>/tmp/ssm-err.txt); then
-              if grep -q 'InvocationDoesNotExist' /tmp/ssm-err.txt; then
+              # Retry the races and the transient service errors; fail fast on
+              # anything that will never resolve by waiting.
+              #
+              # InvocationDoesNotExist: the invocation is not registered yet,
+              # for a moment after SendCommand returns.
+              # Throttling / RequestLimitExceeded / ServiceUnavailable: the box
+              # is still deploying and production WILL update, so exiting here
+              # would paint a successful deploy red.
+              # Everything else — AccessDenied (wrong instance_id, or the
+              # instance was replaced and the role's pinned ARN is stale),
+              # ExpiredToken — is surfaced immediately, because swallowing it
+              # turns a one-line policy problem into a silent wait that points
+              # the reader at the box instead of at the IAM.
+              if grep -qE 'InvocationDoesNotExist|ThrottlingException|RequestLimitExceeded|TooManyRequestsException|ServiceUnavailable' /tmp/ssm-err.txt; then
                 sleep 5
                 continue
               fi
@@ -473,21 +538,25 @@ jobs:
                 ;;
               Success)
                 echo "reconcile succeeded"
-                # NOTE: GetCommandInvocation truncates this to 24,000
-                # characters. On a multi-service reconcile the docker pull
-                # output can exceed that, so treat it as a tail, not a
-                # complete log.
+                # NOTE: GetCommandInvocation returns only the FIRST 24,000
+                # characters of stdout. It is a head, not a tail — so on an
+                # over-long multi-service reconcile the part that gets cut is
+                # the END, which is exactly where the payload prints its
+                # ok:/stale:/reconciled verdicts. If this looks truncated, read
+                # the full output from the box instead of inferring from it.
                 printf '%s' "$invocation" | jq -r '.StandardOutputContent'
                 exit 0
                 ;;
               *)
-                # Cancelled | TimedOut | Failed | Cancelling | Undeliverable |
-                # Terminated — every one of these means the box did NOT adopt
-                # the image, so the job must go red.
+                # Cancelled | TimedOut | Failed | Cancelling (the remaining
+                # Status values; Undeliverable and Terminated are StatusDetails,
+                # not Status, and `*)` catches them either way). Every one means
+                # the box did NOT adopt the image, so the job must go red.
                 echo "::error::reconcile ended in status ${status} (command ${command_id})"
                 # redeploy.sh and its SSM parser print key NAMES and docker
                 # progress only; neither ever echoes a parameter VALUE, so this
-                # output is safe to surface in a build log. Truncated as above.
+                # output is safe to surface in a build log. First 24,000
+                # characters only, as above.
                 printf '%s' "$invocation" | jq -r '.StandardOutputContent'
                 printf '%s' "$invocation" | jq -r '.StandardErrorContent' >&2
                 exit 1
@@ -499,10 +568,12 @@ jobs:
         if: always()
         env:
           REGISTRY: ${{ steps.ecr.outputs.registry }}
+          ECR_PREFIX: ${{ inputs.ecr_repository_prefix }}
           SERVICE: ${{ inputs.service }}
           IMAGE_SHA: ${{ github.sha }}
           ENVIRONMENT: ${{ inputs.environment }}
           INSTANCE_ID: ${{ inputs.instance_id }}
+          DIGEST: ${{ steps.digest.outputs.digest }}
         run: |
           set -euo pipefail
           {
@@ -510,7 +581,8 @@ jobs:
             echo
             echo "| field | value |"
             echo "| --- | --- |"
-            echo "| image | \`${REGISTRY:-<login failed>}/storytime/${SERVICE}\` |"
+            echo "| image | \`${REGISTRY:-<login failed>}/${ECR_PREFIX}/${SERVICE}\` |"
             echo "| tags | \`latest\`, \`${IMAGE_SHA}\` |"
+            echo "| digest | \`${DIGEST:-<not built>}\` |"
             echo "| instance | \`${INSTANCE_ID}\` |"
           } >> "$GITHUB_STEP_SUMMARY"
