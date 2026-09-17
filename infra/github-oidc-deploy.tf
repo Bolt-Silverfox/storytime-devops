@@ -332,8 +332,8 @@ data "aws_iam_policy_document" "gha_deploy_pipeline" {
   # from a URL. The containment that actually matters here is the single
   # instance ARN above, not the document pin.
   statement {
-    sid       = "SendCommandDocument"
-    actions   = ["ssm:SendCommand"]
+    sid     = "SendCommandDocument"
+    actions = ["ssm:SendCommand"]
     # AWS-OWNED documents carry an EMPTY account component: the ARN is
     # arn:aws:ssm:<region>::document/AWS-RunShellScript, with two colons. AWS
     # manages these, so no account owns them. Naming this account here produces
