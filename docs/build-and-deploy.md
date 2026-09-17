@@ -10,14 +10,30 @@ This document describes the chain that replaces it, built for **one service
 (`api`, from `storytime_be`)**. The other four are replications of the same two
 pieces once this one has run green.
 
-**It has not run yet.** The pieces are individually verified — Terraform plans
-clean in both affected workspaces, the workflow passes actionlint and its shell
-passes `bash -n` and `dash -n`, the remote payload is tested against stubbed
-`docker`/`systemctl` for the pass / stale / half-failed / service-down cases,
-the digest equivalence it depends on was tested against a real registry, and the
-arm64 runner was confirmed with a live probe job — but the end-to-end chain
-cannot execute until the Dockerfile lands (see Ordering, next). Do not read
-"built" as "proven in production".
+**It has not run yet.** The pieces are individually verified, and it is worth
+being precise about what that did and did not cover:
+
+- `terraform plan` clean in both affected workspaces; both plan-time
+  preconditions deliberately tripped; `validate` and `fmt` clean.
+- `actionlint` clean; every `run:` block passes `bash -n`.
+- The remote payload was extracted by running the step's real `jq` program,
+  concatenating the resulting `commands` array exactly as AWS-RunShellScript
+  would, and checking that with `dash -n` — so the POSIX claim covers the
+  script as shipped, not the heredoc in isolation.
+- That same assembled payload was executed against stubbed `docker` and
+  `systemctl` for nine cases: all replicas correct; a replica missing; all
+  containers exited; all crash-looping; a stale digest; a **failing**
+  `systemctl start` with healthy containers; a failing `systemctl start` with a
+  missing replica; the service not present in `redeploy.sh` at all; and
+  `redeploy.sh` itself absent. Only the first two (all-correct, and
+  systemctl-fails-but-containers-fine) exit 0.
+- The digest equivalence it depends on was tested against a real registry.
+- The native arm64 runner was confirmed with a live probe job.
+
+**Not covered:** the chain end to end, any `terraform apply`, real systemd job
+coalescing under a concurrent reconcile, and whether the built image actually
+serves traffic. It cannot execute until the Dockerfile lands (see Ordering,
+next). Do not read "built" as "proven in production".
 
 ```
 push/merge to main (app repo)
@@ -73,7 +89,7 @@ One role per repo, named `storytime-gha-deploy-<service>`:
 | Grant | Scope |
 | --- | --- |
 | `ecr:GetAuthorizationToken` | `*` — ECR has no resource-level permission for this call |
-| push + read layers/manifests | **one** repository ARN, `storytime/api`, not `storytime/*` |
+| push actions (AWS's documented push set) | **one** repository ARN, `<ecr_repository_prefix>/api` — `storytime/api` with the default prefix, never `storytime/*` |
 | `ssm:SendCommand` | **one** instance ARN, `i-07cce36e829161c03` |
 | `ssm:SendCommand` | **one** document, `AWS-RunShellScript` |
 | `ssm:GetCommandInvocation` | `*` — supports no resource types or condition keys, so this genuinely reads *any* Run Command output in the account. `ssm:ListCommandInvocations` is deliberately **not** granted. |
@@ -200,21 +216,32 @@ that window is minutes wide, because it pulls images.
 So the payload does not infer success from an exit status. It asserts the
 observable end state on the box:
 
-1. read the expected container count out of `/usr/local/bin/redeploy.sh`, which
-   Terraform generates with one `run_service` line per container — so the number
-   comes from the same apply that created them, with no second place to keep in
-   step with `replicas`;
-2. enumerate matching containers with `docker ps -a`, **not** `docker ps`;
-3. require the count to equal the expected count, every one to be `running` and
-   not `restarting`, and every one to be on exactly the digest just pushed.
+1. read the expected container **names** out of `/usr/local/bin/redeploy.sh`,
+   which Terraform generates with one `run_service "<service>" "<container>"`
+   line per container — so the names and the count come from the same apply that
+   created them, with no second place to keep in step with `replicas`;
+2. `docker inspect` each of those names by name;
+3. require every one to exist, be `running`, not be `restarting`, and be on
+   exactly the digest just pushed.
 
-Step 2 is the subtle one. `docker ps` lists only running containers, so with
-`replicas = 2`, a deploy where `api-0` came up and `api-1` died would show one
-container on the correct digest and nothing wrong — green, at half capacity.
-Counting against the expected total is what makes "the box adopted this image"
-mean all of it. It also catches the case where `redeploy.sh` is killed at
-`TimeoutStartSec` after `docker rm -f` but before `docker run`, leaving the
-service *down* rather than stale.
+Two subtleties, both of which were bugs in earlier drafts of this change:
+
+- An earlier version enumerated `docker ps`, which lists only *running*
+  containers, and passed on "at least one match and no mismatches". With
+  `replicas = 2`, a deploy where `api-0` came up and `api-1` died showed one
+  container on the correct digest and nothing wrong — **green, at half
+  capacity**. Checking a known name list against `docker inspect` makes a
+  missing container a verdict rather than an absence of evidence. Reading the
+  names (not just the count) also means a sibling service that merely looks like
+  a replica — one genuinely named `api-2` alongside `api` — is never mistaken
+  for one.
+- The payload runs under `set -e`, so a bare `systemctl start` that failed
+  aborted the script *before* the check, making the retry and the
+  "container missing" verdict unreachable in precisely the case they exist for:
+  the unit killed at `TimeoutStartSec` after `docker rm -f` but before
+  `docker run`. It now captures the status, reports it, and checks the real
+  state anyway. The job went red either way, so this was never a false green —
+  but the mechanism was not doing what it claimed.
 
 **What this still does not verify is that the image works.** A container can be
 running on the right digest and failing every request. `var.services` carries a

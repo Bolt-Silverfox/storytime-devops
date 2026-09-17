@@ -353,13 +353,14 @@ jobs:
       # the same box, and the whole point of this change is that a second
       # service is coming.
       #
-      # So the payload does not infer success from an exit status. It asserts
-      # the observable end state: every container this service is supposed to
-      # have exists, is running, is not restarting, and is on the exact
-      # manifest digest just pushed — retrying the reconcile once if not. That
-      # also catches the unit being killed at TimeoutStartSec after
-      # `docker rm -f` but before `docker run`, which leaves the service DOWN
-      # rather than merely stale.
+      # So the payload does not infer success from an exit status — it reports
+      # the status and then checks anyway. It asserts the observable end state:
+      # every container this service is supposed to have (by NAME, read out of
+      # the box's own redeploy.sh) exists, is running, is not restarting, and
+      # is on the exact manifest digest just pushed — retrying the reconcile
+      # once if not. That also catches the unit being killed at TimeoutStartSec
+      # after `docker rm -f` but before `docker run`, which leaves the service
+      # DOWN rather than merely stale.
       #
       # What it still does NOT verify: that the new image actually WORKS.
       # A container can be running on the right digest and failing every
@@ -388,68 +389,94 @@ jobs:
           # The remote payload, written to a file so it can be handed to jq
           # verbatim. Quoted heredoc: nothing here is expanded by THIS shell.
           cat > /tmp/reconcile.sh <<'REMOTE'
-          # How many containers SHOULD this service have? Derived from the box's
-          # own redeploy.sh, which Terraform generates with one `run_service`
-          # line per container (replicas included). Reading it here rather than
-          # passing a count in from CI means there is no second place to keep in
-          # step with services.<name>.replicas — the number comes from the same
-          # apply that created the containers.
-          expected=$(grep -c "run_service \"$SERVICE\" " /usr/local/bin/redeploy.sh || true)
-          if [ "$expected" -lt 1 ]; then
-            echo "FATAL: $SERVICE has no run_service line in /usr/local/bin/redeploy.sh -- it is not deployed on this host" >&2
+          # WHICH containers should this service have, by name? Read straight
+          # out of the box's own redeploy.sh, which Terraform generates with one
+          # `run_service "<service>" "<container>" ...` line per container
+          # (replicas included). Using the real names rather than guessing them
+          # from the service name does three things: the expected COUNT and the
+          # expected NAMES come from one source that the same apply produced, a
+          # sibling service that merely looks like a replica (a service actually
+          # named `api-2` alongside `api`) cannot be mistaken for one, and there
+          # is no second place to keep in step with services.<name>.replicas.
+          names=$(sed -n "s/^[[:space:]]*run_service \"$SERVICE\" \"\([^\"]*\)\".*/\1/p" \
+                    /usr/local/bin/redeploy.sh || true)
+          if [ -z "$names" ]; then
+            echo "FATAL: no run_service line for $SERVICE in /usr/local/bin/redeploy.sh -- it is not deployed on this host" >&2
             exit 1
           fi
-          echo "expecting $expected container(s) for $SERVICE"
+          expected=$(printf '%s\n' "$names" | wc -l | tr -d ' ')
+          echo "expecting $expected container(s) for $SERVICE: $(printf '%s ' $names)"
 
           attempt=1
           while [ "$attempt" -le 2 ]; do
-            systemctl start storytime-reconcile.service
+            # `|| rc=$?`, NOT a bare command. The payload runs under `set -e`,
+            # so a bare `systemctl start` that fails would abort the script
+            # right here — skipping the whole check below. That would make the
+            # retry, and the "container is missing" verdict, unreachable in
+            # exactly the case they exist for: the unit being killed at
+            # TimeoutStartSec after `docker rm -f` but before `docker run`.
+            # The job went red either way, so this was never a false green, but
+            # the mechanism did not do what it claimed. The exit status is
+            # reported and then deliberately ignored — the verdict comes from
+            # the observed end state, which is the entire point.
+            rc=0
+            systemctl start storytime-reconcile.service || rc=$?
+            if [ "$rc" -ne 0 ]; then
+              echo "warn: systemctl start exited $rc; checking actual container state anyway"
+            fi
 
             matched=0
-            mismatched=0
+            bad=0
+            for c in $names; do
+              # ONE inspect, not three. Each `$(...)` assignment is a place
+              # errexit can kill the payload if the container disappears
+              # mid-sweep — and the reconcile this just triggered does
+              # `docker rm -f` on every service, so that is a live race, not a
+              # theoretical one. A failed inspect means "not there", which is a
+              # verdict, not a crash.
+              if ! info=$(docker inspect \
+                    -f '{{.State.Status}} {{.State.Restarting}} {{.Image}}' \
+                    "$c" 2>/dev/null); then
+                bad=$((bad + 1))
+                echo "bad: $c does not exist"
+                continue
+              fi
 
-            # `docker ps -a`, NOT `docker ps`. A container that was created and
-            # then died is invisible to `docker ps`, so counting only running
-            # containers would let a half-failed deploy look clean: with
-            # replicas=2, if api-0 came up and api-1 exited, `docker ps` shows
-            # one matching container on the right digest and nothing wrong.
-            # Listing all of them, and requiring the count to equal `expected`
-            # AND every one of them to be running on the right digest, is what
-            # makes "the box adopted this image" mean all of it.
-            for c in $(docker ps -a --format '{{.Names}}'); do
-              case "$c" in
-                "$SERVICE"|"$SERVICE"-[0-9]*) ;;
-                *) continue ;;
-              esac
-
-              state=$(docker inspect -f '{{.State.Status}}' "$c")
-              restarting=$(docker inspect -f '{{.State.Restarting}}' "$c")
-              img=$(docker inspect -f '{{.Image}}' "$c")
+              # shellcheck disable=SC2086
+              set -- $info
+              state=$1
+              restarting=$2
+              img=$3
 
               if [ "$state" != "running" ] || [ "$restarting" = "true" ]; then
-                mismatched=$((mismatched + 1))
-                echo "bad: $c is state=$state restarting=$restarting"
-              elif docker image inspect "$img" -f '{{join .RepoDigests ","}}' \
+                bad=$((bad + 1))
+                echo "bad: $c state=$state restarting=$restarting"
+              elif docker image inspect "$img" -f '{{join .RepoDigests ","}}' 2>/dev/null \
                      | grep -qF "@$EXPECT_DIGEST"; then
                 matched=$((matched + 1))
                 echo "ok: $c running on $EXPECT_DIGEST"
               else
-                mismatched=$((mismatched + 1))
+                bad=$((bad + 1))
                 echo "stale: $c is NOT on $EXPECT_DIGEST"
               fi
             done
 
-            if [ "$matched" -eq "$expected" ] && [ "$mismatched" -eq 0 ]; then
+            if [ "$matched" -eq "$expected" ] && [ "$bad" -eq 0 ]; then
               echo "reconciled: $matched/$expected container(s) of $SERVICE on $EXPECT_DIGEST"
               exit 0
             fi
 
-            echo "attempt $attempt: matched=$matched/$expected mismatched=$mismatched; retrying"
+            echo "attempt $attempt: matched=$matched/$expected bad=$bad"
             attempt=$((attempt + 1))
-            sleep 5
+            # Only between attempts, so the worst case stays 2x900 + 1x5.
+            # `if`, not `&&`: a failing `&&` as the loop body's last command
+            # would trip errexit.
+            if [ "$attempt" -le 2 ]; then
+              sleep 5
+            fi
           done
 
-          echo "FATAL: $SERVICE did not converge: $matched/$expected on $EXPECT_DIGEST, $mismatched bad" >&2
+          echo "FATAL: $SERVICE did not converge: $matched/$expected on $EXPECT_DIGEST, $bad bad" >&2
           exit 1
           REMOTE
 
@@ -463,7 +490,8 @@ jobs:
           # TIMEOUT LADDER, and the numbers have to actually admit the worst
           # case rather than merely look ordered:
           #   each `systemctl start`      <= 900s  (the unit's TimeoutStartSec)
-          #   payload worst case          = 2 x 900 + 5 sleep = 1805s
+          #   payload worst case          = 2 x 900 + 1 x 5 sleep = 1805s
+          #                                 (the sleep runs BETWEEN attempts only)
           #   executionTimeout            = 1900s  (> 1805, so SSM does not kill
           #                                         a retry that was converging)
           #   reconcile_timeout_seconds   >= 2100s (> 1900, so the box reports a

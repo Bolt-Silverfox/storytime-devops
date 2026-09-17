@@ -172,12 +172,15 @@ variable "services" {
                        pushes latest + the git SHA and then reconciles, and it
                        asserts the running containers are on the digest it just
                        pushed. A SHA-pinned image_tag makes redeploy.sh pull the
-                       pinned tag instead, so that assertion can never match and
-                       EVERY deploy fails. Pinning a SHA is for a deliberate
+                       pinned tag instead, so unless that pin happens to equal
+                       the commit being deployed, the assertion cannot match and
+                       the deploy fails. Pinning a SHA is for a deliberate
                        freeze or a forensic re-run only, and note it changes
                        user-data, which REPLACES the instance
                        (user_data_replace_on_change). Provenance comes from the
-                       immutable SHA tag in ECR, not from this field.
+                       git-SHA tag, which the pipeline never moves — the
+                       repository itself is deliberately MUTABLE so that
+                       "latest" can be, so it is "never moved", not "immutable".
     - enabled        : set false to keep a service defined but not deployed.
   EOT
   type = map(object({
