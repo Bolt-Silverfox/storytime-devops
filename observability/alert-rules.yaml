@@ -1,0 +1,141 @@
+apiVersion: 1
+groups:
+    - orgId: 1
+      name: production-1m
+      folder: Storytime
+      interval: 1m
+      rules:
+        - uid: dfyo2bycclvr4c
+          title: storytime-api 5xx error rate
+          condition: C
+          data:
+            - refId: A
+              relativeTimeRange:
+                from: 600
+                to: 0
+              datasourceUid: grafanacloud-prom
+              model:
+                editorMode: code
+                expr: sum(rate(http_server_duration_milliseconds_count{service_name="storytime-api",http_status_code=~"5.."}[5m]))
+                instant: true
+                intervalMs: 1000
+                maxDataPoints: 43200
+                range: false
+                refId: A
+            - refId: C
+              relativeTimeRange:
+                from: 600
+                to: 0
+              datasourceUid: __expr__
+              model:
+                conditions:
+                    - evaluator:
+                        params:
+                            - 0.1
+                        type: gt
+                expression: A
+                intervalMs: 1000
+                maxDataPoints: 43200
+                refId: C
+                type: threshold
+          noDataState: OK
+          execErrState: Error
+          for: 5m
+          annotations:
+            summary: storytime-api is returning 5xx responses (>0.1/s sustained 5m). Check docker logs api on the instance and Grafana traces for the failing route.
+          labels:
+            env: production
+            service: storytime-api
+          isPaused: false
+        - uid: bfyo2c0rok2yoa
+          title: storytime-api event loop stalled
+          condition: C
+          data:
+            - refId: A
+              relativeTimeRange:
+                from: 600
+                to: 0
+              datasourceUid: grafanacloud-prom
+              model:
+                editorMode: code
+                expr: max(nodejs_eventloop_delay_p99_seconds{service_name="storytime-api"})
+                instant: true
+                intervalMs: 1000
+                maxDataPoints: 43200
+                range: false
+                refId: A
+            - refId: C
+              relativeTimeRange:
+                from: 600
+                to: 0
+              datasourceUid: __expr__
+              model:
+                conditions:
+                    - evaluator:
+                        params:
+                            - 1
+                        type: gt
+                expression: A
+                intervalMs: 1000
+                maxDataPoints: 43200
+                refId: C
+                type: threshold
+          noDataState: OK
+          execErrState: Error
+          for: 10m
+          annotations:
+            summary: storytime-api p99 event-loop delay above 1s for 10m. The container is alive and passing health checks but too saturated to serve traffic. Check memory (512 MiB cap, ~70% at idle) and story-generation load.
+          labels:
+            env: production
+            service: storytime-api
+          isPaused: false
+        - uid: afybpc0sg8ikgd
+          title: storytime-api down (no telemetry)
+          condition: C
+          data:
+            - refId: A
+              relativeTimeRange:
+                from: 600
+                to: 0
+              datasourceUid: grafanacloud-prom
+              model:
+                editorMode: code
+                expr: count(db_pool_connections_open{service_name="storytime-api"}) or vector(0)
+                instant: true
+                intervalMs: 1000
+                legendFormat: __auto
+                maxDataPoints: 43200
+                range: false
+                refId: A
+            - refId: C
+              queryType: expression
+              datasourceUid: __expr__
+              model:
+                conditions:
+                    - evaluator:
+                        params:
+                            - 0
+                        type: lt
+                      operator:
+                        type: and
+                      query:
+                        params:
+                            - C
+                      reducer:
+                        params: []
+                        type: last
+                      type: query
+                datasource:
+                    type: __expr__
+                    uid: __expr__
+                expression: A
+                intervalMs: 1000
+                maxDataPoints: 43200
+                refId: C
+                type: threshold
+          noDataState: NoData
+          execErrState: Error
+          for: 5m
+          annotations:
+            summary: 'storytime-api has stopped sending telemetry for 5 minutes. Most likely the container is crash-looping, OOM-killed, or the EC2 box is down. Check: curl https://api.storytimeapp.me/api/v1/health then docker ps on the instance.'
+          isPaused: false
