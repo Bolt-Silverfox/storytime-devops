@@ -2,9 +2,59 @@ apiVersion: 1
 groups:
     - orgId: 1
       name: production-1m
-      folder: Storytime
+      folder: ""
       interval: 1m
       rules:
+        - uid: afybpc0sg8ikgd
+          title: storytime-api down (no telemetry)
+          condition: C
+          data:
+            - refId: A
+              relativeTimeRange:
+                from: 600
+                to: 0
+              datasourceUid: grafanacloud-prom
+              model:
+                editorMode: code
+                expr: count(db_pool_connections_open{service_name="storytime-api"}) or vector(0)
+                instant: true
+                intervalMs: 1000
+                legendFormat: __auto
+                maxDataPoints: 43200
+                range: false
+                refId: A
+            - refId: C
+              queryType: expression
+              datasourceUid: __expr__
+              model:
+                conditions:
+                    - evaluator:
+                        params:
+                            - 1
+                        type: lt
+                      operator:
+                        type: and
+                      query:
+                        params:
+                            - C
+                      reducer:
+                        params: []
+                        type: last
+                      type: query
+                datasource:
+                    type: __expr__
+                    uid: __expr__
+                expression: A
+                intervalMs: 1000
+                maxDataPoints: 43200
+                refId: C
+                type: threshold
+          noDataState: NoData
+          execErrState: Error
+          for: 5m
+          annotations:
+            summary: 'storytime-api has stopped sending telemetry for 5 minutes. Most likely the container is crash-looping, OOM-killed, or the EC2 box is down. Check: curl https://api.storytimeapp.me/api/v1/health then docker ps on the instance.'
+          isPaused: false
         - uid: dfyo2bycclvr4c
           title: storytime-api 5xx error rate
           condition: C
@@ -88,54 +138,4 @@ groups:
           labels:
             env: production
             service: storytime-api
-          isPaused: false
-        - uid: afybpc0sg8ikgd
-          title: storytime-api down (no telemetry)
-          condition: C
-          data:
-            - refId: A
-              relativeTimeRange:
-                from: 600
-                to: 0
-              datasourceUid: grafanacloud-prom
-              model:
-                editorMode: code
-                expr: count(db_pool_connections_open{service_name="storytime-api"}) or vector(0)
-                instant: true
-                intervalMs: 1000
-                legendFormat: __auto
-                maxDataPoints: 43200
-                range: false
-                refId: A
-            - refId: C
-              queryType: expression
-              datasourceUid: __expr__
-              model:
-                conditions:
-                    - evaluator:
-                        params:
-                            - 0
-                        type: lt
-                      operator:
-                        type: and
-                      query:
-                        params:
-                            - C
-                      reducer:
-                        params: []
-                        type: last
-                      type: query
-                datasource:
-                    type: __expr__
-                    uid: __expr__
-                expression: A
-                intervalMs: 1000
-                maxDataPoints: 43200
-                refId: C
-                type: threshold
-          noDataState: NoData
-          execErrState: Error
-          for: 5m
-          annotations:
-            summary: 'storytime-api has stopped sending telemetry for 5 minutes. Most likely the container is crash-looping, OOM-killed, or the EC2 box is down. Check: curl https://api.storytimeapp.me/api/v1/health then docker ps on the instance.'
           isPaused: false
