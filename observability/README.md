@@ -60,7 +60,7 @@ root:
 
 ```bash
 curl -fsSH "Authorization: Bearer $GRAFANA_TOKEN" \
-  "$GRAFANA_URL/api/v1/provisioning/folder/f6ck4k/rule-groups/production-1m/export" \
+  "$GRAFANA_URL/api/v1/provisioning/alert-rules/export?folderUid=f6ck4k" \
   -o observability/alert-rules.yaml.new \
   && mv observability/alert-rules.yaml.new observability/alert-rules.yaml
 ```
@@ -95,6 +95,18 @@ under `groups:`. So a restore is one of:
   in the repo. Note the whole v1 provisioning CRUD surface is marked deprecated
   in favour of `/apis/rules.alerting.grafana.app/v0alpha1` (the *export* routes
   are not), so prefer Terraform over writing a converter.
+
+Use the FOLDER-scoped export above, not the group-scoped routes. Both
+`/folder/<uid>/rule-groups/<group>/export` and
+`/alert-rules/export?folderUid=<uid>&group=<group>` emit `folder: ""`, and file
+provisioning rejects an empty folder rather than treating it as the root — so a
+group-scoped export produces a file that cannot be restored. Folder-scoped is
+the only route that fills in `folder: Storytime`.
+
+The trade-off is that it exports every group in the folder. Today `Storytime`
+holds exactly one group, `production-1m`, so the two are equivalent; if a second
+group is ever added, it will appear in this file on the next re-export, which is
+visible in the diff.
 
 `X-Disable-Provenance: true` keeps the rules editable in the UI; without it they
 get provenance `api` and the UI refuses to edit them. It is not free, though:
