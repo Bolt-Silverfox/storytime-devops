@@ -97,6 +97,10 @@ under `groups:`. So a restore is one of:
   are not), so prefer Terraform over writing a converter.
 
 `X-Disable-Provenance: true` keeps the rules editable in the UI; without it they
-get provenance `api` and the UI refuses to edit them. Writes need
-`alert.provisioning:write` — the read-only token above will 403. Note also that
-Grafana refuses to mix provisioned and unprovisioned rules within one group.
+get provenance `api` and the UI refuses to edit them. It is not free, though:
+setting provenance is a separate permission, so a restore needs BOTH
+`alert.provisioning:write` and `alert.provisioning.provenance:write`. A token
+carrying only the first will fail on the header rather than on the write, which
+is a confusing way to find out. The read-only token above will 403 on either.
+Note also that Grafana refuses to mix provisioned and unprovisioned rules within
+one group.
