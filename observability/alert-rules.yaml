@@ -2,7 +2,7 @@ apiVersion: 1
 groups:
     - orgId: 1
       name: production-1m
-      folder: ""
+      folder: Storytime
       interval: 1m
       rules:
         - uid: afybpc0sg8ikgd
@@ -138,4 +138,46 @@ groups:
           labels:
             env: production
             service: storytime-api
+          isPaused: false
+        - uid: cfyts7gh51j40b
+          title: TLS certificate expiring soon
+          condition: C
+          data:
+            - refId: A
+              relativeTimeRange:
+                from: 21600
+                to: 0
+              datasourceUid: grafanacloud-prom
+              model:
+                editorMode: code
+                expr: min by (host) (tls_cert_expiry_seconds)
+                instant: true
+                intervalMs: 1000
+                maxDataPoints: 43200
+                range: false
+                refId: A
+            - refId: C
+              relativeTimeRange:
+                from: 21600
+                to: 0
+              datasourceUid: __expr__
+              model:
+                conditions:
+                    - evaluator:
+                        params:
+                            - 1.8144e+06
+                        type: lt
+                expression: A
+                intervalMs: 1000
+                maxDataPoints: 43200
+                refId: C
+                type: threshold
+          noDataState: Alerting
+          execErrState: Error
+          for: 1h
+          annotations:
+            summary: 'A TLS certificate expires in under 21 days. Caddy renews Let''s Encrypt certs at ~30 days remaining, so reaching 21 means renewal has been failing for over a week. Check: journalctl -u caddy on the instance, and that all hostnames still resolve to the Elastic IP (ACME HTTP-01 fails otherwise). Let''s Encrypt stopped sending expiry emails in 2025 - this alert is the only warning.'
+          labels:
+            env: production
+            service: storytime-tls
           isPaused: false
