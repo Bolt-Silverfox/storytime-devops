@@ -60,7 +60,7 @@ root:
 
 ```bash
 curl -fsSH "Authorization: Bearer $GRAFANA_TOKEN" \
-  "$GRAFANA_URL/api/v1/provisioning/alert-rules/export?folderUid=f6ck4k" \
+  "$GRAFANA_URL/api/v1/provisioning/folder/f6ck4k/rule-groups/production-1m/export" \
   -o observability/alert-rules.yaml.new \
   && mv observability/alert-rules.yaml.new observability/alert-rules.yaml
 ```
