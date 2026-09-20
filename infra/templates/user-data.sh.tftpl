@@ -867,8 +867,13 @@ printf '{"resourceMetrics":[{"resource":{"attributes":[{"key":"service.name","va
 # The credential goes in on stdin via -K, not on the command line: a curl argv
 # is world-readable in /proc/<pid>/cmdline for the life of the request, and
 # $AUTH is the Grafana Cloud instance id and API token.
+#
+# -sS, not -s: bare -s silences the progress meter AND the error message, so a
+# DNS, TLS, connection or timeout failure would abort the probe under `set -e`
+# with nothing in the journal to say why. -S puts the error back without
+# restoring the progress meter.
 CODE=$(printf 'header = "Authorization: Basic %s"\n' "$AUTH" \
-  | curl -K - -s --max-time 30 -o /dev/null -w '%%{http_code}' -X POST "$EP" \
+  | curl -K - -sS --max-time 30 -o /dev/null -w '%%{http_code}' -X POST "$EP" \
       -H 'Content-Type: application/json' --data-binary @"$F")
 # curl exits 0 on an HTTP 401/429, so the status code has to be checked
 # explicitly. It is necessary but not sufficient: OTLP partial success is also
