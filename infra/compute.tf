@@ -132,6 +132,27 @@ resource "aws_instance" "app" {
     backup_schedule_calendar    = var.backup_schedule_calendar
     enable_restore_verification = var.enable_restore_verification
     restore_verify_min_tables   = var.restore_verify_min_tables
+
+    # TLS expiry probe. Derived from local.routes rather than hard-coded, so a
+    # new service's hostname is probed as soon as it is enabled (local.routes
+    # covers enabled services that declare hostnames, not every service). Space
+    # separated because the systemd unit passes it through Environment=.
+    tls_probe_hosts = join(" ", local.all_hostnames)
+
+    # The live Grafana series was created with deployment.environment
+    # "production", and the alert rule that watches it has noDataState
+    # Alerting. Emitting "prod" here would start a NEW series and page on the
+    # old one, so prod keeps the exact string it already publishes.
+    tls_probe_environment = var.environment == "prod" ? "production" : var.environment
+
+    # Worst case is 15s per host (the `timeout` around openssl), plus 30s for
+    # the push (--max-time), plus three SSM reads bounded at 5s connect / 10s
+    # read with CLI retries — call the fixed part 180s. Deriving the rest from
+    # the host count means adding a service cannot silently push the run past a
+    # fixed ceiling, where systemd would kill it and the no-data alert would
+    # fire with nothing in the journal to explain why.
+    tls_probe_timeout_sec = 180 + length(local.all_hostnames) * 20
+
     containers = [
       for c in local.containers : {
         service        = c.service

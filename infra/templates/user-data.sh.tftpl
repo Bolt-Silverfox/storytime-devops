@@ -756,4 +756,175 @@ systemctl daemon-reload
 systemctl enable --now storytime-pg-verify.timer
 %{ endif ~}
 
+# ---------------------------------------------------------------------------
+# TLS certificate expiry probe.
+#
+# Reads the leaf certificate served on :443 for every public hostname this
+# stack answers for and pushes the remaining lifetime as an OTLP gauge
+# (tls_cert_expiry_seconds) to Grafana Cloud. A Grafana alert rule watches that
+# series with noDataState=Alerting, so a probe that silently stops running is
+# itself an alert rather than a blind spot.
+#
+# This lived only on the live instance until now. user_data_replace_on_change
+# means a replaced instance is a fresh box, so it has to be in the bootstrap.
+#
+# Skipped when tls_mode is "none" (that stack serves plaintext on :80 only) or
+# when no service declares a hostname — in either case the probe could do
+# nothing but fail hourly forever.
+# ---------------------------------------------------------------------------
+%{ if tls_mode != "none" && tls_probe_hosts != "" ~}
+cat > /usr/local/bin/storytime-tls-expiry <<'TLSEXPIRY'
+#!/usr/bin/env bash
+set -euo pipefail
+
+REGION="${aws_region}"
+# Grafana Cloud credentials and the OTLP endpoint live in SSM next to the rest
+# of the app config, so a rotated token needs no Terraform and no redeploy.
+# The "api" segment is where these keys actually live; it is not derived from
+# the service list, so renaming that service breaks the probe.
+P="/${prefix}/api"
+
+# mktemp -d is 0700, so nothing written inside is readable by another user, and
+# one trap covers every scratch file on every exit path. Same shape as
+# pg-backup.sh above.
+WORK=$(mktemp -d /var/tmp/tls-expiry.XXXXXX)
+trap 'rm -rf "$WORK"' EXIT
+# These three are populated outside Terraform (see docs/seed-ssm-from-envfile.md
+# — the Grafana keys come from repo-level secrets, and a seed run can omit the
+# observability keys entirely), so a missing parameter is the likeliest failure
+# on a new stack. Only the likeliest, though: AccessDenied, a KMS denial and an
+# IMDS hiccup all land here too, so report what the CLI actually said and offer
+# the hint rather than asserting it.
+#
+# The explicit CLI timeouts matter. The AWS CLI defaults to 60s connect and 60s
+# read PER ATTEMPT and retries three times, so a blackholed endpoint costs ~3
+# minutes per call — measured — and nine minutes for the three reads. That sits
+# outside TimeoutStartSec, so the unit gets SIGTERMed with nothing in the
+# journal to explain it.
+g() {
+  local out err
+  err="$WORK/ssm.err"
+  if out=$(aws ssm get-parameter --name "$P/$1" --with-decryption --region "$REGION" \
+             --cli-connect-timeout 5 --cli-read-timeout 10 \
+             --query Parameter.Value --output text 2>"$err"); then
+    printf '%s' "$out"
+    return 0
+  fi
+  # tr to spaces, not deletion: AWS CLI errors are multi-line and deleting the
+  # newlines would run the lines together into one unreadable word.
+  echo "FATAL: could not read $P/$1: $(tr '\n' ' ' < "$err")" >&2
+  echo "HINT: if this is ParameterNotFound, the stack needs the observability keys seeded" >&2
+  return 1
+}
+# $HOSTS is set by the unit's Environment= line, space separated. See the unit
+# below for why it has to be quoted there. Under `set -u` a bare $HOSTS would
+# abort with "unbound variable", which says nothing useful to someone running
+# this by hand, so say what is missing instead — and say it before spending two
+# SecureString decrypts finding out.
+: "$${HOSTS:?set HOSTS to a space-separated list of hostnames to probe}"
+
+ID=$(g GRAFANA_CLOUD_INSTANCE_ID)
+TOK=$(g GRAFANA_CLOUD_API_TOKEN)
+EP=$(g OTEL_EXPORTER_METRICS_ENDPOINT)
+AUTH=$(printf '%s:%s' "$ID" "$TOK" | base64 -w0)
+
+# One clock for the whole run: the timestamp on every point and the arithmetic
+# behind it come from T0, so a slow host cannot skew one against the other.
+T0=$(date +%s)
+NOW="$${T0}000000000"
+DP=''
+# Word splitting on $HOSTS is wanted; pathname expansion is not, and a hostname
+# is not validated for format anywhere upstream.
+set -f
+for h in $HOSTS; do
+  # `echo |` closes stdin so s_client exits instead of waiting for input, and
+  # the timeout bounds a host that accepts the TCP connection then stalls.
+  END=$(echo | timeout 15 openssl s_client -servername "$h" -connect "$h":443 2>/dev/null \
+    | openssl x509 -noout -enddate 2>/dev/null | cut -d= -f2) || true
+  # One unreachable host must not lose the readings for the others, so this
+  # warns and carries on rather than exiting.
+  [ -z "$END" ] && { echo "WARN: could not read cert for $h" >&2; continue; }
+  # `date -d` on an unparseable string exits non-zero but prints nothing, and an
+  # empty command substitution inside $(( )) evaluates to 0 rather than tripping
+  # `set -e` — which would publish a large negative gauge as if it were real.
+  END_TS=$(date -d "$END" +%s 2>/dev/null) || END_TS=''
+  [ -z "$END_TS" ] && { echo "WARN: unparseable notAfter for $h: $END" >&2; continue; }
+  S=$(( END_TS - T0 ))
+  DP="$DP{\"asDouble\":$S,\"timeUnixNano\":\"$NOW\",\"attributes\":[{\"key\":\"host\",\"value\":{\"stringValue\":\"$h\"}}]},"
+done
+
+# Every host failing is a real failure: exit non-zero so systemd records it.
+[ -z "$DP" ] && { echo 'FATAL: no certificates could be read' >&2; exit 1; }
+
+# Cleanup is the trap's job, not a line after the push: a curl transport
+# failure (DNS, TLS, timeout) makes the assignment below fail under `set -e`,
+# so an unconditional `rm` would never run. The trap also survives systemd's
+# SIGTERM; only SIGKILL skips it. The --max-time on the curl is for a separate
+# reason: it stops a hung push holding the unit in "activating" and swallowing
+# the next timer trigger.
+F="$WORK/payload.json"
+printf '{"resourceMetrics":[{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"storytime-tls"}},{"key":"deployment.environment","value":{"stringValue":"${tls_probe_environment}"}}]},"scopeMetrics":[{"metrics":[{"name":"tls_cert_expiry_seconds","unit":"s","gauge":{"dataPoints":[%s]}}]}]}]}' "$${DP%,}" > "$F"
+# The credential goes in on stdin via -K, not on the command line: a curl argv
+# is world-readable in /proc/<pid>/cmdline for the life of the request, and
+# $AUTH is the Grafana Cloud instance id and API token.
+#
+# -sS, not -s: bare -s silences the progress meter AND the error message, so a
+# DNS, TLS, connection or timeout failure would abort the probe under `set -e`
+# with nothing in the journal to say why. -S puts the error back without
+# restoring the progress meter.
+CODE=$(printf 'header = "Authorization: Basic %s"\n' "$AUTH" \
+  | curl -K - -sS --max-time 30 -o /dev/null -w '%%{http_code}' -X POST "$EP" \
+      -H 'Content-Type: application/json' --data-binary @"$F")
+# curl exits 0 on an HTTP 401/429, so the status code has to be checked
+# explicitly. It is necessary but not sufficient: OTLP partial success is also
+# a 200, with the rejected count in a body this deliberately discards.
+[ "$CODE" = 200 ] || { echo "FATAL: OTLP push returned $CODE" >&2; exit 1; }
+TLSEXPIRY
+chmod 0755 /usr/local/bin/storytime-tls-expiry
+
+# Environment= MUST be quoted as a single "NAME=value" token. Unquoted, systemd
+# unquotes the line into whitespace-separated items and treats EACH as its own
+# assignment, so the unit gets HOSTS=<first hostname> and the remaining
+# hostnames are discarded as "Invalid environment assignment". systemd emits
+# that warning when it parses the unit, which here is at `enable --now` below
+# rather than at the `daemon-reload` — and nothing downstream complains, so
+# every certificate after the first goes unprobed while the timer and the
+# dashboard both look healthy.
+cat > /etc/systemd/system/storytime-tls-expiry.service <<'UNIT'
+[Unit]
+Description=Storytime TLS certificate expiry probe
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+Environment="HOSTS=${tls_probe_hosts}"
+ExecStart=/usr/local/bin/storytime-tls-expiry
+# Derived, not a round number: the run spends up to `timeout 15` per host, up
+# to --max-time 30 on the push, and a bounded amount on three SSM reads, so a
+# hard-coded ceiling would start killing runs as soon as enough services
+# declared hostnames. The arithmetic is in compute.tf.
+TimeoutStartSec=${tls_probe_timeout_sec}
+UNIT
+
+cat > /etc/systemd/system/storytime-tls-expiry.timer <<'UNIT'
+[Unit]
+Description=Storytime TLS certificate expiry probe timer
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=1h
+# Inert here: systemd.timer(5) says Persistent= only has an effect on timers
+# configured with OnCalendar=, and this one is monotonic. Kept so that a later
+# switch to OnCalendar= catches up a missed run instead of skipping it.
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+UNIT
+
+systemctl daemon-reload
+systemctl enable --now storytime-tls-expiry.timer
+%{ endif ~}
+
 echo "=== storytime bootstrap complete: ${prefix} @ $(date -Is) ==="
