@@ -199,7 +199,11 @@ resource "aws_iam_role_policy_attachment" "dlm" {
 resource "aws_dlm_lifecycle_policy" "ebs" {
   count = var.create_instance && var.enable_ebs_snapshots ? 1 : 0
 
-  description        = "Storytime ${var.environment} — scheduled EBS snapshots (backup layer 2)"
+  # DLM restricts this field to [0-9A-Za-z _-] — no other punctuation. Both an
+  # em dash and parentheses are rejected by the AWS provider at validate/plan
+  # time (a client-side regex, so the call never reaches AWS) with "invalid
+  # value for description", which names neither the character nor the position.
+  description        = "Storytime ${var.environment} scheduled EBS snapshots backup layer 2"
   execution_role_arn = aws_iam_role.dlm[0].arn
   state              = "ENABLED"
 

@@ -101,9 +101,16 @@ resource "aws_instance" "app" {
     volume_type = "gp3"
   }
 
-  # Plain templatefile: aws_instance.user_data takes raw text and Terraform does
-  # the encoding. Do NOT base64encode here.
-  user_data = templatefile("${path.module}/templates/user-data.sh.tftpl", {
+  # GZIPPED, not plain text. EC2 caps user data at 16384 bytes AFTER decoding,
+  # and the rendered bootstrap script is 32736 bytes — a plain `user_data` also
+  # trips the provider's own length check at plan time, "expected length of
+  # user_data to be in the range (0 - 16384)". cloud-init detects and inflates
+  # gzip, so base64gzip() is the standard escape hatch: 11687 bytes gzipped
+  # (15584 chars of base64), i.e. ~4.7 KB of headroom under the cap.
+  # NOTE: `user_data_base64` has NO length validation in the provider, so if the
+  # script ever outgrows the cap it will fail at apply (RunInstances) rather
+  # than at plan. Do not switch this back to `user_data`.
+  user_data_base64 = base64gzip(templatefile("${path.module}/templates/user-data.sh.tftpl", {
     aws_region      = var.aws_region
     prefix          = local.prefix
     environment     = var.environment
@@ -164,7 +171,7 @@ resource "aws_instance" "app" {
         extra_env      = c.extra_env
       }
     ]
-  })
+  }))
 
   # A user_data change alone updates in place WITHOUT re-running it, so the
   # instance must be replaced for bootstrap changes to take effect.
