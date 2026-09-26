@@ -75,8 +75,9 @@ runs a V8 that believes it may grow past its cap and is OOM-killed before it
 ever GCs. The flags are set per service in `config_plain`, not baked into
 images, so retuning one costs an apply rather than a rebuild.
 
-Raising any allocation breaks the guard with 48 MiB spare. The move is
-`t4g.medium` (~2× the instance cost), not shaving the host reserve.
+There is 48 MiB of slack, so allocations can grow by up to that in total
+before the guard fails the plan — not "any increase breaks it". Once it does,
+the move is `t4g.medium` (~2× the instance cost), not shaving the host reserve.
 
 ## Configuration
 
@@ -136,7 +137,9 @@ Two non-obvious things, both learned the hard way:
 
 `user_data_replace_on_change = true`, so **any change to the bootstrap script
 replaces the instance** — a few minutes of downtime across all five services.
-That is intended: a user_data change alone updates in place without re-running.
+That is deliberate. Without it, Terraform would update the user data attribute
+in place and the instance would keep running the script it booted with, so a
+bootstrap change would appear to apply cleanly while changing nothing.
 
 User data is `base64gzip`-ed because EC2 caps it at 16384 bytes after decoding
 and the rendered script is ~32 KB. Note `user_data_base64` has **no** length
