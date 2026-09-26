@@ -145,12 +145,12 @@ groups:
           data:
             - refId: A
               relativeTimeRange:
-                from: 21600
+                from: 10800
                 to: 0
               datasourceUid: grafanacloud-prom
               model:
                 editorMode: code
-                expr: min by (host) (tls_cert_expiry_seconds)
+                expr: min by (host) (max_over_time(tls_cert_expiry_seconds[2h]))
                 instant: true
                 intervalMs: 1000
                 maxDataPoints: 43200
@@ -176,7 +176,7 @@ groups:
           execErrState: Error
           for: 1h
           annotations:
-            summary: 'A TLS certificate expires in under 21 days. Caddy renews Let''s Encrypt certs at ~30 days remaining, so reaching 21 means renewal has been failing for over a week. Check: journalctl -u caddy on the instance, and that all hostnames still resolve to the Elastic IP (ACME HTTP-01 fails otherwise). Let''s Encrypt stopped sending expiry emails in 2025 - this alert is the only warning.'
+            summary: 'A TLS certificate expires in under 21 days. Caddy renews Let''s Encrypt certs at ~30 days remaining, so reaching 21 means renewal has been failing for over a week. Check: journalctl -u caddy on the instance, and that every hostname still resolves to the Elastic IP (ACME HTTP-01 fails otherwise). Let''s Encrypt stopped sending expiry emails in 2025, so this alert is the only warning. NOTE: the probe (storytime-tls-expiry.timer) pushes hourly, which is longer than Prometheus'' ~5min staleness window - hence max_over_time(...[2h]). No Data here means the probe itself has stopped for over two hours, which is also worth knowing about.'
           labels:
             env: production
             service: storytime-tls
