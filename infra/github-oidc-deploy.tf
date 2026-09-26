@@ -155,7 +155,18 @@ variable "github_deploy_repos" {
   }
 
   default = {
-    "storytime_be" = { ref = "refs/heads/main", service = "api" }
+    # One entry per app repo. `ref` is the branch a production deploy runs
+    # from and is ENUMERATED, never wildcarded: `repo:Bolt-Silverfox/*` would
+    # let any branch — or a pull_request_target run — assume a role that can
+    # push a production image and reconcile the box.
+    #
+    # `service` must match a key in var.services; the role name is derived
+    # from it, which is why the validation below requires them to be distinct.
+    "storytime_be"          = { ref = "refs/heads/main", service = "api" }
+    "storytime-fe"          = { ref = "refs/heads/main", service = "web" }
+    "storytime_superadmin"  = { ref = "refs/heads/main", service = "admin" }
+    "storytime-waitlist-be" = { ref = "refs/heads/main", service = "waitlist-api" }
+    "storytime-waitlist-fe" = { ref = "refs/heads/main", service = "waitlist-web" }
   }
 }
 
