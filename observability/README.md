@@ -3,9 +3,12 @@
 Version-controlled copies of observability objects that otherwise live only in
 Grafana Cloud.
 
-Stack `dashingraccoon1269`; the snippets below need
-`GRAFANA_URL=https://dashingraccoon1269.grafana.net` exported alongside the
-token.
+**This repository is public**, so the stack is not named here — same reasoning as
+`docs/current-state.md`: pointing at the Grafana tenant that holds production
+telemetry is a targeting aid even though the hostname resolves publicly. Export
+it alongside the token, from the Grafana Cloud portal or your password manager:
+
+    export GRAFANA_URL=https://<stack>.grafana.net
 Region `prod-gb-south-1` — the AWS UK one; `prod-gb-south-0` is a separate
 GCP-hosted UK region. Folder `Storytime`, UID `f6ck4k`. Prometheus datasource UID
 `grafanacloud-prom`.

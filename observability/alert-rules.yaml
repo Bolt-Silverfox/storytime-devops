@@ -145,12 +145,12 @@ groups:
           data:
             - refId: A
               relativeTimeRange:
-                from: 21600
+                from: 10800
                 to: 0
               datasourceUid: grafanacloud-prom
               model:
                 editorMode: code
-                expr: min by (host) (tls_cert_expiry_seconds)
+                expr: min by (host) (max_over_time(tls_cert_expiry_seconds[2h]))
                 instant: true
                 intervalMs: 1000
                 maxDataPoints: 43200
@@ -176,7 +176,7 @@ groups:
           execErrState: Error
           for: 1h
           annotations:
-            summary: 'A TLS certificate expires in under 21 days. Caddy renews Let''s Encrypt certs at ~30 days remaining, so reaching 21 means renewal has been failing for over a week. Check: journalctl -u caddy on the instance, and that all hostnames still resolve to the Elastic IP (ACME HTTP-01 fails otherwise). Let''s Encrypt stopped sending expiry emails in 2025 - this alert is the only warning.'
+            summary: 'A TLS certificate expires in under 21 days. Caddy renews Let''s Encrypt certs at ~30 days remaining, so reaching 21 means renewal has been failing for over a week. Check: journalctl -u caddy on the instance, and that every hostname still resolves to the Elastic IP (ACME HTTP-01 fails otherwise). Let''s Encrypt stopped sending expiry emails in 2025, so this alert is the only warning. NO DATA does not mean any single specific thing: it means no hostname has produced a sample in 2h. That covers the storytime-tls-expiry.timer not running, every certificate read failing (openssl/DNS), and the OTLP push failing (auth or network) - check journalctl -u storytime-tls-expiry to tell them apart. The 2h window exists because the probe pushes hourly and Prometheus treats a sample as current for only ~5min; it also means the last good sample can already be ~1h old when things break, so No Data lags the actual failure by roughly one to two hours.'
           labels:
             env: production
             service: storytime-tls
