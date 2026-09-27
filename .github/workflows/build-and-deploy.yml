@@ -213,6 +213,25 @@ jobs:
           # Non-emptiness is not the contract. `build_args: FOO=bar` is
           # non-empty and still produces a misconfigured bundle, so the check
           # is for the values that actually matter.
+          #
+          # Duplicates first, for every service: Buildx keeps the LAST
+          # assignment of a repeated key, so `NEXT_PUBLIC_API_URL=https://x`
+          # followed by `NEXT_PUBLIC_API_URL=` would satisfy a per-line check
+          # and still build against the empty value. Rejecting the repeat is
+          # better than validating the winner -- a key assigned twice is a
+          # caller bug whichever way it resolves, and this way the error names
+          # the real mistake.
+          if [ -n "${BUILD_ARGS//[[:space:]]/}" ]; then
+            DUPLICATE_KEYS=$(
+              grep -oE '^[[:space:]]*[A-Za-z_][A-Za-z0-9_]*=' <<<"$BUILD_ARGS" \
+                | sed -E 's/^[[:space:]]*//; s/=$//' | sort | uniq -d | tr '\n' ' '
+            )
+            [ -z "${DUPLICATE_KEYS// /}" ] || {
+              echo "::error::build_args assigns the same key more than once: ${DUPLICATE_KEYS}(Buildx keeps the last assignment, so an earlier value is silently discarded)"
+              exit 1
+            }
+          fi
+
           case "$SERVICE" in
             web|admin|waitlist-web)
               [ -n "${BUILD_ARGS//[[:space:]]/}" ] || {
