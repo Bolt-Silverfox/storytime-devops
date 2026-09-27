@@ -35,18 +35,30 @@
 # resources have already changed — not at plan time. `shared` is also where the
 # ECR repositories these policies name actually live, so the two stay in step.
 #
-# THE INSTANCE ID IS A CROSS-WORKSPACE COUPLING — READ THIS BEFORE AN APPLY.
+# THE SSM TARGET IS SCOPED BY TAG, NOT BY INSTANCE ID.
 # The roles live in `shared`; the EC2 instance they may SendCommand to lives in
-# `prod`. There is no state link between the two, so the ID is passed in by
-# hand via `github_deploy_instance_id`. If the prod instance is ever REPLACED
-# (compute.tf replaces it on a user-data or AMI change), its ID changes and
-# every deploy then fails with AccessDenied on ssm:SendCommand until this
-# variable is updated and `shared` is re-applied. That is deliberate: an
-# explicit ID is what makes "this role can only talk to that one box" true. If
-# instance churn ever makes it painful, the alternative is the tag condition
-# gha_deploy_ssm already uses (ssm:resourceTag/Project) — which is weaker,
-# because it re-widens the grant to every instance in the project including
-# whichever environment you did not mean to deploy.
+# `prod`, and there is no state link between the two. This was previously an
+# instance ID passed in by hand, which made "this role can only talk to that
+# one box" exactly true — but compute.tf replaces the instance on any user-data
+# or AMI change, and every replacement then broke all five deploy roles with
+# AccessDenied until someone remembered to update the variable and re-apply
+# `shared`. Instance churn is routine here, so that cost is not hypothetical.
+#
+# The tag condition below is NOT the weaker `ssm:resourceTag/Project` one that
+# gha_deploy_ssm uses. Project spans environments, which is the objection that
+# kept this pinned to an ID. This requires BOTH:
+#
+#   Stack = <github_deploy_target_stack>       e.g. storytime-prod
+#   Name  = <github_deploy_target_stack>-app
+#
+# Stack is environment-specific, so a dev or staging box never matches, and
+# Name pins it to the app instance rather than any future instance in the same
+# stack. The grant is therefore "the app box of one named stack, whatever its
+# current ID" — as tight as the ID pin in practice, and it survives
+# replacement.
+#
+# Read the honesty note on SendCommandDocument below before widening this
+# further: the role can run arbitrary root commands on whatever it matches.
 # ---------------------------------------------------------------------------
 
 variable "manage_github_deploy_roles" {
@@ -65,24 +77,26 @@ variable "manage_github_deploy_roles" {
   default     = false
 }
 
-variable "github_deploy_instance_id" {
+variable "github_deploy_target_stack" {
   description = <<-EOT
-    The ONE EC2 instance the deploy roles may target with ssm:SendCommand,
-    e.g. "i-07cce36e829161c03". Required when manage_github_deploy_roles is on.
+    The `Stack` tag of the environment a deploy may reconcile, e.g.
+    "storytime-prod". The SSM grant matches by tag, so a replaced instance does
+    not break every deploy role the way a pinned instance ID did.
 
-    This is the prod instance ID, and `shared` has no state link to the `prod`
-    workspace that creates it — see the header note. Re-apply `shared` whenever
-    the instance is replaced, or deploys start failing with AccessDenied.
+    This is a CROSS-WORKSPACE value. These roles are created in `shared`, where
+    local.prefix is the shared stack — so it cannot be derived and must name the
+    target environment's stack explicitly.
+
+    Scoped deliberately narrow: the policy requires Stack AND Name, so it
+    matches one environment's app instance and not, say, a dev box that happens
+    to carry the same Project tag.
   EOT
   type        = string
   default     = ""
 
   validation {
-    # A blank or malformed ID would produce an ARN like `.../instance/` — which
-    # IAM accepts as a literal and then matches nothing, so every deploy would
-    # fail with an AccessDenied that looks like a policy bug rather than a typo.
-    condition     = var.github_deploy_instance_id == "" || can(regex("^i-[0-9a-f]{8,32}$", var.github_deploy_instance_id))
-    error_message = "github_deploy_instance_id must look like i-0123456789abcdef0."
+    condition     = var.github_deploy_target_stack == "" || can(regex("^[a-z0-9][a-z0-9-]{0,62}$", var.github_deploy_target_stack))
+    error_message = "github_deploy_target_stack must be a tag-safe lowercase name, e.g. storytime-prod."
   }
 }
 
@@ -219,8 +233,8 @@ resource "terraform_data" "github_deploy_guards" {
     }
 
     precondition {
-      condition     = var.github_deploy_instance_id != ""
-      error_message = "github_deploy_instance_id must be set when manage_github_deploy_roles is true; otherwise the SSM grant matches no instance and every deploy fails with AccessDenied."
+      condition     = var.github_deploy_target_stack != ""
+      error_message = "github_deploy_target_stack must be set when manage_github_deploy_roles is true; otherwise the SSM grant matches no instance and every deploy fails with AccessDenied."
     }
   }
 }
@@ -274,7 +288,7 @@ data "aws_iam_policy_document" "gha_deploy_pipeline_assume" {
 resource "aws_iam_role" "gha_deploy_pipeline" {
   for_each           = local.deploy_repos
   name               = "${var.name_prefix}-gha-deploy-${each.value.service}"
-  description        = "Builds ${each.key} and pushes ${var.ecr_repository_prefix}/${each.value.service}, then reconciles ${var.github_deploy_instance_id}."
+  description        = "Builds ${each.key} and pushes ${var.ecr_repository_prefix}/${each.value.service}, then reconciles the app instance of ${var.github_deploy_target_stack}."
   assume_role_policy = data.aws_iam_policy_document.gha_deploy_pipeline_assume[each.key].json
 
   # A build-and-deploy run is a build, a push, and a reconcile poll. On the
@@ -332,13 +346,27 @@ data "aws_iam_policy_document" "gha_deploy_pipeline" {
     resources = [local.deploy_ecr_repo_arns[each.key]]
   }
 
-  # Trigger the reconcile. Pinned to ONE instance, not the project tag: a tag
-  # condition would let the api repo's pipeline redeploy every environment's
-  # box, which is the scope mistake gha_deploy_ssm makes.
+  # Trigger the reconcile. Scoped by TAG rather than by instance ID, so an
+  # instance replacement does not break every deploy role — see the note at the
+  # top of this file. Both conditions are required: Stack keeps this inside one
+  # environment (the objection to gha_deploy_ssm's Project-only condition), and
+  # Name pins it to the app instance rather than anything else in that stack.
   statement {
-    sid       = "SendCommandToOneInstance"
+    sid       = "SendCommandToStackAppInstance"
     actions   = ["ssm:SendCommand"]
-    resources = ["arn:aws:ec2:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:instance/${var.github_deploy_instance_id}"]
+    resources = ["arn:aws:ec2:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:instance/*"]
+
+    condition {
+      test     = "StringEquals"
+      variable = "ssm:resourceTag/Stack"
+      values   = [var.github_deploy_target_stack]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "ssm:resourceTag/Name"
+      values   = ["${var.github_deploy_target_stack}-app"]
+    }
   }
 
   # SendCommand authorises the DOCUMENT as well as the target, so both ARNs are
