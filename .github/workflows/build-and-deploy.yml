@@ -108,6 +108,25 @@ on:
         required: false
         type: string
         default: '.'
+      build_args:
+        description: >-
+          Newline-separated KEY=VALUE pairs passed to the image build.
+
+          REQUIRED for the Next.js services (web, admin, waitlist-web). Next
+          inlines NEXT_PUBLIC_* into the JavaScript bundle at BUILD time, so
+          they cannot be supplied as runtime env the way every other setting
+          here is: an image built without them is wrong, not unconfigured, and
+          waitlist-web's Dockerfile fails the build outright rather than
+          shipping a broken bundle.
+
+          PUBLIC VALUES ONLY. Build args are readable in `docker history` and
+          in this workflow's logs. That is acceptable for NEXT_PUBLIC_* because
+          those values are already served to every browser that loads the site
+          — it is what the prefix means. Anything genuinely secret must not be
+          passed here; it belongs in SSM and is read at runtime.
+        required: false
+        type: string
+        default: ''
       ecr_repository_prefix:
         description: >-
           Namespace of the ECR repository: <prefix>/<service>. MUST match
@@ -302,6 +321,9 @@ jobs:
           context: ${{ inputs.build_context }}
           file: ${{ inputs.dockerfile }}
           platforms: linux/arm64
+          # Empty string is fine: the action treats a blank build-args as none,
+          # so services that need no build-time configuration are unaffected.
+          build-args: ${{ inputs.build_args }}
           provenance: false
           push: true
           tags: |
