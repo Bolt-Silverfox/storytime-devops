@@ -131,9 +131,20 @@ variable "github_deploy_repos" {
     not the format, so read the `sub` out of a failing run's token claims
     instead of trusting a settings lookup.)
 
-    Deliberately starts with storytime_be ONLY. The chain gets proven end to
-    end for one service before the other four are added — a broken deploy role
-    that lands for five repos at once is five outages, not one.
+    All five services are enumerated. This widened a deliberate
+    storytime_be-only default, so the reasoning for changing it: creating a
+    role is not deploying with it. These roles are inert until a caller
+    workflow assumes one, every caller is `workflow_dispatch` only, and a
+    deploy is therefore always a human running one service at a time. The
+    original concern — "a broken deploy role that lands for five repos at once
+    is five outages, not one" — is about deploys, and nothing here causes one.
+
+    The intent behind it still holds, though, and is now an operational rule
+    rather than a Terraform one: PROVE THE CHAIN ON `api` FIRST. Dispatch one
+    api deploy, confirm the image reached ECR and the box reconciled onto the
+    new digest, and only then dispatch the other four. If the trust policy or
+    the OIDC subject format is wrong, that surfaces on the first dispatch and
+    costs one service, not five.
   EOT
   type = map(object({
     ref     = string
@@ -155,7 +166,18 @@ variable "github_deploy_repos" {
   }
 
   default = {
-    "storytime_be" = { ref = "refs/heads/main", service = "api" }
+    # One entry per app repo. `ref` is the branch a production deploy runs
+    # from and is ENUMERATED, never wildcarded: `repo:Bolt-Silverfox/*` would
+    # let any branch — or a pull_request_target run — assume a role that can
+    # push a production image and reconcile the box.
+    #
+    # `service` must match a key in var.services; the role name is derived
+    # from it, which is why the validation below requires them to be distinct.
+    "storytime_be"          = { ref = "refs/heads/main", service = "api" }
+    "storytime-fe"          = { ref = "refs/heads/main", service = "web" }
+    "storytime_superadmin"  = { ref = "refs/heads/main", service = "admin" }
+    "storytime-waitlist-be" = { ref = "refs/heads/main", service = "waitlist-api" }
+    "storytime-waitlist-fe" = { ref = "refs/heads/main", service = "waitlist-web" }
   }
 }
 
