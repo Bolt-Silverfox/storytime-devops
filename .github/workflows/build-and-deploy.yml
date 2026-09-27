@@ -209,12 +209,33 @@ jobs:
           # The list is hard-coded deliberately. Deriving it from a caller
           # input would let the caller most likely to get this wrong opt out of
           # the check. Adding a Next.js service means adding it here.
+          #
+          # Non-emptiness is not the contract. `build_args: FOO=bar` is
+          # non-empty and still produces a misconfigured bundle, so the check
+          # is for the values that actually matter.
           case "$SERVICE" in
             web|admin|waitlist-web)
               [ -n "${BUILD_ARGS//[[:space:]]/}" ] || {
                 echo "::error::$SERVICE needs build_args (NEXT_PUBLIC_* are inlined at build time; an image built without them is misconfigured, not unconfigured)"
                 exit 1
               }
+              grep -qE '^[[:space:]]*NEXT_PUBLIC_[A-Z0-9_]+=' <<<"$BUILD_ARGS" || {
+                echo "::error::$SERVICE build_args contains no NEXT_PUBLIC_* assignment; those are what Next inlines at build time"
+                exit 1
+              }
+              # web is singled out because it is the only one that fails
+              # QUIETLY. admin and waitlist-web abort their own builds when
+              # their values are missing; web falls back to a default API
+              # origin and ships a bundle that looks healthy and 404s every
+              # request. Naming the key couples this workflow to the app, which
+              # is the price of catching the silent case here rather than in
+              # production.
+              if [ "$SERVICE" = web ]; then
+                grep -qE '^[[:space:]]*NEXT_PUBLIC_API_URL=[^[:space:]]' <<<"$BUILD_ARGS" || {
+                  echo "::error::web build_args must set NEXT_PUBLIC_API_URL; without it the bundle silently falls back to a default API origin"
+                  exit 1
+                }
+              fi
               ;;
           esac
           case "$ENVIRONMENT" in
