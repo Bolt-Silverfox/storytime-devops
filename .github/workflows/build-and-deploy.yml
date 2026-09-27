@@ -193,10 +193,30 @@ jobs:
           ECR_PREFIX: ${{ inputs.ecr_repository_prefix }}
           DOCKERFILE: ${{ inputs.dockerfile }}
           BUILD_CONTEXT: ${{ inputs.build_context }}
+          BUILD_ARGS: ${{ inputs.build_args }}
         run: |
           set -euo pipefail
           [[ "$SERVICE" =~ ^[a-z0-9][a-z0-9-]{0,39}$ ]] \
             || { echo "::error::service must be lowercase alphanumeric/dash"; exit 1; }
+          # The Next.js services inline NEXT_PUBLIC_* at BUILD time, so an
+          # image built without them is WRONG rather than unconfigured. admin
+          # and waitlist-web fail their own builds when the values are absent;
+          # web does not — it falls back to a default API origin and produces a
+          # bundle that looks healthy and 404s every request once a user hits
+          # one. That silent case is why this is checked here rather than left
+          # to each Dockerfile.
+          #
+          # The list is hard-coded deliberately. Deriving it from a caller
+          # input would let the caller most likely to get this wrong opt out of
+          # the check. Adding a Next.js service means adding it here.
+          case "$SERVICE" in
+            web|admin|waitlist-web)
+              [ -n "${BUILD_ARGS//[[:space:]]/}" ] || {
+                echo "::error::$SERVICE needs build_args (NEXT_PUBLIC_* are inlined at build time; an image built without them is misconfigured, not unconfigured)"
+                exit 1
+              }
+              ;;
+          esac
           case "$ENVIRONMENT" in
             dev|staging|blue|prod) ;;
             *) echo "::error::environment must be one of dev staging blue prod"; exit 1 ;;
