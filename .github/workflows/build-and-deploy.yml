@@ -108,6 +108,25 @@ on:
         required: false
         type: string
         default: '.'
+      build_args:
+        description: >-
+          Newline-separated KEY=VALUE pairs passed to the image build.
+
+          REQUIRED for the Next.js services (web, admin, waitlist-web). Next
+          inlines NEXT_PUBLIC_* into the JavaScript bundle at BUILD time, so
+          they cannot be supplied as runtime env the way every other setting
+          here is: an image built without them is wrong, not unconfigured, and
+          waitlist-web's Dockerfile fails the build outright rather than
+          shipping a broken bundle.
+
+          PUBLIC VALUES ONLY. Build args are readable in `docker history` and
+          in this workflow's logs. That is acceptable for NEXT_PUBLIC_* because
+          those values are already served to every browser that loads the site
+          — it is what the prefix means. Anything genuinely secret must not be
+          passed here; it belongs in SSM and is read at runtime.
+        required: false
+        type: string
+        default: ''
       ecr_repository_prefix:
         description: >-
           Namespace of the ECR repository: <prefix>/<service>. MUST match
@@ -174,10 +193,70 @@ jobs:
           ECR_PREFIX: ${{ inputs.ecr_repository_prefix }}
           DOCKERFILE: ${{ inputs.dockerfile }}
           BUILD_CONTEXT: ${{ inputs.build_context }}
+          BUILD_ARGS: ${{ inputs.build_args }}
         run: |
           set -euo pipefail
           [[ "$SERVICE" =~ ^[a-z0-9][a-z0-9-]{0,39}$ ]] \
             || { echo "::error::service must be lowercase alphanumeric/dash"; exit 1; }
+          # The Next.js services inline NEXT_PUBLIC_* at BUILD time, so an
+          # image built without them is WRONG rather than unconfigured. admin
+          # and waitlist-web fail their own builds when the values are absent;
+          # web does not — it falls back to a default API origin and produces a
+          # bundle that looks healthy and 404s every request once a user hits
+          # one. That silent case is why this is checked here rather than left
+          # to each Dockerfile.
+          #
+          # The list is hard-coded deliberately. Deriving it from a caller
+          # input would let the caller most likely to get this wrong opt out of
+          # the check. Adding a Next.js service means adding it here.
+          #
+          # Non-emptiness is not the contract. `build_args: FOO=bar` is
+          # non-empty and still produces a misconfigured bundle, so the check
+          # is for the values that actually matter.
+          #
+          # Duplicates first, for every service: Buildx keeps the LAST
+          # assignment of a repeated key, so `NEXT_PUBLIC_API_URL=https://x`
+          # followed by `NEXT_PUBLIC_API_URL=` would satisfy a per-line check
+          # and still build against the empty value. Rejecting the repeat is
+          # better than validating the winner -- a key assigned twice is a
+          # caller bug whichever way it resolves, and this way the error names
+          # the real mistake.
+          if [ -n "${BUILD_ARGS//[[:space:]]/}" ]; then
+            DUPLICATE_KEYS=$(
+              grep -oE '^[[:space:]]*[A-Za-z_][A-Za-z0-9_]*=' <<<"$BUILD_ARGS" \
+                | sed -E 's/^[[:space:]]*//; s/=$//' | sort | uniq -d | tr '\n' ' '
+            )
+            [ -z "${DUPLICATE_KEYS// /}" ] || {
+              echo "::error::build_args assigns the same key more than once: ${DUPLICATE_KEYS}(Buildx keeps the last assignment, so an earlier value is silently discarded)"
+              exit 1
+            }
+          fi
+
+          case "$SERVICE" in
+            web|admin|waitlist-web)
+              [ -n "${BUILD_ARGS//[[:space:]]/}" ] || {
+                echo "::error::$SERVICE needs build_args (NEXT_PUBLIC_* are inlined at build time; an image built without them is misconfigured, not unconfigured)"
+                exit 1
+              }
+              grep -qE '^[[:space:]]*NEXT_PUBLIC_[A-Z0-9_]+=' <<<"$BUILD_ARGS" || {
+                echo "::error::$SERVICE build_args contains no NEXT_PUBLIC_* assignment; those are what Next inlines at build time"
+                exit 1
+              }
+              # web is singled out because it is the only one that fails
+              # QUIETLY. admin and waitlist-web abort their own builds when
+              # their values are missing; web falls back to a default API
+              # origin and ships a bundle that looks healthy and 404s every
+              # request. Naming the key couples this workflow to the app, which
+              # is the price of catching the silent case here rather than in
+              # production.
+              if [ "$SERVICE" = web ]; then
+                grep -qE '^[[:space:]]*NEXT_PUBLIC_API_URL=[^[:space:]]' <<<"$BUILD_ARGS" || {
+                  echo "::error::web build_args must set NEXT_PUBLIC_API_URL; without it the bundle silently falls back to a default API origin"
+                  exit 1
+                }
+              fi
+              ;;
+          esac
           case "$ENVIRONMENT" in
             dev|staging|blue|prod) ;;
             *) echo "::error::environment must be one of dev staging blue prod"; exit 1 ;;
@@ -302,6 +381,9 @@ jobs:
           context: ${{ inputs.build_context }}
           file: ${{ inputs.dockerfile }}
           platforms: linux/arm64
+          # Empty string is fine: the action treats a blank build-args as none,
+          # so services that need no build-time configuration are unaffected.
+          build-args: ${{ inputs.build_args }}
           provenance: false
           push: true
           tags: |
