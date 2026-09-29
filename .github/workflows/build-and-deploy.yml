@@ -222,12 +222,53 @@ jobs:
           # caller bug whichever way it resolves, and this way the error names
           # the real mistake.
           if [ -n "${BUILD_ARGS//[[:space:]]/}" ]; then
-            DUPLICATE_KEYS=$(
+            # `|| true` IS LOAD-BEARING, not defensive habit. grep exits 1 when
+            # nothing matches; under `set -o pipefail` that becomes the
+            # pipeline's status, and `set -e` then kills the step HERE --
+            # before any of the checks below can print their message. The
+            # inputs that match no assignment line are exactly the ones the
+            # errors below are written for (`FOO`, `# comment`, `SOME-KEY=1`),
+            # so without this the caller gets "exit code 1" and no annotation.
+            # It was also a false failure for the API services, which have no
+            # build-arg contract at all.
+            BUILD_ARG_KEYS=$(
               grep -oE '^[[:space:]]*[A-Za-z_][A-Za-z0-9_]*=' <<<"$BUILD_ARGS" \
-                | sed -E 's/^[[:space:]]*//; s/=$//' | sort | uniq -d | tr '\n' ' '
+                | sed -E 's/^[[:space:]]*//; s/=$//' || true
             )
+
+            DUPLICATE_KEYS=$(sort <<<"$BUILD_ARG_KEYS" | uniq -d | tr '\n' ' ')
             [ -z "${DUPLICATE_KEYS// /}" ] || {
               echo "::error::build_args assigns the same key more than once: ${DUPLICATE_KEYS}(Buildx keeps the last assignment, so an earlier value is silently discarded)"
+              exit 1
+            }
+
+            # ALLOWLIST, not a denylist. BuildKit reads several build args as
+            # control knobs rather than application config, and this pipeline
+            # holds ECR push credentials while it builds: BUILDKIT_SYNTAX
+            # replaces the Dockerfile frontend with an arbitrary image (code
+            # execution inside a build that can push to ECR and write the
+            # shared cache), http_proxy/https_proxy route every fetch in the
+            # build through a chosen host, and BUILDKIT_CACHE_MOUNT_NS can
+            # collide with another service's cache. Callers need repo write,
+            # so this is defence in depth -- but the role_arn account pinning
+            # above is written to exactly that standard, and leaving the key
+            # space open is inconsistent with it.
+            #
+            # It also makes "PUBLIC VALUES ONLY" real rather than advisory:
+            # the runner echoes the full build command, so a SECRET_TOKEN=...
+            # passed here would sit unmasked in a log any repo reader can see,
+            # and in the image config in ECR.
+            #
+            # NEXT_PUBLIC_* covers every ARG the three Next.js Dockerfiles
+            # declare. NODE_VERSION/PNPM_VERSION/ALPINE_VERSION are the
+            # toolchain pins the Dockerfiles also declare; they are harmless to
+            # set and occasionally useful. Add to this list deliberately.
+            DISALLOWED_KEYS=$(
+              grep -vE '^(NEXT_PUBLIC_[A-Za-z0-9_]+|NODE_VERSION|PNPM_VERSION|ALPINE_VERSION)$' \
+                <<<"$BUILD_ARG_KEYS" | grep -v '^$' | tr '\n' ' ' || true
+            )
+            [ -z "${DISALLOWED_KEYS// /}" ] || {
+              echo "::error::build_args contains keys that are not allowed: ${DISALLOWED_KEYS}(only NEXT_PUBLIC_*, NODE_VERSION, PNPM_VERSION and ALPINE_VERSION may be set; build args are echoed in logs and recorded in the image, and BuildKit treats some keys as build controls)"
               exit 1
             }
           fi
