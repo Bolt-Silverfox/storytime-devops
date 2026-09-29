@@ -236,6 +236,23 @@ jobs:
                 | sed -E 's/^[[:space:]]*//; s/=$//' || true
             )
 
+            # A non-blank build_args that yields NO keys is malformed, and
+            # silently forwarding it is worse than it looks. Buildx reads a
+            # bare `FOO` as inherit-from-environment, and the action passes no
+            # csv comment option, so `# a note` becomes a literal build arg
+            # named `#`. Neither is the documented KEY=VALUE contract.
+            #
+            # It is also an ALLOWLIST BYPASS: the disallowed-key check below
+            # works off BUILD_ARG_KEYS, so an input that extracts no keys
+            # passes it unexamined. `BUILDKIT_SYNTAX` written bare would reach
+            # Buildx without being rejected by name. Harmless only because the
+            # build step's environment does not define it -- which is a
+            # property of the runner, not a check we make.
+            [ -n "$BUILD_ARG_KEYS" ] || {
+              echo "::error::build_args has no KEY=VALUE assignment; it must be newline-separated KEY=VALUE pairs (a bare key means inherit-from-environment to Buildx and is not supported here)"
+              exit 1
+            }
+
             DUPLICATE_KEYS=$(sort <<<"$BUILD_ARG_KEYS" | uniq -d | tr '\n' ' ')
             [ -z "${DUPLICATE_KEYS// /}" ] || {
               echo "::error::build_args assigns the same key more than once: ${DUPLICATE_KEYS}(Buildx keeps the last assignment, so an earlier value is silently discarded)"
