@@ -341,7 +341,7 @@ permissions:
 
 jobs:
   deploy:
-    uses: Bolt-Silverfox/storytime-devops/.github/workflows/build-and-deploy.yml@main
+    uses: Bolt-Silverfox/storytime-devops/.github/workflows/build-and-deploy.yml@e8e832285ca78d3c49bd54142d9b5aa4fc1ad0b0
     with:
       service: api
       environment: prod
@@ -350,9 +350,28 @@ jobs:
       aws_region: eu-west-1
 ```
 
-`@main` must match `github_deploy_workflow_ref` in the Terraform exactly
-(`...build-and-deploy.yml@refs/heads/main`), or the `job_workflow_ref` condition
-rejects the assume-role.
+The ref is PINNED TO AN IMMUTABLE COMMIT, not `@main`. On a branch ref, anyone
+who can push this repo's `main` can change privileged deploy code — code that
+holds ECR push credentials and issues SSM commands to the production box —
+without a change landing in any app repo.
+
+**The SHA above is not decoration: it must equal `github_deploy_workflow_ref`
+in `infra/github-oidc-deploy.tf` byte for byte**, because `job_workflow_ref` is
+matched with `StringEquals` and the claim is whatever this `uses:` line says,
+verbatim. That variable is the source of truth — copy the value from there
+rather than from this page, which can only ever be a snapshot.
+
+A mismatch on either side fails **every** deploy at assume-role with
+`AccessDenied`, and it surfaces at run time, not at plan. So changing the
+pipeline is a sequence, not an edit:
+
+1. merge the change here
+2. `terraform apply` the new SHA into `github_deploy_workflow_ref`
+3. bump the `uses:` line in all five caller repos
+4. update the example above
+
+There is no partial state that works. If you are mid-sequence, deploys are
+down.
 
 `permissions:` must be declared on the **calling** job as well. A reusable
 workflow cannot grant itself more than the caller gave it, so without
