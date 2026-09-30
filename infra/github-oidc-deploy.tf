@@ -198,11 +198,24 @@ variable "github_deploy_repos" {
 variable "github_deploy_workflow_ref" {
   description = <<-EOT
     The exact reusable workflow permitted to assume a deploy role, as the OIDC
-    `job_workflow_ref` claim spells it. Callers must reference this same ref
-    (`...@main`) or the assume-role fails.
+    `job_workflow_ref` claim spells it. Every caller's `uses:` line must match
+    this string VERBATIM or the assume-role fails with AccessDenied.
+
+    PINNED TO AN IMMUTABLE COMMIT rather than `@refs/heads/main`. On a branch
+    ref, anyone who can push storytime-devops' main can change privileged
+    deploy code -- code that holds ECR push credentials and issues SSM
+    commands to the production box -- without a change landing in any app
+    repo. The branch-aligned policy stopped a caller from silently retargeting
+    `uses:`; it did not stop the workflow itself from changing underneath it.
+
+    THE COST IS A LOCKSTEP UPDATE, and it is a six-file change every time the
+    pipeline changes: merge in storytime-devops, apply this variable, then bump
+    the `uses:` line in all five caller repos. There is no partial state that
+    works -- a mismatch on either side fails every deploy at assume-role, not
+    at plan.
   EOT
   type        = string
-  default     = "Bolt-Silverfox/storytime-devops/.github/workflows/build-and-deploy.yml@refs/heads/main"
+  default     = "Bolt-Silverfox/storytime-devops/.github/workflows/build-and-deploy.yml@e8e832285ca78d3c49bd54142d9b5aa4fc1ad0b0"
 }
 
 locals {
