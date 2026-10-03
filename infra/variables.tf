@@ -824,25 +824,58 @@ variable "allow_plaintext_origin" {
 # CI / OIDC
 # ---------------------------------------------------------------------------
 
-variable "manage_github_oidc" {
+variable "manage_github_oidc_provider" {
   description = <<-EOT
-    Create the account-global GitHub OIDC provider and the CI deploy role.
+    Create the account-global GitHub OIDC provider
+    (token.actions.githubusercontent.com).
 
-    Defaults to FALSE and MUST STAY FALSE for account 772316781095. That account
-    already has a GitHub OIDC provider for token.actions.githubusercontent.com,
-    created by the FateRound stack; AWS permits exactly one provider per URL per
-    account, so creating a second one fails the apply outright.
+    SPLIT OUT of manage_github_oidc, which used to gate this AND the legacy CI
+    deploy role together. That coupling made the provider impossible to own
+    without also creating a role that trusts development branches — see the
+    note on manage_github_oidc below.
 
-    The consequence is a real gap, stated plainly: CI has no deploy role from
-    this stack. Closing it means REUSING the existing provider — reference its
-    ARN and attach a Storytime-specific role to it — not creating another.
-    Confirm what exists with `aws iam list-open-id-connect-providers`.
+    AWS permits exactly one provider per URL per account, so exactly one
+    configuration may own it. In account 772316781095 the `shared` workspace
+    does. Confirm what exists with `aws iam list-open-id-connect-providers`
+    before changing this: it returning empty does NOT mean no one else declares
+    it, only that nobody currently has it created.
 
-    Only set it true in an account that has no such provider at all. Note it also
-    gates the CI deploy role, so both appear together.
+    Setting this back to false DESTROYS the provider, which instantly breaks
+    every OIDC role in the account — including other projects' roles, since a
+    trust policy may name a provider ARN that no longer exists and fails only at
+    assume time. That is not a theoretical risk: it happened on 2026-09-29.
   EOT
   type        = bool
   default     = false
+}
+
+variable "manage_github_oidc" {
+  description = <<-EOT
+    Create the LEGACY single CI deploy role (`<prefix>-gha-deploy`). No longer
+    gates the OIDC provider — that is manage_github_oidc_provider.
+
+    LEAVE THIS FALSE unless you have read what the role trusts. Its assume-role
+    policy is var.github_deploy_subjects, which lists DEVELOPMENT branches
+    (develop-v1.2.0, develop-v1.3.0, dev, develop) alongside main, and the role
+    carries ecr:PutImage and ssm:SendCommand. Enabling it lets a dev branch push
+    a production image and reconcile the production box.
+
+    It is superseded by the five per-service roles in github-oidc-deploy.tf
+    (manage_github_deploy_roles), each pinned to `refs/heads/main`, to one
+    service's ECR repository, and to the reusable workflow at an exact commit.
+    Prefer those. This variable exists for a single-repo account that genuinely
+    wants one broad role; Storytime is not that.
+
+    Requires manage_github_oidc_provider, because the role's assume-role policy
+    references aws_iam_openid_connect_provider.github[0].
+  EOT
+  type        = bool
+  default     = false
+
+  validation {
+    condition     = !var.manage_github_oidc || var.manage_github_oidc_provider
+    error_message = "manage_github_oidc requires manage_github_oidc_provider: the legacy deploy role's assume-role policy references aws_iam_openid_connect_provider.github[0], which does not exist when the provider is not managed here."
+  }
 }
 
 variable "github_deploy_subjects" {

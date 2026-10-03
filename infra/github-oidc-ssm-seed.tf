@@ -10,13 +10,20 @@
 # person — read them and write them straight across.
 #
 # WHY IT IS NOT THE gha_deploy ROLE
-# gha_deploy lives in github-oidc.tf behind `manage_github_oidc`, which MUST
-# STAY FALSE for account 772316781095: the FateRound stack already created an
-# OIDC provider for token.actions.githubusercontent.com there, AWS allows
-# exactly one per URL per account, and a second one fails the apply. This file
-# takes the workaround that github-oidc.tf documents — it looks the existing
-# provider up as a DATA source and reuses its ARN — so it can be enabled on its
-# own without flipping that flag.
+# gha_deploy lives in github-oidc.tf behind `manage_github_oidc` and should stay
+# off: its assume-role policy trusts var.github_deploy_subjects, which includes
+# DEVELOPMENT branches, while carrying ecr:PutImage and ssm:SendCommand. A role
+# that lets a dev branch push a production image is not the one to seed
+# production configuration with. The roles here are one per repo, write-only,
+# and pinned to a single `service` path segment.
+#
+# This file does not care who owns the OIDC provider. It reads
+# local.github_oidc_provider_arn, which resolves to the provider this stack
+# manages (manage_github_oidc_provider) or to the data source lookup when it
+# does not. AWS permits exactly one provider per URL per account, so exactly one
+# configuration may own it — in account 772316781095 the `shared` workspace now
+# does, after FateRound's Terraform created it on 2026-09-19 and deleted it on
+# 2026-09-29.
 #
 # WHY IT CANNOT READ
 # The policy grants ssm:PutParameter and nothing else. No GetParameter, no
@@ -34,9 +41,10 @@ variable "manage_github_ssm_seed_role" {
     secrets. Account-global — set this true in the `shared` workspace ONLY, or
     four workspaces will fight over one role name.
 
-    Unlike `manage_github_oidc`, this is safe to turn on in account
-    772316781095: it consumes the existing OIDC provider rather than creating a
-    second one.
+    Unlike `manage_github_oidc`, this is safe to turn on: it consumes a provider
+    ARN (local.github_oidc_provider_arn) rather than creating one, and the roles
+    it makes are write-only and pinned to one `service` path each — not the
+    broad, dev-branch-trusting gha_deploy role that flag creates.
   EOT
   type        = bool
   default     = false
@@ -94,15 +102,46 @@ variable "github_ssm_seed_workflow_ref" {
   default     = "Bolt-Silverfox/storytime-devops/.github/workflows/seed-ssm-from-envfile.yml@refs/heads/main"
 }
 
-# The provider this stack does NOT manage. Data source, not a resource: if it is
-# missing the plan fails loudly rather than silently creating a duplicate.
+# The provider, when this stack does NOT manage it. Data source, not a resource:
+# if it is missing the plan fails loudly rather than silently creating a
+# duplicate.
 #
-# Shared with the deploy-pipeline roles in github-oidc-deploy.tf, which consume
-# the same provider — hence the count covers BOTH flags. It stays here rather
-# than moving to a neutral file so the existing state address is unchanged.
+# ONLY WHEN NOT MANAGED HERE — note the `!var.manage_github_oidc_provider`. A
+# data source with a fixed URL does not reference
+# aws_iam_openid_connect_provider.github, so Terraform may read it during
+# PLANNING, before that resource exists. Previously that made the first plan of
+# a stack that managed the provider AND any role fail with "finding IAM OIDC
+# Provider by url: not found" — the provider could never be created in the same
+# apply as its consumers, and the only way through was
+# `-target=aws_iam_openid_connect_provider.github[0]` followed by a second
+# apply. That is how this provider was in fact bootstrapped on 2026-10-02.
+#
+# Consumers now read local.github_oidc_provider_arn, which selects the managed
+# resource when we own it and this data source when we do not. Referencing the
+# resource creates the dependency the fixed-URL lookup could not express.
+#
+# It stays in this file so the existing state address is unchanged.
 data "aws_iam_openid_connect_provider" "github_existing" {
-  count = var.manage_github_ssm_seed_role || var.manage_github_deploy_roles ? 1 : 0
+  count = (var.manage_github_ssm_seed_role || var.manage_github_deploy_roles) && !var.manage_github_oidc_provider ? 1 : 0
   url   = "https://token.actions.githubusercontent.com"
+}
+
+locals {
+  # One provider ARN for every role in this stack, from whichever of the two
+  # sources is live. Both cannot be: the data source's count excludes the
+  # managed case above.
+  #
+  # `one()`, NOT `[0]`. A local is evaluated even where nothing references it,
+  # so in a workspace that owns neither the provider nor any role — `prod`, which
+  # has both flags off — `[0]` fails the whole plan with "Invalid index: the
+  # collection has no elements", and it fails on an unrelated plan that was only
+  # ever going to touch the instance. `one()` returns null on an empty
+  # collection, so the value is simply unused, which is the truth of that case.
+  github_oidc_provider_arn = var.manage_github_oidc_provider ? (
+    one(aws_iam_openid_connect_provider.github[*].arn)
+    ) : (
+    one(data.aws_iam_openid_connect_provider.github_existing[*].arn)
+  )
 }
 
 locals {
@@ -122,7 +161,7 @@ data "aws_iam_policy_document" "gha_ssm_seed_assume" {
 
     principals {
       type        = "Federated"
-      identifiers = [data.aws_iam_openid_connect_provider.github_existing[0].arn]
+      identifiers = [local.github_oidc_provider_arn]
     }
 
     condition {
