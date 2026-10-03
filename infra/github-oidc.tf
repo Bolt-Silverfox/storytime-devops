@@ -5,26 +5,39 @@
 # Both the OIDC provider and the deploy role are account-global, so they belong to
 # the `shared` workspace.
 #
-# BUT: NONE OF IT IS CREATED IN THE ACCOUNT THIS STACK ACTUALLY TARGETS.
-# manage_github_oidc defaults to false and must stay false for account
-# 772316781095 — the FateRound stack already created an OIDC provider for
-# token.actions.githubusercontent.com there, AWS allows exactly one per URL per
-# account, and a second one fails the apply. That account is shared with the
-# FateRound application and a third-party `Portfolio-Server`; this stack does not
-# get to assume it owns account-global identity resources.
+# TWO SEPARATE SWITCHES, deliberately, and they used to be one.
 #
-# To give Storytime CI a role, REUSE the existing provider: reference its ARN in
-# the assume-role policy instead of aws_iam_openid_connect_provider.github[0].
-# The resources below stay for the case of a dedicated account with no provider
-# of its own.
+#   manage_github_oidc_provider -> the account-global OIDC provider, below.
+#   manage_github_oidc          -> the LEGACY single CI deploy role further down.
+#
+# They were conflated under `manage_github_oidc`, which made the provider
+# impossible to own without also creating that legacy role. The role trusts
+# `var.github_deploy_subjects`, a list that includes DEVELOPMENT branches
+# (develop-v1.2.0, develop-v1.3.0, dev, develop) and grants ecr:PutImage plus
+# ssm:SendCommand. Creating it would let a dev branch push a production image
+# and reconcile the box — the exact thing the five per-service
+# gha_deploy_pipeline roles in github-oidc-deploy.tf exist to prevent, each
+# pinned to `refs/heads/main` and to one service's ECR repository.
+#
+# So the provider is now separable. In account 772316781095 the correct setting
+# is provider = true, legacy role = false.
+#
+# ON THE PROVIDER'S HISTORY IN THAT ACCOUNT: the FateRound stack created it
+# (2026-09-19) and its own Terraform deleted it (2026-09-29), which silently
+# broke every GitHub OIDC role in the account — Storytime's five ssm-seed roles
+# and FateRound's own two deploy roles — because a trust policy may name a
+# provider ARN that no longer exists. AWS permits exactly one provider per URL
+# per account, so if FateRound's configuration still declares it, whichever side
+# applies second fails with EntityAlreadyExists. The `shared` workspace now owns
+# it; that is a deliberate choice of owner, not a claim that no one else wants it.
 
 data "tls_certificate" "github" {
-  count = var.manage_github_oidc ? 1 : 0
+  count = var.manage_github_oidc_provider ? 1 : 0
   url   = "https://token.actions.githubusercontent.com"
 }
 
 resource "aws_iam_openid_connect_provider" "github" {
-  count           = var.manage_github_oidc ? 1 : 0
+  count           = var.manage_github_oidc_provider ? 1 : 0
   url             = "https://token.actions.githubusercontent.com"
   client_id_list  = ["sts.amazonaws.com"]
   thumbprint_list = [data.tls_certificate.github[0].certificates[0].sha1_fingerprint]
