@@ -131,9 +131,9 @@ fi
 # wrong archive is recoverable; restoring over an un-backed-up dataset is not.
 #
 # EVERYTHING AFTER THE SAFETY COPY IS ROLLED BACK ON FAILURE. The first version of
-# this script had two outage paths: if `tar -xzf` failed after the volume had been
-# cleared, `set -e` exited before `docker start redis` and left Redis stopped on an
-# empty volume; and if `docker start` failed, or Redis never answered PING, nothing
+# this script had two outage paths: if tar -xzf failed after the volume had been
+# cleared, set -e exited before docker start redis and left Redis stopped on an
+# empty volume; and if docker start failed, or Redis never answered PING, nothing
 # put the old dataset back. Both are now covered by an ERR trap armed only once the
 # safety copy exists.
 run_remote "set -euo pipefail
@@ -173,11 +173,11 @@ rollback() {
   exit 1
 }
 # NOT ARMED YET. On AL2023 /bin/sh is Bash, so a failing top-level command fires
-# the ERR trap before `set -e` exits — and arming it here meant a failed `aws s3
-# cp` (a 403, a network blip) would run `rollback`, which stops Redis, clears the
+# the ERR trap before set -e exits — and arming it here meant a failed aws s3
+# cp (a 403, a network blip) would run rollback, which stops Redis, clears the
 # volume and re-extracts, all while nothing had been touched. A safety mechanism
 # that breaks a healthy Redis on a benign download failure is worse than none.
-# The trap goes on immediately before `docker stop redis` instead.
+# The trap goes on immediately before docker stop redis instead.
 aws s3 cp --region $REGION --only-show-errors 's3://$BUCKET/$KEY' /var/tmp/redis-restore.tar.gz
 # Fail before touching anything if the archive is not what we expect. A tar that
 # unpacks without appendonlydir would leave Redis loading NOTHING, because the
@@ -202,7 +202,7 @@ for i in \$(seq 1 30); do
   if docker exec redis redis-cli PING 2>/dev/null | grep -q PONG; then READY=1; break; fi
   sleep 1
 done
-# CALL rollback, do not `exit 1`. An explicit exit does NOT fire the ERR trap
+# CALL rollback, do not exit 1. An explicit exit does NOT fire the ERR trap
 # (verified), so exiting here would detect the failure and then skip the very
 # recovery this trap exists for — leaving Redis down on a freshly replaced volume.
 # That was the hole the readiness check was added to close, and the check alone
@@ -211,7 +211,7 @@ done
 
 AFTER=\$(docker exec redis redis-cli DBSIZE | tr -d '\\r')
 echo \"live keys after restore: \$AFTER (was \$BEFORE)\"
-# `|| true` because this is DIAGNOSTIC ONLY. grep exits 1 when it matches
+# || true because this is DIAGNOSTIC ONLY. grep exits 1 when it matches
 # nothing — a noisier log, a Redis version that words it differently — and with
 # the trap still armed that non-zero would run rollback and destroy the dataset
 # that had just been restored and verified. An informational line must not be
