@@ -172,14 +172,21 @@ rollback() {
   logger -t storytime-redis-restore -p user.crit 'restore failed; rollback attempted'
   exit 1
 }
-trap rollback ERR
-
+# NOT ARMED YET. On AL2023 /bin/sh is Bash, so a failing top-level command fires
+# the ERR trap before `set -e` exits — and arming it here meant a failed `aws s3
+# cp` (a 403, a network blip) would run `rollback`, which stops Redis, clears the
+# volume and re-extracts, all while nothing had been touched. A safety mechanism
+# that breaks a healthy Redis on a benign download failure is worse than none.
+# The trap goes on immediately before `docker stop redis` instead.
 aws s3 cp --region $REGION --only-show-errors 's3://$BUCKET/$KEY' /var/tmp/redis-restore.tar.gz
 # Fail before touching anything if the archive is not what we expect. A tar that
 # unpacks without appendonlydir would leave Redis loading NOTHING, because the
 # container runs with --appendonly yes and ignores dump.rdb.
 tar -tzf /var/tmp/redis-restore.tar.gz | grep -q 'appendonlydir/' \\
   || { echo 'archive has no appendonlydir/ — refusing, Redis would start EMPTY' >&2; exit 1; }
+
+# FROM HERE ON the volume is being replaced, so a failure must roll back.
+trap rollback ERR
 
 # Stop Redis before replacing the volume. Writing under a running server would
 # leave it serving a dataset that no longer matches what is on disk.
@@ -195,11 +202,21 @@ for i in \$(seq 1 30); do
   if docker exec redis redis-cli PING 2>/dev/null | grep -q PONG; then READY=1; break; fi
   sleep 1
 done
-[ \"\$READY\" = '1' ] || { echo 'redis did not answer PING after the restore' >&2; exit 1; }
+# CALL rollback, do not `exit 1`. An explicit exit does NOT fire the ERR trap
+# (verified), so exiting here would detect the failure and then skip the very
+# recovery this trap exists for — leaving Redis down on a freshly replaced volume.
+# That was the hole the readiness check was added to close, and the check alone
+# did not close it.
+[ \"\$READY\" = '1' ] || { echo 'redis did not answer PING after the restore' >&2; rollback; }
 
 AFTER=\$(docker exec redis redis-cli DBSIZE | tr -d '\\r')
 echo \"live keys after restore: \$AFTER (was \$BEFORE)\"
-docker logs --tail 40 redis 2>&1 | grep -iE 'DB loaded|Ready to accept' | sed 's/^/  /'
+# `|| true` because this is DIAGNOSTIC ONLY. grep exits 1 when it matches
+# nothing — a noisier log, a Redis version that words it differently — and with
+# the trap still armed that non-zero would run rollback and destroy the dataset
+# that had just been restored and verified. An informational line must not be
+# able to fail the script.
+docker logs --tail 40 redis 2>&1 | grep -iE 'DB loaded|Ready to accept' | sed 's/^/  /' || true
 
 trap - ERR
 rm -f /var/tmp/redis-restore.tar.gz
