@@ -151,6 +151,16 @@ for i in \$(seq 1 120); do
   [ \"\$IN\" = '0' ] && [ \"\${SCHED:-0}\" = '0' ] && break
   sleep 1
 done
+# The flags going to 0 says the rewrite ENDED, not that it SUCCEEDED. On
+# aof_last_bgrewrite_status=err the old AOF is still loadable, so the rollback
+# copy is not worthless -- but it has no fresh base, and its live incremental
+# file can be captured mid-write by the tar below, leaving the copy missing its
+# tail. A rollback artefact is the one thing that must not be approximate, so
+# this refuses rather than proceeding. redis-backup.sh already asserted it; the
+# two had drifted.
+STATUS=\$(docker exec redis redis-cli INFO persistence | tr -d '\\r' | sed -n 's/^aof_last_bgrewrite_status:\\(.*\\)\$/\\1/p')
+[ \"\$STATUS\" = 'ok' ] \\
+  || { echo \"aof_last_bgrewrite_status=\$STATUS after the rewrite -- refusing to restore without a sound safety copy\" >&2; exit 1; }
 BEFORE=\$(docker exec redis redis-cli DBSIZE | tr -d '\\r')
 echo \"live keys before restore: \$BEFORE\"
 
