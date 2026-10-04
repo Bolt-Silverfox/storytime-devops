@@ -438,6 +438,30 @@ variable "backup_retention_days" {
   }
 }
 
+variable "redis_backup_retention_days" {
+  description = <<-EOT
+    Days to keep a Redis volume archive before the S3 lifecycle rule expires it.
+
+    Much shorter than backup_retention_days, on purpose. These archives are taken
+    around an instance replacement rather than on a schedule, and their value
+    decays within hours: restoring a week-old Redis over a live dataset would
+    reinstate stale guest sessions and expired cache entries, which is worse than
+    starting empty. There is no "unnoticed weekend failure" case to survive here,
+    because a missing Redis archive costs cache and sessions, not data of record —
+    that is Postgres, which has its own 30-day history and PITR.
+
+    The lifecycle rule is also the only deletion path: the instance role is not
+    granted s3:DeleteObject, so nothing else can ever remove these.
+  EOT
+  type        = number
+  default     = 7
+
+  validation {
+    condition     = var.redis_backup_retention_days >= 1
+    error_message = "redis_backup_retention_days must be at least 1: expiring same-day would race the replacement the archive exists to cover."
+  }
+}
+
 variable "enable_ebs_snapshots" {
   description = <<-EOT
     Create a DLM policy taking scheduled EBS snapshots of this stack's volumes —
