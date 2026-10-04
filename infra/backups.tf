@@ -32,11 +32,20 @@
 locals {
   backup_bucket = var.backup_bucket_name != "" ? var.backup_bucket_name : "${local.prefix}-backups"
 
-  # The instance may write under exactly two prefixes, and the IAM policy in
-  # iam.tf is scoped to both: `<backup_prefix>/` for the dumps themselves, and
-  # `_status/` for the success and restore-verification heartbeats. Nothing else
-  # in the bucket is writable by the box, and DeleteObject is not granted at all.
+  # The instance may write under exactly three prefixes, and the IAM policy in
+  # iam.tf is scoped to all of them: `<backup_prefix>/` for the Postgres dumps,
+  # `<redis_backup_prefix>/` for the Redis volume archives, and `_status/` for the
+  # success and restore-verification heartbeats. Nothing else in the bucket is
+  # writable by the box, and DeleteObject is not granted at all.
   backup_prefix = "postgres"
+
+  # Redis is a CONTAINER on this box, not ElastiCache, so its data lives in a
+  # docker volume on the root EBS volume and does NOT survive an instance
+  # replacement — and `user_data_replace_on_change = true` means any bootstrap
+  # change replaces the instance. An archive of the volume is the only way to
+  # carry the dataset across. Separate prefix from the Postgres dumps so each gets
+  # its own retention: these are small and frequent, a pg dump is neither.
+  redis_backup_prefix = "redis"
 }
 
 resource "aws_s3_bucket" "backups" {
@@ -143,6 +152,34 @@ resource "aws_s3_bucket_lifecycle_configuration" "backups" {
 
     abort_incomplete_multipart_upload {
       days_after_initiation = 3
+    }
+  }
+
+  # Redis archives expire FASTER than the Postgres dumps, deliberately. They are
+  # taken around an instance replacement rather than nightly, they are tiny (tens
+  # of KB), and their value decays within hours — a week-old Redis snapshot would
+  # restore stale guest sessions and expired cache entries over a live dataset,
+  # which is worse than starting empty. A lifecycle rule is also the ONLY way these
+  # ever get deleted: the instance role is deliberately not granted
+  # s3:DeleteObject, so without this they would accumulate indefinitely.
+  rule {
+    id     = "expire-redis-archives"
+    status = "Enabled"
+
+    filter {
+      prefix = "${local.redis_backup_prefix}/"
+    }
+
+    expiration {
+      days = var.redis_backup_retention_days
+    }
+
+    noncurrent_version_expiration {
+      noncurrent_days = 3
+    }
+
+    abort_incomplete_multipart_upload {
+      days_after_initiation = 1
     }
   }
 

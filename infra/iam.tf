@@ -74,6 +74,7 @@ data "aws_iam_policy_document" "app_instance" {
       ]
       resources = [
         "${aws_s3_bucket.backups[0].arn}/${local.backup_prefix}/*",
+        "${aws_s3_bucket.backups[0].arn}/${local.redis_backup_prefix}/*",
         "${aws_s3_bucket.backups[0].arn}/_status/*",
       ]
     }
@@ -90,6 +91,7 @@ data "aws_iam_policy_document" "app_instance" {
         variable = "s3:prefix"
         values = [
           "${local.backup_prefix}/*",
+          "${local.redis_backup_prefix}/*",
           "_status/*",
         ]
       }
