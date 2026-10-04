@@ -265,7 +265,7 @@ data "aws_iam_policy_document" "gha_deploy_pipeline_assume" {
       # its count already covers both flags. Data source, not a resource: if it
       # is missing the plan fails loudly rather than silently creating a
       # duplicate and failing the account.
-      identifiers = [data.aws_iam_openid_connect_provider.github_existing[0].arn]
+      identifiers = [local.github_oidc_provider_arn]
     }
 
     condition {
