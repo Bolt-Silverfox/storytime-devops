@@ -75,6 +75,14 @@ if [ -z "$KEY" ]; then
   KEY=$(sort <<<"$LISTING" | tail -1 | awk '{print $2}')
   [ -n "$KEY" ] || fail "could not determine the newest archive from the listing"
 fi
+# VALIDATE BEFORE INTERPOLATING. $KEY is substituted into single-quoted strings
+# inside the remote command (`aws s3 cp 's3://...'`, `logger '...'`). A single
+# quote in the key would close that quoting and the remainder would run as shell
+# on the production box. This check covers BOTH sources — an operator --key and a
+# key read back from S3 — which is why it sits after the selection, not inside it.
+[[ "$KEY" =~ ^redis/[A-Za-z0-9/_.-]+\.tar\.gz$ ]] \
+  || fail "refusing an archive key that is not ^redis/[A-Za-z0-9/_.-]+\.tar\.gz\$ : $KEY"
+
 echo "instance: $INSTANCE"
 echo "archive:  s3://$BUCKET/$KEY"
 
@@ -121,30 +129,79 @@ fi
 
 # A safety archive of the CURRENT dataset before overwriting it. Restoring the
 # wrong archive is recoverable; restoring over an un-backed-up dataset is not.
+#
+# EVERYTHING AFTER THE SAFETY COPY IS ROLLED BACK ON FAILURE. The first version of
+# this script had two outage paths: if `tar -xzf` failed after the volume had been
+# cleared, `set -e` exited before `docker start redis` and left Redis stopped on an
+# empty volume; and if `docker start` failed, or Redis never answered PING, nothing
+# put the old dataset back. Both are now covered by an ERR trap armed only once the
+# safety copy exists.
 run_remote "set -euo pipefail
-echo \"live keys before restore: \$(docker exec redis redis-cli DBSIZE | tr -d '\r')\"
-docker run --rm -v storytime-redis:/d:ro -v /var/tmp:/out alpine \
+PRE=/var/tmp/redis-pre-restore.tar.gz
+
+# Compact the AOF BEFORE the safety copy, for the same reason the backup does it:
+# otherwise the rollback artefact is an un-rewritten AOF, i.e. the thing we would
+# fall back to is weaker than the thing we are replacing.
+docker exec redis redis-cli -e BGREWRITEAOF >/dev/null \\
+  || { echo 'BGREWRITEAOF rejected — refusing to restore without a sound safety copy' >&2; exit 1; }
+for i in \$(seq 1 120); do
+  P=\$(docker exec redis redis-cli INFO persistence | tr -d '\\r')
+  IN=\$(sed -n 's/^aof_rewrite_in_progress:\\(.*\\)\$/\\1/p' <<<\"\$P\")
+  SCHED=\$(sed -n 's/^aof_rewrite_scheduled:\\(.*\\)\$/\\1/p' <<<\"\$P\")
+  [ \"\$IN\" = '0' ] && [ \"\${SCHED:-0}\" = '0' ] && break
+  sleep 1
+done
+BEFORE=\$(docker exec redis redis-cli DBSIZE | tr -d '\\r')
+echo \"live keys before restore: \$BEFORE\"
+
+docker run --rm -v storytime-redis:/d:ro -v /var/tmp:/out alpine \\
   tar -czf /out/redis-pre-restore.tar.gz -C /d . >/dev/null
-echo \"pre-restore safety copy: /var/tmp/redis-pre-restore.tar.gz (\$(stat -c %s /var/tmp/redis-pre-restore.tar.gz) bytes)\"
+echo \"pre-restore safety copy: \$PRE (\$(stat -c %s \$PRE) bytes)\"
+
+rollback() {
+  echo 'RESTORE FAILED — rolling back to the pre-restore dataset' >&2
+  docker stop redis >/dev/null 2>&1 || true
+  if docker run --rm -v storytime-redis:/d -v /var/tmp:/in alpine sh -c \\
+       'rm -rf /d/* /d/..?* /d/.[!.]* 2>/dev/null; tar -xzf /in/redis-pre-restore.tar.gz -C /d' >/dev/null; then
+    docker start redis >/dev/null 2>&1 \\
+      && echo 'rollback ok: previous dataset restored and redis started' >&2 \\
+      || echo 'ROLLBACK EXTRACTED BUT REDIS WOULD NOT START — manual attention needed' >&2
+  else
+    echo \"ROLLBACK FAILED — the volume may be empty. The safety copy is at \$PRE\" >&2
+  fi
+  logger -t storytime-redis-restore -p user.crit 'restore failed; rollback attempted'
+  exit 1
+}
+trap rollback ERR
 
 aws s3 cp --region $REGION --only-show-errors 's3://$BUCKET/$KEY' /var/tmp/redis-restore.tar.gz
 # Fail before touching anything if the archive is not what we expect. A tar that
-# unpacks without appendonlydir would leave Redis loading nothing.
-tar -tzf /var/tmp/redis-restore.tar.gz | grep -q 'appendonlydir/' \
-  || { echo 'archive has no appendonlydir/ — refusing to restore, Redis would start EMPTY' >&2; exit 1; }
+# unpacks without appendonlydir would leave Redis loading NOTHING, because the
+# container runs with --appendonly yes and ignores dump.rdb.
+tar -tzf /var/tmp/redis-restore.tar.gz | grep -q 'appendonlydir/' \\
+  || { echo 'archive has no appendonlydir/ — refusing, Redis would start EMPTY' >&2; exit 1; }
 
 # Stop Redis before replacing the volume. Writing under a running server would
 # leave it serving a dataset that no longer matches what is on disk.
 docker stop redis >/dev/null
-docker run --rm -v storytime-redis:/d -v /var/tmp:/in alpine sh -c \
+docker run --rm -v storytime-redis:/d -v /var/tmp:/in alpine sh -c \\
   'rm -rf /d/* /d/..?* /d/.[!.]* 2>/dev/null; tar -xzf /in/redis-restore.tar.gz -C /d' >/dev/null
 docker start redis >/dev/null
+
+# Readiness is checked, not assumed. The old loop could run out and fall through
+# to a DBSIZE inside an echo, which hid the error and reported success.
+READY=0
 for i in \$(seq 1 30); do
-  docker exec redis redis-cli PING 2>/dev/null | grep -q PONG && break
+  if docker exec redis redis-cli PING 2>/dev/null | grep -q PONG; then READY=1; break; fi
   sleep 1
 done
-echo \"live keys after restore: \$(docker exec redis redis-cli DBSIZE | tr -d '\r')\"
+[ \"\$READY\" = '1' ] || { echo 'redis did not answer PING after the restore' >&2; exit 1; }
+
+AFTER=\$(docker exec redis redis-cli DBSIZE | tr -d '\\r')
+echo \"live keys after restore: \$AFTER (was \$BEFORE)\"
 docker logs --tail 40 redis 2>&1 | grep -iE 'DB loaded|Ready to accept' | sed 's/^/  /'
+
+trap - ERR
 rm -f /var/tmp/redis-restore.tar.gz
 logger -t storytime-redis-restore -p user.notice 'restored $KEY'"
 

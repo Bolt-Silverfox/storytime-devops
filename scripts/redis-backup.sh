@@ -40,11 +40,30 @@ echo "target:   s3://$BUCKET/$KEY"
 # makes that a non-question rather than a tolerated risk.
 read -r -d '' SCRIPT <<'REMOTE' || true
 set -euo pipefail
-docker exec redis redis-cli BGREWRITEAOF >/dev/null
-for i in $(seq 1 60); do
-  [ "$(docker exec redis redis-cli INFO persistence | tr -d '\r' | sed -n 's/^aof_rewrite_in_progress:\(.*\)$/\1/p')" = "0" ] && break
+# `-e` IS REQUIRED. Without it redis-cli exits 0 even when Redis replies with an
+# error, and Redis rejects BGREWRITEAOF when it cannot fork the rewrite child. The
+# old code then saw aof_rewrite_in_progress:0 on the FIRST poll, read that as
+# "finished", and archived the un-compacted AOF — a backup quietly weaker than its
+# own stated guarantee.
+docker exec redis redis-cli -e BGREWRITEAOF >/dev/null \
+  || { echo "BGREWRITEAOF was rejected by Redis — refusing to archive without a fresh AOF base" >&2; exit 1; }
+
+# Wait on BOTH flags. An RDB save in flight makes Redis SCHEDULE the rewrite and
+# still reply OK, so in_progress stays 0 while scheduled is 1 — polling only
+# in_progress would exit immediately and archive the old AOF.
+for i in $(seq 1 120); do
+  P=$(docker exec redis redis-cli INFO persistence | tr -d '\r')
+  IN=$(sed -n 's/^aof_rewrite_in_progress:\(.*\)$/\1/p' <<<"$P")
+  SCHED=$(sed -n 's/^aof_rewrite_scheduled:\(.*\)$/\1/p' <<<"$P")
+  [ "$IN" = "0" ] && [ "${SCHED:-0}" = "0" ] && break
   sleep 1
 done
+# And confirm it actually succeeded. A failed rewrite leaves the previous AOF
+# intact, so the archive would still load — but it would not be the fresh base
+# this script promises, and silently degrading that is worse than stopping.
+STATUS=$(docker exec redis redis-cli INFO persistence | tr -d '\r' | sed -n 's/^aof_last_bgrewrite_status:\(.*\)$/\1/p')
+[ "$STATUS" = "ok" ] \
+  || { echo "aof_last_bgrewrite_status=$STATUS after the rewrite — refusing to archive" >&2; exit 1; }
 BEFORE=$(docker exec redis redis-cli DBSIZE | tr -d '\r')
 # --rm alpine with the volume mounted read-only: the tar never runs as a process
 # that could write to the live dataset.
@@ -85,6 +104,17 @@ for _ in $(seq 1 60); do
   ST=$(aws ssm get-command-invocation --command-id "$CID" --instance-id "$INSTANCE" --query Status --output text 2>/dev/null || echo Pending)
   case "$ST" in Success|Failed|Cancelled|TimedOut) break;; esac
 done
+# A non-terminal status here means WE gave up watching, not that the job failed.
+# Saying "exited Pending" would read as a failure and invite a second run on top
+# of a backup that is still uploading.
+case "$ST" in
+  Success|Failed|Cancelled|TimedOut) ;;
+  *)
+    echo "stopped waiting after ~5 minutes; the remote command is still $ST and may yet finish." >&2
+    echo "check it with: aws ssm get-command-invocation --command-id $CID --instance-id $INSTANCE" >&2
+    fail "timed out watching the remote backup (it was NOT cancelled)"
+    ;;
+esac
 OUT=$(aws ssm get-command-invocation --command-id "$CID" --instance-id "$INSTANCE" --query StandardOutputContent --output text 2>/dev/null)
 ERR=$(aws ssm get-command-invocation --command-id "$CID" --instance-id "$INSTANCE" --query StandardErrorContent --output text 2>/dev/null)
 echo "status:   $ST"
