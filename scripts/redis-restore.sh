@@ -207,7 +207,16 @@ MANIFEST=\$(tar -xzOf /var/tmp/redis-restore.tar.gz ./appendonlydir/appendonly.a
 # history entries as the active dataset. So a manifest of only comments, or only
 # history entries whose files happen to be present, passes a naive
 # 'every named file exists' check and still yields an empty Redis.
-ACTIVE=\$(grep -cE '^file .+ type [bi]\$' <<<\"\$MANIFEST\" || true)
+# EVERY entry must carry file, a NONZERO seq, and type. Redis 7.4's
+# aofLoadManifestFromFile() parses key/value pairs and rejects an entry when any
+# of file_name / file_seq / file_type is missing or zero, with 'Invalid AOF
+# manifest file format' -- and then EXITS. The container would fail to start, so
+# the PING check below would catch it and roll back; refusing here is better,
+# because it happens before the volume is touched at all.
+MALFORMED=\$(grep '^file ' <<<\"\$MANIFEST\" | grep -vcE '^file [^ ]+ seq [1-9][0-9]* type [bih]\$' || true)
+[ \"\$MALFORMED\" = '0' ] \\
+  || { echo 'manifest has entries missing file/seq/type or with seq 0 -- Redis would reject it as Invalid AOF manifest file format and exit; refusing' >&2; exit 1; }
+ACTIVE=\$(grep -cE '^file [^ ]+ seq [1-9][0-9]* type [bi]\$' <<<\"\$MANIFEST\" || true)
 [ \"\$ACTIVE\" -gt 0 ] \\
   || { echo 'manifest has no base or incremental entry (only comments or history) -- refusing, Redis would start EMPTY' >&2; exit 1; }
 

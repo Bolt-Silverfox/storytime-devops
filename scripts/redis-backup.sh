@@ -116,8 +116,12 @@ docker run --rm -v storytime-redis:/d:ro -v /var/tmp:/out alpine \
   tar -czf /out/redis-backup.tar.gz -C /d . >/dev/null
 
 docker start redis >/dev/null || { echo 'archive taken but redis did not restart' >&2; exit 1; }
-REDIS_STOPPED=0
+# REDIS_STOPPED STAYS 1 UNTIL READINESS PASSES. Clearing it before the PING check
+# meant that a container which started but never answered left the flag at 0, so
+# the EXIT trap skipped BOTH its recovery attempt and its user.crit alert — the
+# script exited non-zero with Redis unavailable and nothing saying so.
 redis_ready || { echo 'redis restarted but never answered PING' >&2; exit 1; }
+REDIS_STOPPED=0
 trap - EXIT
 
 SIZE=$(stat -c %s /var/tmp/redis-backup.tar.gz)
