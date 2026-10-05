@@ -84,11 +84,26 @@ BEFORE=$(docker exec redis redis-cli DBSIZE | tr -d '\r')
 # wire, and the restore side then has to rebuild the AOF from it. Do not simply
 # delete the stop below.
 REDIS_STOPPED=0
+# Readiness is CHECKED here too, not just on the happy path. `docker start`
+# returning 0 means the container was started, not that Redis answers requests —
+# so the first version of this trap could print "redis restarted" while Redis was
+# still unavailable, which is the most misleading thing a recovery path can do.
+redis_ready() {
+  local i
+  for i in $(seq 1 30); do
+    docker exec redis redis-cli PING 2>/dev/null | grep -q PONG && return 0
+    sleep 1
+  done
+  return 1
+}
 restart_redis() {
   if [ "$REDIS_STOPPED" = '1' ]; then
-    docker start redis >/dev/null 2>&1 \
-      && echo 'redis restarted' >&2 \
-      || echo 'REDIS DID NOT RESTART after the backup — it is STOPPED, start it by hand' >&2
+    if docker start redis >/dev/null 2>&1 && redis_ready; then
+      echo 'redis restarted and answering PING' >&2
+    else
+      echo 'REDIS IS NOT SERVING after the backup — it is stopped or unresponsive. Recover by hand: docker start redis; docker exec redis redis-cli PING' >&2
+      logger -t storytime-redis-backup -p user.crit 'redis not serving after backup; manual recovery needed' 2>/dev/null || true
+    fi
   fi
 }
 # EXIT, not ERR: this must also run if the script is interrupted part-way, because
@@ -102,12 +117,7 @@ docker run --rm -v storytime-redis:/d:ro -v /var/tmp:/out alpine \
 
 docker start redis >/dev/null || { echo 'archive taken but redis did not restart' >&2; exit 1; }
 REDIS_STOPPED=0
-READY=0
-for i in $(seq 1 30); do
-  docker exec redis redis-cli PING 2>/dev/null | grep -q PONG && { READY=1; break; }
-  sleep 1
-done
-[ "$READY" = '1' ] || { echo 'redis restarted but never answered PING' >&2; exit 1; }
+redis_ready || { echo 'redis restarted but never answered PING' >&2; exit 1; }
 trap - EXIT
 
 SIZE=$(stat -c %s /var/tmp/redis-backup.tar.gz)
