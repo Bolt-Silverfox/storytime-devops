@@ -65,10 +65,65 @@ STATUS=$(docker exec redis redis-cli INFO persistence | tr -d '\r' | sed -n 's/^
 [ "$STATUS" = "ok" ] \
   || { echo "aof_last_bgrewrite_status=$STATUS after the rewrite — refusing to archive" >&2; exit 1; }
 BEFORE=$(docker exec redis redis-cli DBSIZE | tr -d '\r')
-# --rm alpine with the volume mounted read-only: the tar never runs as a process
-# that could write to the live dataset.
+
+# REDIS IS STOPPED FOR THE ARCHIVE. The rewrite-status checks above are not a
+# lock: Redis 7.4 enables automatic AOF rewrites by default, so a rewrite can
+# begin AFTER those checks and while tar is reading. The manifest swap is atomic,
+# but the multi-part file SET is not snapshotted atomically — so tar can capture a
+# manifest naming files from one generation alongside files from another, or miss
+# a file deleted during the switch. That does not degrade the archive; it can make
+# it unloadable, which is the one outcome a backup may not have.
+#
+# A read-only mount does not help. It stops the tar writing; it does not stop
+# Redis rewriting underneath it.
+#
+# THE COST IS A FEW SECONDS OF DOWNTIME per backup, which is why this script is
+# for bracketing a deliberate operation (an instance replacement) rather than for
+# a cron. If a non-disruptive periodic backup is ever wanted, the mechanism is
+# different: `redis-cli --rdb` asks the server for a point-in-time RDB over the
+# wire, and the restore side then has to rebuild the AOF from it. Do not simply
+# delete the stop below.
+REDIS_STOPPED=0
+# Readiness is CHECKED here too, not just on the happy path. `docker start`
+# returning 0 means the container was started, not that Redis answers requests —
+# so the first version of this trap could print "redis restarted" while Redis was
+# still unavailable, which is the most misleading thing a recovery path can do.
+redis_ready() {
+  local i
+  for i in $(seq 1 30); do
+    docker exec redis redis-cli PING 2>/dev/null | grep -q PONG && return 0
+    sleep 1
+  done
+  return 1
+}
+restart_redis() {
+  if [ "$REDIS_STOPPED" = '1' ]; then
+    if docker start redis >/dev/null 2>&1 && redis_ready; then
+      echo 'redis restarted and answering PING' >&2
+    else
+      echo 'REDIS IS NOT SERVING after the backup — it is stopped or unresponsive. Recover by hand: docker start redis; docker exec redis redis-cli PING' >&2
+      logger -t storytime-redis-backup -p user.crit 'redis not serving after backup; manual recovery needed' 2>/dev/null || true
+    fi
+  fi
+}
+# EXIT, not ERR: this must also run if the script is interrupted part-way, because
+# leaving production Redis stopped is worse than a missing backup.
+trap restart_redis EXIT
+docker stop redis >/dev/null || { echo 'could not stop redis — refusing to archive a live volume' >&2; exit 1; }
+REDIS_STOPPED=1
+
 docker run --rm -v storytime-redis:/d:ro -v /var/tmp:/out alpine \
   tar -czf /out/redis-backup.tar.gz -C /d . >/dev/null
+
+docker start redis >/dev/null || { echo 'archive taken but redis did not restart' >&2; exit 1; }
+# REDIS_STOPPED STAYS 1 UNTIL READINESS PASSES. Clearing it before the PING check
+# meant that a container which started but never answered left the flag at 0, so
+# the EXIT trap skipped BOTH its recovery attempt and its user.crit alert — the
+# script exited non-zero with Redis unavailable and nothing saying so.
+redis_ready || { echo 'redis restarted but never answered PING' >&2; exit 1; }
+REDIS_STOPPED=0
+trap - EXIT
+
 SIZE=$(stat -c %s /var/tmp/redis-backup.tar.gz)
 aws s3 cp --region eu-west-1 --only-show-errors /var/tmp/redis-backup.tar.gz "s3://BUCKET_PLACEHOLDER/KEY_PLACEHOLDER"
 rm -f /var/tmp/redis-backup.tar.gz

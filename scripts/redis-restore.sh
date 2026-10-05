@@ -192,8 +192,47 @@ aws s3 cp --region $REGION --only-show-errors 's3://$BUCKET/$KEY' /var/tmp/redis
 # Fail before touching anything if the archive is not what we expect. A tar that
 # unpacks without appendonlydir would leave Redis loading NOTHING, because the
 # container runs with --appendonly yes and ignores dump.rdb.
-tar -tzf /var/tmp/redis-restore.tar.gz | grep -q 'appendonlydir/' \\
-  || { echo 'archive has no appendonlydir/ — refusing, Redis would start EMPTY' >&2; exit 1; }
+# VALIDATE THE MANIFEST, THE ENTRY TYPES, AND THE FILES IT NAMES. A bare
+# appendonlydir/ entry is not enough: with --appendonly yes, Redis initialises a
+# NEW empty AOF when that directory has no usable manifest, then answers PING
+# happily -- so the restore skipped rollback and reported DBSIZE=0 as a result.
+# A successful restore of nothing.
+MANIFEST=\$(tar -xzOf /var/tmp/redis-restore.tar.gz ./appendonlydir/appendonly.aof.manifest 2>/dev/null || true)
+[ -n \"\$MANIFEST\" ] \\
+  || { echo 'archive has no appendonlydir/appendonly.aof.manifest -- refusing, Redis would start EMPTY and report success' >&2; exit 1; }
+
+# AN ACTIVE ENTRY IS REQUIRED. Manifest lines are
+#   file <name> seq <n> type <b|i|h>
+# where b is the base, i an incremental, and h HISTORY. Redis does not load
+# history entries as the active dataset. So a manifest of only comments, or only
+# history entries whose files happen to be present, passes a naive
+# 'every named file exists' check and still yields an empty Redis.
+# EVERY entry must carry file, a NONZERO seq, and type. Redis 7.4's
+# aofLoadManifestFromFile() parses key/value pairs and rejects an entry when any
+# of file_name / file_seq / file_type is missing or zero, with 'Invalid AOF
+# manifest file format' -- and then EXITS. The container would fail to start, so
+# the PING check below would catch it and roll back; refusing here is better,
+# because it happens before the volume is touched at all.
+MALFORMED=\$(grep '^file ' <<<\"\$MANIFEST\" | grep -vcE '^file [^ ]+ seq [1-9][0-9]* type [bih]\$' || true)
+[ \"\$MALFORMED\" = '0' ] \\
+  || { echo 'manifest has entries missing file/seq/type or with seq 0 -- Redis would reject it as Invalid AOF manifest file format and exit; refusing' >&2; exit 1; }
+ACTIVE=\$(grep -cE '^file [^ ]+ seq [1-9][0-9]* type [bi]\$' <<<\"\$MANIFEST\" || true)
+[ \"\$ACTIVE\" -gt 0 ] \\
+  || { echo 'manifest has no base or incremental entry (only comments or history) -- refusing, Redis would start EMPTY' >&2; exit 1; }
+
+# Every referenced file must be present. -F and -x: without -F the dots in
+# appendonly.aof.4.incr.aof are regex wildcards, so a mangled
+# appendonlyXaofX4XincrXaof in the archive would satisfy the check and Redis
+# would then fail to load the file it was actually told to load.
+ARCHIVED=\$(tar -tzf /var/tmp/redis-restore.tar.gz)
+MISSING=''
+while read -r _ fname _; do
+  [ -n \"\$fname\" ] || continue
+  grep -Fqx -- \"./appendonlydir/\$fname\" <<<\"\$ARCHIVED\" || MISSING=\"\$MISSING \$fname\"
+done <<<\"\$(grep '^file ' <<<\"\$MANIFEST\")\"
+[ -z \"\${MISSING// /}\" ] \\
+  || { echo \"manifest references files absent from the archive:\$MISSING -- refusing\" >&2; exit 1; }
+echo \"manifest ok: \$ACTIVE active entry/entries, all referenced files present\"
 
 # FROM HERE ON the volume is being replaced, so a failure must roll back.
 trap rollback ERR
