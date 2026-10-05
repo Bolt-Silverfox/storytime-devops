@@ -192,8 +192,25 @@ aws s3 cp --region $REGION --only-show-errors 's3://$BUCKET/$KEY' /var/tmp/redis
 # Fail before touching anything if the archive is not what we expect. A tar that
 # unpacks without appendonlydir would leave Redis loading NOTHING, because the
 # container runs with --appendonly yes and ignores dump.rdb.
-tar -tzf /var/tmp/redis-restore.tar.gz | grep -q 'appendonlydir/' \\
-  || { echo 'archive has no appendonlydir/ — refusing, Redis would start EMPTY' >&2; exit 1; }
+# VALIDATE THE MANIFEST AND THE FILES IT NAMES, not just the directory. A bare
+# appendonlydir/ entry is not enough: with --appendonly yes, Redis initialises a
+# NEW empty AOF when that directory has no manifest, then answers PING happily.
+# The restore would skip rollback and report DBSIZE=0 as a result -- a successful
+# restore of nothing.
+MANIFEST=\$(tar -xzOf /var/tmp/redis-restore.tar.gz ./appendonlydir/appendonly.aof.manifest 2>/dev/null || true)
+[ -n \"\$MANIFEST\" ] \\
+  || { echo 'archive has no appendonlydir/appendonly.aof.manifest -- refusing, Redis would start EMPTY and report success' >&2; exit 1; }
+# Every file the manifest references must be present. A manifest naming a base or
+# incr file that is absent is the unloadable case, and it passes a directory check.
+ARCHIVED=\$(tar -tzf /var/tmp/redis-restore.tar.gz)
+MISSING=''
+while read -r _ fname _; do
+  [ -n \"\$fname\" ] || continue
+  grep -qx \"./appendonlydir/\$fname\" <<<\"\$ARCHIVED\" || MISSING=\"\$MISSING \$fname\"
+done <<<\"\$(grep '^file ' <<<\"\$MANIFEST\")\"
+[ -z \"\${MISSING// /}\" ] \\
+  || { echo \"manifest references files absent from the archive:\$MISSING -- refusing\" >&2; exit 1; }
+echo \"manifest ok, \$(grep -c '^file ' <<<\"\$MANIFEST\") file(s) referenced and present\"
 
 # FROM HERE ON the volume is being replaced, so a failure must roll back.
 trap rollback ERR
