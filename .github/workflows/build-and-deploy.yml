@@ -155,6 +155,39 @@ on:
         required: false
         type: number
         default: 2400
+      smoke_url:
+        description: |
+          OPTIONAL post-deploy check. A URL to GET once the reconcile has
+          finished; the job fails if it does not answer with one of
+          smoke_expect_status.
+
+          This exists because a deploy can go green while the service is
+          completely unusable. storytime_superadmin shipped for a week with
+          NEXT_PUBLIC_API_URL missing the API's `/api/v1` global prefix: the
+          container was healthy, the login page returned 200, and every single
+          API call 404'd. Nothing noticed until someone tried to log in.
+
+          So point this at a route that only answers correctly when the service
+          is wired up — ideally an AUTHENTICATED one, where the meaningful pass
+          is 401. A 401 proves the route exists and the base path is right; a
+          404 proves it is not. An unauthenticated 200 page proves much less,
+          because a misconfigured app still serves its own shell.
+
+          Left empty, the step is skipped and the behaviour is unchanged.
+        required: false
+        type: string
+        default: ''
+      smoke_expect_status:
+        description: |
+          Comma-separated HTTP statuses that count as a pass for smoke_url.
+          Default covers the useful cases: 200/204 for a public endpoint,
+          401/403 for an authenticated one reached without credentials.
+
+          404 is deliberately NOT in the default, and is the whole point: it is
+          the signature of a wrong base path or a route that never registered.
+        required: false
+        type: string
+        default: '200,204,401,403'
 
 permissions:
   contents: read
@@ -749,6 +782,49 @@ jobs:
                 ;;
             esac
           done
+
+      - name: Post-deploy smoke check
+        if: inputs.smoke_url != ''
+        env:
+          SMOKE_URL: ${{ inputs.smoke_url }}
+          EXPECT: ${{ inputs.smoke_expect_status }}
+        run: |
+          set -euo pipefail
+
+          # The container has just been recreated, so the first probe can land
+          # before it is listening. Retry a bounded number of times rather than
+          # sleeping a fixed amount: a fast service passes immediately, a slow
+          # one still gets its window, and a dead one fails in ~1 minute.
+          attempts=12
+          delay=5
+          code=000
+
+          for i in $(seq 1 "$attempts"); do
+            # --max-time bounds a hung connection; without it a black-holed
+            # port would hold the step open until the job timeout.
+            code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 "$SMOKE_URL" || echo 000)
+
+            # Exact match against a comma-separated list. The commas on both
+            # sides stop 40 matching inside 404, or 20 inside 200.
+            case ",${EXPECT}," in
+              *",${code},"*)
+                echo "smoke check passed: ${SMOKE_URL} -> ${code} (attempt ${i})"
+                exit 0
+                ;;
+            esac
+
+            echo "attempt ${i}/${attempts}: ${code} (want one of ${EXPECT})"
+            [ "$i" -lt "$attempts" ] && sleep "$delay"
+          done
+
+          if [ "$code" = "404" ]; then
+            echo "::error::smoke check: ${SMOKE_URL} returned 404. The route does not exist — this is what a wrong API base path or an unregistered route looks like. The container may well be healthy; it is pointed at the wrong place."
+          elif [ "$code" = "000" ]; then
+            echo "::error::smoke check: ${SMOKE_URL} did not respond at all (connection failure or timeout) after ${attempts} attempts."
+          else
+            echo "::error::smoke check: ${SMOKE_URL} returned ${code}, wanted one of ${EXPECT}, after ${attempts} attempts."
+          fi
+          exit 1
 
       - name: Summary
         if: always()
