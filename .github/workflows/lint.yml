@@ -120,6 +120,30 @@ jobs:
           python3 --version
           python3 capture/lib/redact_test.py
 
+  deploy-harness:
+    name: deploy rails harness
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Exercises the REAL step scripts of build-and-deploy.yml against stubbed
+      # aws/docker/curl/redeploy.sh: success, unhealthy -> rollback, migration
+      # failure -> abort before swap, lock contention, instance lookup, :latest
+      # promotion. No credentials, nothing deployed. ruby, jq, python3, flock and
+      # dash are preinstalled on the runner. Run under bash-as-sh and dash, since
+      # the SSM payload must be POSIX sh.
+      - name: deploy rails harness
+        run: |
+          set -euo pipefail
+          tests/deploy/run-tests.sh
+          SH=dash tests/deploy/run-tests.sh
+
   actionlint:
     name: actionlint
     runs-on: ubuntu-latest
