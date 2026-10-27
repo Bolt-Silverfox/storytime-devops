@@ -448,6 +448,14 @@ jobs:
             echo "::error::health_stable_samples must be an integer in 2..30"
             exit 1
           fi
+          # The gate samples every 10 s, and the first sample after the swap can
+          # still be "starting". Require one warm-up sample on top of the stable
+          # ones, or e.g. 60 s with 6 samples can never succeed (the same gate
+          # runs after a rollback). The payload's tries clamp stays as a backstop.
+          if [ "$HEALTH_TIMEOUT" -lt $(( 10 * (STABLE_SAMPLES + 1) )) ]; then
+            echo "::error::health_timeout_seconds must be at least 10 x (health_stable_samples + 1) so the gate gets one warm-up sample"
+            exit 1
+          fi
           if [ -n "$GATE_SMOKE_URL" ]; then
             [[ "$GATE_SMOKE_URL" =~ ^https://[A-Za-z0-9.-]+(/[A-Za-z0-9._~%/?=\&+,-]*)?$ ]] \
               || { echo "::error::gate_smoke_url must be a plain https URL (no port, userinfo or quotes)"; exit 1; }
