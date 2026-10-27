@@ -15,6 +15,9 @@ ROOT="$(cd "$HERE/../.." && pwd)"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 cp "$HERE"/harness/* "$TMP"/
+# The stubs are stored as stubs.tf.txt so the CI validate/tflint discovery
+# (git ls-files '*.tf') does not treat this partial harness as a root module.
+mv "$TMP/stubs.tf.txt" "$TMP/stubs.tf"
 cp "$ROOT/infra/github-oidc-deploy.tf" "$TMP"/
 cd "$TMP"
 terraform init -backend=false -input=false -no-color ${PLUGIN_DIR:+-plugin-dir="$PLUGIN_DIR"} >/dev/null
