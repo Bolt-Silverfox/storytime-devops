@@ -197,29 +197,58 @@ variable "github_deploy_repos" {
 
 variable "github_deploy_workflow_ref" {
   description = <<-EOT
-    The exact reusable workflow permitted to assume a deploy role, as the OIDC
+    The exact reusable workflow(s) permitted to assume a deploy role, as the OIDC
     `job_workflow_ref` claim spells it. Every caller's `uses:` line must match
-    this string VERBATIM or the assume-role fails with AccessDenied.
+    one of these strings VERBATIM or the assume-role fails with AccessDenied.
 
-    PINNED TO AN IMMUTABLE COMMIT rather than `@refs/heads/main`. On a branch
-    ref, anyone who can push storytime-devops' main can change privileged
-    deploy code -- code that holds ECR push credentials and issues SSM
-    commands to the production box -- without a change landing in any app
-    repo. The branch-aligned policy stopped a caller from silently retargeting
-    `uses:`; it did not stop the workflow itself from changing underneath it.
+    A LIST of allowed refs (a single string is still accepted and treated as a
+    one-element list, so existing tfvars keep working). The trust condition is
+    StringEquals with several values, which IAM evaluates as "any of".
 
-    THE COST IS A LOCKSTEP UPDATE, and it is a six-file change every time the
-    pipeline changes: merge in storytime-devops, apply this variable, then bump
-    the `uses:` line in all five caller repos. There is no partial state that
-    works -- a mismatch on either side fails every deploy at assume-role, not
-    at plan.
+    WHY A LIST: bumping the pin used to be a hard lockstep -- apply the new SHA,
+    then bump five callers -- with no state in between that works, so any
+    in-flight or not-yet-bumped caller broke at assume-role. With a list the bump
+    is: apply [old, new]; re-pin the callers one at a time; later apply [new]
+    to drop the old one. See "Bumping the workflow pin" in
+    docs/build-and-deploy.md.
+
+    EACH ENTRY IS PINNED TO AN IMMUTABLE 40-HEX COMMIT rather than
+    `@refs/heads/main`. On a branch ref, anyone who can push storytime-devops'
+    main can change privileged deploy code -- code that holds ECR push
+    credentials and issues SSM commands to the production box -- without a
+    change landing in any app repo. Every entry here is a SHA that has been
+    reviewed; do not leave a stale one in the list longer than the migration
+    needs, because each listed SHA is a version of privileged code that can
+    still assume the role.
   EOT
-  type        = string
-  default     = "Bolt-Silverfox/storytime-devops/.github/workflows/build-and-deploy.yml@e8e832285ca78d3c49bd54142d9b5aa4fc1ad0b0"
+  type        = any
+  default     = ["Bolt-Silverfox/storytime-devops/.github/workflows/build-and-deploy.yml@e8e832285ca78d3c49bd54142d9b5aa4fc1ad0b0"]
+
+  validation {
+    condition = (
+      can(tolist(var.github_deploy_workflow_ref)) || can(tostring(var.github_deploy_workflow_ref))
+    )
+    error_message = "github_deploy_workflow_ref must be a string or a list of strings."
+  }
+
+  validation {
+    condition = (
+      length(flatten([var.github_deploy_workflow_ref])) >= 1 &&
+      length(flatten([var.github_deploy_workflow_ref])) <= 4 &&
+      alltrue([
+        for r in flatten([var.github_deploy_workflow_ref]) :
+        can(regex("^Bolt-Silverfox/storytime-devops/\\.github/workflows/build-and-deploy\\.yml@[0-9a-f]{40}$", r))
+      ])
+    )
+    error_message = "github_deploy_workflow_ref must hold 1 to 4 entries, each Bolt-Silverfox/storytime-devops/.github/workflows/build-and-deploy.yml@<40-hex commit SHA>."
+  }
 }
 
 locals {
   deploy_repos = var.manage_github_deploy_roles ? var.github_deploy_repos : {}
+
+  # Normalised to a list whether the caller supplied a string or a list.
+  deploy_workflow_refs = distinct(flatten([var.github_deploy_workflow_ref]))
 
   # Built from the prefix rather than read off aws_ecr_repository.svc so this
   # file does not require the same workspace to also own ECR. The validation
@@ -293,7 +322,7 @@ data "aws_iam_policy_document" "gha_deploy_pipeline_assume" {
     condition {
       test     = "StringEquals"
       variable = "token.actions.githubusercontent.com:job_workflow_ref"
-      values   = [var.github_deploy_workflow_ref]
+      values   = local.deploy_workflow_refs
     }
   }
 }
@@ -380,6 +409,23 @@ data "aws_iam_policy_document" "gha_deploy_pipeline" {
       variable = "ssm:resourceTag/Name"
       values   = ["${var.github_deploy_target_stack}-app"]
     }
+  }
+
+  # Lets the workflow find the app instance by tag when `instance_id` is not
+  # passed (see "Resolve target instance" in build-and-deploy.yml), so five caller
+  # repos no longer carry a hard-coded instance ID that goes stale whenever
+  # compute.tf replaces the box.
+  #
+  # `*` is forced: ec2:DescribeInstances supports NO resource-level permissions
+  # (EC2 Service Authorization Reference), so this cannot be pinned to the app
+  # instance. It is read-only metadata about instances in the account -- names,
+  # tags, IPs -- and grants no ability to act on any of them; acting still needs
+  # the tag-scoped SendCommand above. Accepted for the convenience of tag lookup;
+  # the workflow also still honours an explicit `instance_id`.
+  statement {
+    sid       = "DescribeInstancesForTagLookup"
+    actions   = ["ec2:DescribeInstances"]
+    resources = ["*"]
   }
 
   # SendCommand authorises the DOCUMENT as well as the target, so both ARNs are
