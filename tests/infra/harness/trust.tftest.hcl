@@ -114,3 +114,22 @@ run "bad_external_id_rejected" {
   }
   expect_failures = [var.woodpecker_external_ids]
 }
+
+run "agent_role_in_other_account_rejected" {
+  command = plan
+  variables {
+    woodpecker_agent_role_arns = ["arn:aws:iam::111122223333:role/some-role"]
+  }
+  expect_failures = [var.woodpecker_agent_role_arns]
+}
+
+run "duplicate_external_ids_rejected" {
+  command = plan
+  variables {
+    woodpecker_external_ids = {
+      api   = "0123456789abcdef0123456789abcdef0123456789abcdef"
+      admin = "0123456789abcdef0123456789abcdef0123456789abcdef"
+    }
+  }
+  expect_failures = [var.woodpecker_external_ids]
+}

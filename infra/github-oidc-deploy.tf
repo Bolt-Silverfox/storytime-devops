@@ -275,9 +275,9 @@ variable "woodpecker_agent_role_arns" {
   validation {
     condition = alltrue([
       for a in var.woodpecker_agent_role_arns :
-      can(regex("^arn:aws:iam::[0-9]{12}:role/[A-Za-z0-9+=,.@_/-]+$", a))
+      can(regex("^arn:aws:iam::772641335580:role/[A-Za-z0-9+=,.@_/-]+$", a))
     ])
-    error_message = "woodpecker_agent_role_arns entries must be IAM role ARNs, e.g. arn:aws:iam::772641335580:role/shared-spot-agent-storytime."
+    error_message = "woodpecker_agent_role_arns entries must be IAM role ARNs in the CI account 772641335580, e.g. arn:aws:iam::772641335580:role/shared-spot-agent-storytime."
   }
 
   validation {
@@ -313,6 +313,11 @@ variable "woodpecker_external_ids" {
       contains(["api", "admin", "web", "waitlist-api", "waitlist-web"], k)
     ])
     error_message = "woodpecker_external_ids keys must be among api, admin, web, waitlist-api, waitlist-web."
+  }
+
+  validation {
+    condition     = length(distinct(values(var.woodpecker_external_ids))) == length(values(var.woodpecker_external_ids))
+    error_message = "Each service needs its own distinct ExternalId; do not reuse a value across services."
   }
 
   validation {

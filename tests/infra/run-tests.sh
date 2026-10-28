@@ -12,6 +12,8 @@
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
+# a relative PLUGIN_DIR must be resolved before we cd into the temp dir
+if [ -n "${PLUGIN_DIR:-}" ]; then PLUGIN_DIR="$(cd "$PLUGIN_DIR" && pwd)"; fi
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 cp "$HERE"/harness/* "$TMP"/

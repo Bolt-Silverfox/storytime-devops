@@ -124,7 +124,7 @@ Before turning `woodpecker_ecr_registry_cache` on:
 ## Owner runbook
 
 Prerequisites: the infra-shared storytime lane is applied and
-`infra/tofu staging output spot_storytime_role_arn` printed
+`infra/tofu staging output spot_storytime_role_arn` (run from the infra-shared repository checkout's `infra/` wrapper directory, where the `tofu` helper script lives) printed
 `arn:aws:iam::772641335580:role/shared-spot-agent-storytime` (call it
 `$LANE_ROLE`). Phases 1 and 2 change nothing about how storytime deploys today.
 
@@ -235,8 +235,9 @@ steps:
     secrets: [aws_external_id]
     commands:
       - aws sts assume-role --role-arn "$ROLE_ARN" --role-session-name "wp-$CI_PIPELINE_NUMBER"
-          --duration-seconds 7200 --external-id "$AWS_EXTERNAL_ID" --query Credentials > /woodpecker/aws-creds.json
-      - 'echo "assumed: $(aws sts get-caller-identity --query Arn --output text)"'   # with the role's creds loaded from the file
+          --duration-seconds 7200 --external-id "$AWS_EXTERNAL_ID" --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' --output text > /woodpecker/aws-creds.txt
+      - read -r AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN < /woodpecker/aws-creds.txt && export AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
+      - 'echo "assumed: $(aws sts get-caller-identity --query Arn --output text)"'   # now with the deploy role creds
 
   - name: ecr-login-and-resolve  # ECR password, instance lookup by tag (as "Resolve target instance")
     image: *aws_cli
