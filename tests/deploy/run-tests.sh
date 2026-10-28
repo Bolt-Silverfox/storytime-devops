@@ -296,7 +296,9 @@ run_payload() { # [VAR=val ...] extra env for the *step* and the payload
       HEALTH_TIMEOUT=60 STABLE_SAMPLES=3 GATE_SMOKE_URL="" GATE_SMOKE_EXPECT="200,204,401,403" \
       GITHUB_OUTPUT="$SB/gh_output" NEWSHA REPO
     for kv in "$@"; do export "${kv?}"; done
-    step_script "Deploy on the instance" > "$SB/step.sh"
+    # The step writes fixed /tmp paths; keep them inside this run's sandbox so
+    # concurrent runs cannot collide and nothing outlives the harness.
+    step_script "Deploy on the instance" | sed "s#/tmp/#$SB/#g" > "$SB/step.sh"
     bash "$SB/step.sh" > "$SB/step.out" 2>&1
     echo $? > "$SB/step.rc"
   )
@@ -569,6 +571,8 @@ assert_eq "explicit instance_id valid" 0 "$(validate INSTANCE_ID=i-0123456789abc
 assert_eq "bad instance_id rejected" 1 "$(validate INSTANCE_ID=nope)"
 assert_eq "run_migrations only for api" 1 "$(validate SERVICE=web RUN_MIGRATIONS=true BUILD_ARGS=NEXT_PUBLIC_API_URL=https://x)"
 assert_eq "health timeout too low" 1 "$(validate HEALTH_TIMEOUT=5)"
+assert_eq "timeout without a warm-up sample rejected" 1 "$(validate HEALTH_TIMEOUT=60 STABLE_SAMPLES=6)"
+assert_eq "timeout with exactly one warm-up sample valid" 0 "$(validate HEALTH_TIMEOUT=70 STABLE_SAMPLES=6)"
 assert_eq "non-https gate url rejected" 1 "$(validate GATE_SMOKE_URL=http://x.test/)"
 assert_eq "bad expect list rejected" 1 "$(validate GATE_SMOKE_EXPECT='200;rm')"
 assert_eq "legacy 2400 reconcile timeout still valid" 0 "$(validate RECONCILE_TIMEOUT=2400)"

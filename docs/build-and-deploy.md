@@ -205,7 +205,7 @@ are optional and their defaults preserve the old behaviour.
 | `dry_run` | no | `false` | Build and push the `<sha>` tag, pull and verify on the box, run `prisma migrate status` (if `run_migrations`); replace nothing, move nothing. |
 | `run_migrations` | no | `false` | api only (rejected for any other service). See *Migrations*. |
 | `health_timeout_seconds` | no | `300` | How long the new container has to become healthy and stable; reused for the wait after a rollback. 60..900. |
-| `health_stable_samples` | no | `6` | Consecutive healthy samples, 10 s apart, before the deploy counts as healthy. 2..30. |
+| `health_stable_samples` | no | `6` | Consecutive healthy samples, 10 s apart, before the deploy counts as healthy. 2..30. `health_timeout_seconds` must be at least `10 x (this + 1)`. |
 | `gate_smoke_url` | no | `''` | https URL curled **on the box** through the local proxy (`--resolve host:443:127.0.0.1`) as part of the gate. A failure rolls back. |
 | `gate_smoke_expect_status` | no | `200,204,401,403` | Passing codes for `gate_smoke_url`. For `admin`, 401 is the meaningful pass. |
 | `reconcile_timeout_seconds` | no | `2400` | Now a **floor**. The effective wait is the larger of this and `5460 + 2 x health_timeout_seconds + 300`. |
@@ -317,7 +317,8 @@ A hotfix is a normal deploy of a different commit; the rails stay on. Dispatch
 the caller workflow from the hotfix commit (or merge it to the deploy branch and
 dispatch). There is no "skip the gate" switch by design: if the gate is wrong
 for an emergency, shorten `health_timeout_seconds` (minimum 60) rather than
-bypassing it. To rehearse first, dispatch with `dry_run: true`.
+bypassing it, but keep it at least `10 x (health_stable_samples + 1)` seconds
+so the gate gets one warm-up sample before the stable ones. To rehearse first, dispatch with `dry_run: true`.
 
 ### Manual rollback
 
