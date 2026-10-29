@@ -57,3 +57,31 @@ output "trust" {
 output "perms" {
   value = { for k, d in data.aws_iam_policy_document.gha_deploy_pipeline : k => jsondecode(d.json) }
 }
+
+# PINNED expectation of the Federated OIDC statement (Statement[0]) for every
+# default deploy repo, written out literally rather than derived from the module
+# so that weakening the real statement (dropping a condition, loosening sub,
+# changing the principal) makes the tests fail. Keep in step with the defaults of
+# github_deploy_repos / github_deploy_workflow_ref on purpose.
+output "expected_oidc" {
+  value = {
+    for repo, svc in {
+      "storytime_be"          = "main"
+      "storytime-fe"          = "main"
+      "storytime_superadmin"  = "main"
+      "storytime-waitlist-be" = "main"
+      "storytime-waitlist-fe" = "main"
+      } : repo => {
+      Effect    = "Allow"
+      Action    = "sts:AssumeRoleWithWebIdentity"
+      Principal = { Federated = "arn:aws:iam::772316781095:oidc-provider/token.actions.githubusercontent.com" }
+      Condition = {
+        StringEquals = {
+          "token.actions.githubusercontent.com:aud"              = "sts.amazonaws.com"
+          "token.actions.githubusercontent.com:sub"              = "repo:Bolt-Silverfox/${repo}:ref:refs/heads/${svc}"
+          "token.actions.githubusercontent.com:job_workflow_ref" = "Bolt-Silverfox/storytime-devops/.github/workflows/build-and-deploy.yml@e8e832285ca78d3c49bd54142d9b5aa4fc1ad0b0"
+        }
+      }
+    }
+  }
+}

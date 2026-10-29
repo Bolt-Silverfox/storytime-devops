@@ -275,9 +275,9 @@ variable "woodpecker_agent_role_arns" {
   validation {
     condition = alltrue([
       for a in var.woodpecker_agent_role_arns :
-      can(regex("^arn:aws:iam::772641335580:role/[A-Za-z0-9+=,.@_/-]+$", a))
+      can(regex("^arn:aws:iam::772641335580:role/shared-spot-agent-storytime[A-Za-z0-9+=,.@_-]*$", a))
     ])
-    error_message = "woodpecker_agent_role_arns entries must be IAM role ARNs in the CI account 772641335580, e.g. arn:aws:iam::772641335580:role/shared-spot-agent-storytime."
+    error_message = "woodpecker_agent_role_arns entries must be the storytime-lane agent role in the CI account 772641335580: arn:aws:iam::772641335580:role/shared-spot-agent-storytime (optionally with a name suffix while rotating). No other role, :root, :user, path or wildcard."
   }
 
   validation {
@@ -322,9 +322,9 @@ variable "woodpecker_external_ids" {
 
   validation {
     condition = alltrue([
-      for v in values(var.woodpecker_external_ids) : length(v) >= 32 && can(regex("^[A-Za-z0-9+=,.@:/-]+$", v))
+      for v in values(var.woodpecker_external_ids) : length(v) >= 32 && length(v) <= 128 && can(regex("^[A-Za-z0-9_+=,.@:/-]+$", v))
     ])
-    error_message = "Each ExternalId must be at least 32 characters of [A-Za-z0-9+=,.@:/-] (openssl rand -hex 32)."
+    error_message = "Each ExternalId must be 32 to 128 characters of [A-Za-z0-9_+=,.@:/-] (AWS's ExternalId charset; openssl rand -hex 32 gives 64)."
   }
 }
 
@@ -481,10 +481,15 @@ data "aws_iam_policy_document" "gha_deploy_pipeline_assume" {
 }
 
 resource "aws_iam_role" "gha_deploy_pipeline" {
-  for_each           = local.deploy_repos
-  name               = "${var.name_prefix}-gha-deploy-${each.value.service}"
-  description        = "Builds ${each.key} and pushes ${var.ecr_repository_prefix}/${each.value.service}, then reconciles the app instance of ${var.github_deploy_target_stack}."
-  assume_role_policy = data.aws_iam_policy_document.gha_deploy_pipeline_assume[each.key].json
+  for_each    = local.deploy_repos
+  name        = "${var.name_prefix}-gha-deploy-${each.value.service}"
+  description = "Builds ${each.key} and pushes ${var.ecr_repository_prefix}/${each.value.service}, then reconciles the app instance of ${var.github_deploy_target_stack}."
+  # sensitive(): the Woodpecker statement embeds the ExternalId. Marking the
+  # variable sensitive does NOT survive aws_iam_policy_document (the rendered
+  # .json is not sensitive), so without this wrapper every plan that changes the
+  # trust prints the ExternalId in plaintext. A side effect: the trust diff is
+  # redacted in full, OIDC statement included; tests/infra pins that statement.
+  assume_role_policy = sensitive(data.aws_iam_policy_document.gha_deploy_pipeline_assume[each.key].json)
 
   # A build-and-deploy run is a build, a push, and a reconcile poll. On the
   # native arm64 runner that fits inside an hour; an emulated fallback build

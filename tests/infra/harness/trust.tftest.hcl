@@ -28,6 +28,14 @@ run "defaults_change_nothing" {
     error_message = "The remaining statement must be the Federated OIDC one."
   }
   assert {
+    condition     = alltrue([for k, t in output.trust : jsonencode(t.Statement[0]) == jsonencode(output.expected_oidc[k])])
+    error_message = "The OIDC statement (Effect, Action, Federated principal, aud, sub, job_workflow_ref) must equal the pinned expectation."
+  }
+  assert {
+    condition     = alltrue([for k, r in aws_iam_role.gha_deploy_pipeline : issensitive(r.assume_role_policy)])
+    error_message = "assume_role_policy must always be marked sensitive so a trust diff never prints an ExternalId."
+  }
+  assert {
     condition     = alltrue([for k, t in output.trust : !strcontains(jsonencode(t), "ExternalId")])
     error_message = "No ExternalId may appear while Woodpecker is unconfigured."
   }
@@ -75,6 +83,14 @@ run "woodpecker_trust_added_per_service" {
   assert {
     condition     = alltrue([for k, t in output.trust : t.Statement[0].Action == "sts:AssumeRoleWithWebIdentity"])
     error_message = "The OIDC statement must stay first and untouched."
+  }
+  assert {
+    condition     = alltrue([for k, t in output.trust : jsonencode(t.Statement[0]) == jsonencode(output.expected_oidc[k])])
+    error_message = "With Woodpecker set, the OIDC statement must still equal the pinned expectation exactly."
+  }
+  assert {
+    condition     = alltrue([for k, r in aws_iam_role.gha_deploy_pipeline : issensitive(r.assume_role_policy)])
+    error_message = "assume_role_policy carries the ExternalId and must be marked sensitive, or plans print it in plaintext."
   }
   assert {
     condition = alltrue([for k, t in output.trust :
@@ -130,6 +146,146 @@ run "duplicate_external_ids_rejected" {
       api   = "0123456789abcdef0123456789abcdef0123456789abcdef"
       admin = "0123456789abcdef0123456789abcdef0123456789abcdef"
     }
+  }
+  expect_failures = [var.woodpecker_external_ids]
+}
+
+run "arn_other_role_in_ci_account_rejected" {
+  command = plan
+  variables {
+    woodpecker_external_ids    = { for s in ["api", "admin", "web", "waitlist-api", "waitlist-web"] : s => "${s}${join("", [for i in range(32) : "x"])}" }
+    woodpecker_agent_role_arns = ["arn:aws:iam::772641335580:role/some-other-role"]
+  }
+  expect_failures = [var.woodpecker_agent_role_arns]
+}
+
+run "arn_account_root_rejected" {
+  command = plan
+  variables {
+    woodpecker_external_ids    = { for s in ["api", "admin", "web", "waitlist-api", "waitlist-web"] : s => "${s}${join("", [for i in range(32) : "x"])}" }
+    woodpecker_agent_role_arns = ["arn:aws:iam::772641335580:root"]
+  }
+  expect_failures = [var.woodpecker_agent_role_arns]
+}
+
+run "arn_user_rejected" {
+  command = plan
+  variables {
+    woodpecker_external_ids    = { for s in ["api", "admin", "web", "waitlist-api", "waitlist-web"] : s => "${s}${join("", [for i in range(32) : "x"])}" }
+    woodpecker_agent_role_arns = ["arn:aws:iam::772641335580:user/shared-spot-agent-storytime"]
+  }
+  expect_failures = [var.woodpecker_agent_role_arns]
+}
+
+run "arn_role_wildcard_rejected" {
+  command = plan
+  variables {
+    woodpecker_external_ids    = { for s in ["api", "admin", "web", "waitlist-api", "waitlist-web"] : s => "${s}${join("", [for i in range(32) : "x"])}" }
+    woodpecker_agent_role_arns = ["arn:aws:iam::772641335580:role/*"]
+  }
+  expect_failures = [var.woodpecker_agent_role_arns]
+}
+
+run "arn_name_wildcard_rejected" {
+  command = plan
+  variables {
+    woodpecker_external_ids    = { for s in ["api", "admin", "web", "waitlist-api", "waitlist-web"] : s => "${s}${join("", [for i in range(32) : "x"])}" }
+    woodpecker_agent_role_arns = ["arn:aws:iam::772641335580:role/shared-spot-agent-storytime*"]
+  }
+  expect_failures = [var.woodpecker_agent_role_arns]
+}
+
+run "arn_path_rejected" {
+  command = plan
+  variables {
+    woodpecker_external_ids    = { for s in ["api", "admin", "web", "waitlist-api", "waitlist-web"] : s => "${s}${join("", [for i in range(32) : "x"])}" }
+    woodpecker_agent_role_arns = ["arn:aws:iam::772641335580:role/x/shared-spot-agent-storytime"]
+  }
+  expect_failures = [var.woodpecker_agent_role_arns]
+}
+
+run "arn_trailing_newline_rejected" {
+  command = plan
+  variables {
+    woodpecker_external_ids    = { for s in ["api", "admin", "web", "waitlist-api", "waitlist-web"] : s => "${s}${join("", [for i in range(32) : "x"])}" }
+    woodpecker_agent_role_arns = ["arn:aws:iam::772641335580:role/shared-spot-agent-storytime\n"]
+  }
+  expect_failures = [var.woodpecker_agent_role_arns]
+}
+
+run "arn_three_entries_rejected" {
+  command = plan
+  variables {
+    woodpecker_external_ids = { for s in ["api", "admin", "web", "waitlist-api", "waitlist-web"] : s => "${s}${join("", [for i in range(32) : "x"])}" }
+    woodpecker_agent_role_arns = [
+      "arn:aws:iam::772641335580:role/shared-spot-agent-storytime",
+      "arn:aws:iam::772641335580:role/shared-spot-agent-storytime-a",
+      "arn:aws:iam::772641335580:role/shared-spot-agent-storytime-b",
+    ]
+  }
+  expect_failures = [var.woodpecker_agent_role_arns]
+}
+
+run "arn_rotation_name_with_prefix_accepted" {
+  command = plan
+  variables {
+    woodpecker_external_ids = { for s in ["api", "admin", "web", "waitlist-api", "waitlist-web"] : s => "${s}${join("", [for i in range(32) : "x"])}" }
+    woodpecker_agent_role_arns = [
+      "arn:aws:iam::772641335580:role/shared-spot-agent-storytime",
+      "arn:aws:iam::772641335580:role/shared-spot-agent-storytime-v2",
+    ]
+  }
+}
+
+run "external_id_31_chars_rejected" {
+  command = plan
+  variables {
+    woodpecker_external_ids = { api = join("", [for i in range(31) : "a"]) }
+  }
+  expect_failures = [var.woodpecker_external_ids]
+}
+
+run "external_id_32_chars_accepted" {
+  command = plan
+  variables {
+    woodpecker_external_ids = { api = join("", [for i in range(32) : "a"]) }
+  }
+}
+
+run "external_id_128_chars_accepted" {
+  command = plan
+  variables {
+    woodpecker_external_ids = { api = join("", [for i in range(128) : "a"]) }
+  }
+}
+
+run "external_id_129_chars_rejected" {
+  command = plan
+  variables {
+    woodpecker_external_ids = { api = join("", [for i in range(129) : "a"]) }
+  }
+  expect_failures = [var.woodpecker_external_ids]
+}
+
+run "external_id_underscore_accepted" {
+  command = plan
+  variables {
+    woodpecker_external_ids = { api = "${join("", [for i in range(31) : "a"])}_" }
+  }
+}
+
+run "external_id_space_rejected" {
+  command = plan
+  variables {
+    woodpecker_external_ids = { api = "${join("", [for i in range(31) : "a"])} " }
+  }
+  expect_failures = [var.woodpecker_external_ids]
+}
+
+run "external_id_quote_rejected" {
+  command = plan
+  variables {
+    woodpecker_external_ids = { api = "${join("", [for i in range(31) : "a"])}\"" }
   }
   expect_failures = [var.woodpecker_external_ids]
 }
