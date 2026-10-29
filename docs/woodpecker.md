@@ -97,13 +97,15 @@ document. The cost is that you can no longer eyeball "the OIDC statement did not
 change" in the plan diff; that check now comes from `tests/infra/run-tests.sh`,
 which pins the whole Federated statement (principal, `aud`, `sub`,
 `job_workflow_ref`) against a literal expectation, asserts the policy is marked
-sensitive, and runs in CI (`lint` workflow). An update-in-place of the five roles
-with no visible diff is expected on the first plan after this lands, and is
-confirmed harmless by the test rather than by reading the diff.
+sensitive, and runs in CI (`lint` workflow). With the defaults the rendered IAM
+policy is unchanged. Wrapping the attribute in `sensitive()` may still make the
+first plan after this lands show the five roles as an in-place update; that is
+metadata only (the policy text is identical) and cannot be verified by reading
+the redacted diff, so rely on the test and on the resource list.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `woodpecker_agent_role_arns` | `[]` | the lane's instance role ARN; only `role/shared-spot-agent-storytime` (optionally with a name suffix while rotating) in account 772641335580 (max 2: current + one being rotated in) |
+| `woodpecker_agent_role_arns` | `[]` | the lane's instance role ARN; only `role/shared-spot-agent-storytime` (optionally with a name suffix while rotating, role name at most 64 characters) in account 772641335580 (max 2: current + one being rotated in) |
 | `woodpecker_external_ids` | `{}` (sensitive) | service => ExternalId; keys `api admin web waitlist-api waitlist-web`; 32 to 128 chars of `[A-Za-z0-9_+=,.@:/-]` |
 | `woodpecker_ecr_registry_cache` | `false` | optional `ecr:GetDownloadUrlForLayer` on the role's own repository (see below) |
 
@@ -172,6 +174,13 @@ PY
    tofu workspace select shared
    tofu plan -var-file=terraform.shared.tfvars -var-file=$HOME/.config/storytime/woodpecker.tfvars.json -out=wp.tfplan
    ```
+
+   **`wp.tfplan` is a secret.** A saved plan holds the input variables and
+   planned values in cleartext, ExternalIds included, even though the terminal
+   output is redacted. Keep it outside any synced or shared folder, never upload
+   it (CI artefacts, chat, tickets), and delete it right after
+   `tofu apply wp.tfplan` (`shred -u` or `rm`). `.gitignore` does not protect a
+   local copy.
 
    Use `tofu` for everything that touches state. Do not mix Terraform and
    OpenTofu on the shared S3 state: whichever writes last can bump the state

@@ -275,9 +275,9 @@ variable "woodpecker_agent_role_arns" {
   validation {
     condition = alltrue([
       for a in var.woodpecker_agent_role_arns :
-      can(regex("^arn:aws:iam::772641335580:role/shared-spot-agent-storytime[A-Za-z0-9+=,.@_-]*$", a))
+      can(regex("^arn:aws:iam::772641335580:role/shared-spot-agent-storytime[A-Za-z0-9+=,.@_-]{0,37}$", a))
     ])
-    error_message = "woodpecker_agent_role_arns entries must be the storytime-lane agent role in the CI account 772641335580: arn:aws:iam::772641335580:role/shared-spot-agent-storytime (optionally with a name suffix while rotating). No other role, :root, :user, path or wildcard."
+    error_message = "woodpecker_agent_role_arns entries must be the storytime-lane agent role in the CI account 772641335580: arn:aws:iam::772641335580:role/shared-spot-agent-storytime (optionally with a name suffix while rotating; the whole role name is at most 64 characters). No other role, :root, :user, path or wildcard."
   }
 
   validation {

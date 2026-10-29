@@ -289,3 +289,20 @@ run "external_id_quote_rejected" {
   }
   expect_failures = [var.woodpecker_external_ids]
 }
+
+run "arn_role_name_over_64_chars_rejected" {
+  command = plan
+  variables {
+    woodpecker_external_ids    = { for s in ["api", "admin", "web", "waitlist-api", "waitlist-web"] : s => "${s}${join("", [for i in range(32) : "x"])}" }
+    woodpecker_agent_role_arns = ["arn:aws:iam::772641335580:role/shared-spot-agent-storytime${join("", [for i in range(38) : "a"])}"]
+  }
+  expect_failures = [var.woodpecker_agent_role_arns]
+}
+
+run "arn_role_name_64_chars_accepted" {
+  command = plan
+  variables {
+    woodpecker_external_ids    = { for s in ["api", "admin", "web", "waitlist-api", "waitlist-web"] : s => "${s}${join("", [for i in range(32) : "x"])}" }
+    woodpecker_agent_role_arns = ["arn:aws:iam::772641335580:role/shared-spot-agent-storytime${join("", [for i in range(37) : "a"])}"]
+  }
+}
