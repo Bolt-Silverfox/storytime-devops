@@ -87,10 +87,24 @@ All additive; with the defaults below nothing in any plan changes
 (`tests/infra/run-tests.sh` proves it: trust policies keep exactly the one OIDC
 statement).
 
+**Plans redact the trust policy.** The ExternalId is written into the role's
+trust policy, and marking the variable `sensitive` does not survive
+`aws_iam_policy_document` (its rendered `.json` is plain), so a plain diff of
+`assume_role_policy` would print it. The role therefore sets
+`assume_role_policy = sensitive(...)`: `tofu plan` shows the attribute as
+`(sensitive value)` and reveals neither the ExternalId nor the rest of the trust
+document. The cost is that you can no longer eyeball "the OIDC statement did not
+change" in the plan diff; that check now comes from `tests/infra/run-tests.sh`,
+which pins the whole Federated statement (principal, `aud`, `sub`,
+`job_workflow_ref`) against a literal expectation, asserts the policy is marked
+sensitive, and runs in CI (`lint` workflow). An update-in-place of the five roles
+with no visible diff is expected on the first plan after this lands, and is
+confirmed harmless by the test rather than by reading the diff.
+
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `woodpecker_agent_role_arns` | `[]` | the lane's instance role ARN (max 2: current + one being rotated in) |
-| `woodpecker_external_ids` | `{}` (sensitive) | service => ExternalId; keys `api admin web waitlist-api waitlist-web`; at least 32 chars |
+| `woodpecker_agent_role_arns` | `[]` | the lane's instance role ARN; only `role/shared-spot-agent-storytime` (optionally with a name suffix while rotating) in account 772641335580 (max 2: current + one being rotated in) |
+| `woodpecker_external_ids` | `{}` (sensitive) | service => ExternalId; keys `api admin web waitlist-api waitlist-web`; 32 to 128 chars of `[A-Za-z0-9_+=,.@:/-]` |
 | `woodpecker_ecr_registry_cache` | `false` | optional `ecr:GetDownloadUrlForLayer` on the role's own repository (see below) |
 
 When `woodpecker_agent_role_arns` is non-empty each of the five roles gets a
@@ -147,12 +161,27 @@ json.dump({"woodpecker_agent_role_arns": [os.environ["LANE_ROLE_ARN"]], "woodpec
 PY
 ```
 
-   Both files are secrets: keep them outside the checkout (`*.tfvars` is
-   git-ignored here, `.tfvars.json` is not).
+   Both files are secrets: keep them outside the checkout. (`infra/.gitignore`
+   ignores both `*.tfvars` and `*.tfvars.json`, so an accidental copy into
+   `infra/` will not be staged, but outside the checkout is still the rule.)
 2. In the `shared` workspace (account 772316781095, as for the other role
-   changes): `terraform plan -var-file=terraform.shared.tfvars -var-file=$HOME/.config/storytime/woodpecker.tfvars.json -out=wp.tfplan`.
+   changes), using **OpenTofu**:
+
+   ```sh
+   cd infra
+   tofu workspace select shared
+   tofu plan -var-file=terraform.shared.tfvars -var-file=$HOME/.config/storytime/woodpecker.tfvars.json -out=wp.tfplan
+   ```
+
+   Use `tofu` for everything that touches state. Do not mix Terraform and
+   OpenTofu on the shared S3 state: whichever writes last can bump the state
+   format/version and lock the other out. (CI uses Terraform only for
+   `fmt`/`validate`/`tflint`, with `-backend=false`, so it never touches state.)
+
    Expected: 5 `aws_iam_role.gha_deploy_pipeline` **updated in place** (trust
-   policy only), nothing else. Anything else: stop. Apply it.
+   policy only), nothing else. The `assume_role_policy` change is shown as
+   `(sensitive value)` (see "Plans redact the trust policy"); check the
+   resource list, not the diff text. Anything else: stop. Apply it.
 3. Verify, from a step later (phase 2 check) or by hand with the lane role.
 
 ### Phase 2: activate repos and secrets in Woodpecker (still no deploys)
@@ -175,15 +204,19 @@ PY
 
    Copy a value without showing it, e.g.
    `grep '^api=' ~/.config/storytime/woodpecker-external-ids.env | cut -d= -f2- | tr -d '\n' | pbcopy`
-   and paste into the UI. Do not put it in a `.woodpecker/*.yaml`. The role ARN
+   and paste into the UI. **The clipboard is not private:** clipboard managers
+   and history tools (Raycast, Alfred, Paste, Maccy, Universal Clipboard to
+   other devices) can keep the value after you paste it. Turn clipboard history
+   off or exclude the terminal first, and overwrite the clipboard afterwards
+   (`printf '' | pbcopy`). Do not put it in a `.woodpecker/*.yaml`. The role ARN
    (`arn:aws:iam::772316781095:role/storytime-gha-deploy-<service>`) is not a
    secret and lives in the pipeline file.
-3. Rotation: generate a new value for one service, `terraform apply` with it,
+3. Rotation: generate a new value for one service, `tofu apply` with it,
    update that repo's secret. Between the two the deploy fails closed. (There is
    no overlap window per service; schedule it outside a deploy.)
 4. Prove it before any real deploy: a manual pipeline on `storytime-waitlist-fe`
-   with the single step in the sketch below (`sts assume-role` then
-   `sts get-caller-identity`), expect `storytime-gha-deploy-waitlist-web`. Then
+   with the single `assume-role-check` step in the sketch below (profile
+   assume, then `sts get-caller-identity`), expect `storytime-gha-deploy-waitlist-web`. Then
    prove the negatives: a `push` pipeline cannot read `aws_external_id`; a
    wrong ExternalId gets AccessDenied; the api repo's value does not work on the
    web role.
@@ -227,17 +260,23 @@ variables:
   - &repo 772316781095.dkr.ecr.eu-west-1.amazonaws.com/storytime/api
 
 steps:
-  - name: assume-role           # instance role -> deploy role; credentials stay in the workspace
+  - name: assume-role-check     # per-step profile: no credentials file in the shared workspace
     image: *aws_cli
     environment:
       AWS_REGION: eu-west-1
+      AWS_CONFIG_FILE: /tmp/aws-config   # container-local, NOT under /woodpecker (the shared workspace)
+      AWS_PROFILE: deploy
       ROLE_ARN: *role
     secrets: [aws_external_id]
     commands:
-      - aws sts assume-role --role-arn "$ROLE_ARN" --role-session-name "wp-$CI_PIPELINE_NUMBER"
-          --duration-seconds 7200 --external-id "$AWS_EXTERNAL_ID" --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' --output text > /woodpecker/aws-creds.txt
-      - read -r AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN < /woodpecker/aws-creds.txt && export AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
-      - 'echo "assumed: $(aws sts get-caller-identity --query Arn --output text)"'   # now with the deploy role creds
+      # Every AWS step repeats these two lines, so each assumes the role for
+      # itself and nothing with credentials is written where a later step (or a
+      # later pipeline on a reused workspace) can read it. The ExternalId must
+      # therefore be allowed to every AWS step (images filter stays amazon/aws-cli).
+      - printf '[profile deploy]\nrole_arn = %s\ncredential_source = Ec2InstanceMetadata\nexternal_id = %s\nrole_session_name = wp-%s\nduration_seconds = 7200\n' "$ROLE_ARN" "$AWS_EXTERNAL_ID" "$CI_PIPELINE_NUMBER" > "$AWS_CONFIG_FILE"
+      - 'echo "assumed: $(aws sts get-caller-identity --query Arn --output text)"'   # deploy role creds
+      # DO NOT instead write the assume-role output to /woodpecker/*: that is the
+      # workspace every later step mounts, and it would hold live credentials.
 
   - name: ecr-login-and-resolve  # ECR password, instance lookup by tag (as "Resolve target instance")
     image: *aws_cli
@@ -266,7 +305,7 @@ Mapping from the GitHub workflow:
 
 | GitHub step | Woodpecker |
 | --- | --- |
-| `configure-aws-credentials` (OIDC, 7200 s) | `assume-role` above, 7200 s, direct from the instance role (no chaining) |
+| `configure-aws-credentials` (OIDC, 7200 s) | a per-step profile (`assume-role-check` above), 7200 s, direct from the instance role (no chaining) |
 | Resolve target instance (tags) | same shell, `ec2 describe-instances` |
 | Log in to ECR | `aws ecr get-login-password` |
 | `build-push-action`, `type=gha` cache | buildx plugin on the heavy lane, `type=registry` cache or none |
@@ -288,11 +327,16 @@ Open items (unverified, do not assume):
    it (clone this repo at a pinned SHA; whether the repo is readable from the
    lane without a token) is not settled.
 3. **Passing assumed credentials between steps.** Each step is its own
-   container; the sketch writes them to a workspace file. Alternative: an
-   `~/.aws/config` profile with `credential_source = Ec2InstanceMetadata`,
-   `role_arn` and `external_id` so each step assumes for itself (no file with
-   credentials, but the ExternalId must then be present as a secret in every
-   step that calls AWS).
+   container. The sketch deliberately does NOT hand credentials between steps
+   through the shared workspace (any later step, including a plugin image, could
+   read them); each AWS step builds a container-local `AWS_CONFIG_FILE` profile
+   with `credential_source = Ec2InstanceMetadata`, `role_arn` and `external_id`
+   and assumes for itself. The cost is that the ExternalId secret is present in
+   every step that calls AWS. `credential_source` with `duration_seconds` /
+   `external_id` in a profile is unverified against this setup (see item 5); if
+   it fails, the fallback is ONE step that does assume-role, resolve, deploy and
+   promote in a single shell with the credentials only in that shell's
+   environment.
 4. **Secret image filter vs. the plugin.** The buildx plugin step has no secret
    today; the AWS steps all use `amazon/aws-cli`. If a step ever needs another
    image to see an AWS secret, widen the filter deliberately, not by dropping it.
