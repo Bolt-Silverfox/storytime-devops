@@ -1,0 +1,87 @@
+# Test harness stubs for infra/github-oidc-deploy.tf (copied in by run-tests.sh).
+# Declares only what that file reads from the rest of the stack. The aws
+# provider is configured with fake credentials and every AWS-facing check off:
+# the harness plans, it never applies, and nothing here talks to AWS.
+
+terraform {
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.40"
+    }
+  }
+}
+
+provider "aws" {
+  region                      = "eu-west-1"
+  access_key                  = "test"
+  secret_key                  = "test"
+  skip_credentials_validation = true
+  skip_requesting_account_id  = true
+  skip_metadata_api_check     = true
+  skip_region_validation      = true
+}
+
+variable "name_prefix" {
+  type    = string
+  default = "storytime"
+}
+
+variable "ecr_repository_prefix" {
+  type    = string
+  default = "storytime"
+}
+
+variable "services" {
+  type = map(any)
+  default = {
+    api          = {}
+    web          = {}
+    admin        = {}
+    waitlist-api = {}
+    waitlist-web = {}
+  }
+}
+
+data "aws_caller_identity" "current" {}
+data "aws_region" "current" {}
+
+locals {
+  github_oidc_provider_arn = "arn:aws:iam::772316781095:oidc-provider/token.actions.githubusercontent.com"
+}
+
+output "trust" {
+  value = { for k, d in data.aws_iam_policy_document.gha_deploy_pipeline_assume : k => jsondecode(d.json) }
+}
+
+output "perms" {
+  value = { for k, d in data.aws_iam_policy_document.gha_deploy_pipeline : k => jsondecode(d.json) }
+}
+
+# PINNED expectation of the Federated OIDC statement (Statement[0]) for every
+# default deploy repo, written out literally rather than derived from the module
+# so that weakening the real statement (dropping a condition, loosening sub,
+# changing the principal) makes the tests fail. Keep in step with the defaults of
+# github_deploy_repos / github_deploy_workflow_ref on purpose.
+output "expected_oidc" {
+  value = {
+    for repo, svc in {
+      "storytime_be"          = "main"
+      "storytime-fe"          = "main"
+      "storytime_superadmin"  = "main"
+      "storytime-waitlist-be" = "main"
+      "storytime-waitlist-fe" = "main"
+      } : repo => {
+      Effect    = "Allow"
+      Action    = "sts:AssumeRoleWithWebIdentity"
+      Principal = { Federated = "arn:aws:iam::772316781095:oidc-provider/token.actions.githubusercontent.com" }
+      Condition = {
+        StringEquals = {
+          "token.actions.githubusercontent.com:aud"              = "sts.amazonaws.com"
+          "token.actions.githubusercontent.com:sub"              = "repo:Bolt-Silverfox/${repo}:ref:refs/heads/${svc}"
+          "token.actions.githubusercontent.com:job_workflow_ref" = "Bolt-Silverfox/storytime-devops/.github/workflows/build-and-deploy.yml@e8e832285ca78d3c49bd54142d9b5aa4fc1ad0b0"
+        }
+      }
+    }
+  }
+}
