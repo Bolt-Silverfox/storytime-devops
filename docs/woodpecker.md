@@ -75,8 +75,9 @@ Woodpecker behaviour: confirm each on the server before relying on it.
    on the server whether a manual run of a non-default branch is possible for
    them.)
    **Decision (owner, sole operator): there is no second-person approval gate**
-   for Woodpecker pipelines, so the gap is closed with a control that needs no
-   second person. **Design rule, to implement when deploy pipelines are written
+   for Woodpecker pipelines, so the control below needs no second person. It
+   **reduces accidental deployment** of an unmerged or non-`main` commit
+   (branch drift); it does not close the gap (see its limits). **Design rule, to implement when deploy pipelines are written
    (not implemented now):** the deploy pipeline starts with a step named
    `guard` that fails unless the event is `manual` **and** `CI_COMMIT_SHA`
    equals the head of `origin/main`:
@@ -171,10 +172,14 @@ Woodpecker behaviour: confirm each on the server before relying on it.
    be scheduled onto these instances and reach the instance role's
    credentials; the ExternalId, and nothing else, then stands between that
    step and these five roles. (Unverified: confirm on the server how label
-   matching and repo/organization restrictions behave.) **Optional hardening, not a
-   blocker:** an organization-scoped agent for Bolt-Silverfox, so that only
-   Bolt-Silverfox repos can be scheduled there. It changes infra-shared, not
-   this repository.
+   matching and repo/organization restrictions behave.) **Prerequisite for
+   deploy, not for CI:** CI-only runs do not need this, because CI uses its own
+   CI-only lane with no AWS access (infra-shared PR #10; not re-verified here).
+   But before any deploy pipeline is enabled on this deploy lane, its agents
+   must be restricted so only the deploy repos (Bolt-Silverfox, the five
+   activated repos) can be scheduled there, for example an organization-scoped
+   agent. The owner dropped the second-person gate, not this isolation. It
+   changes infra-shared, not this repository.
 
 If you need GitHub's "only this pinned workflow on this branch" guarantee
 back for production, keep the GitHub OIDC path as the production deployer and
