@@ -74,10 +74,30 @@ Woodpecker behaviour: confirm each on the server before relying on it.
    with `image: amazon/aws-cli` and read the ExternalId. (Unverified: confirm
    on the server whether a manual run of a non-default branch is possible for
    them.)
-   **OWNER DECISION, not yet taken:** set the approval mode to `all_events`
-   (every pipeline waits for a maintainer's approval), or put an equivalent
-   second-person gate in front of manual runs, for these five repos. Until it
-   is decided, do not describe pipeline file changes as "code reviewed".
+   **Decision (owner, sole operator): there is no second-person approval gate**
+   for Woodpecker pipelines, so the gap is closed with a control that needs no
+   second person. **Design rule, to implement when deploy pipelines are written
+   (not implemented now):** the deploy pipeline's first step must fail unless
+   the event is `manual` **and** the commit is reachable from `origin/main`,
+   for example:
+
+   ```sh
+   [ "$CI_PIPELINE_EVENT" = manual ] &&
+     git fetch origin main &&
+     git merge-base --is-ancestor "$CI_COMMIT_SHA" origin/main
+   ```
+
+   A run of an unmerged branch then stops before any later step can use the
+   deploy secrets. Limits: this guard lives in the pipeline file itself, so the
+   branch author can delete it from their own copy; it protects against
+   mistakes and a stale branch, not against a hostile author with write access.
+   Treat repo write access as deploy access (see above), and keep the guard
+   plus the event/image filter in item 2 as the compensating controls. Do not
+   describe pipeline file changes on non-`main` branches as "code reviewed".
+   (Unverified Woodpecker behaviour, confirm on the server: the variable names
+   `CI_PIPELINE_EVENT` and `CI_COMMIT_SHA`, whether the clone has enough
+   history for `merge-base`, and what a manual run of a non-default branch
+   checks out. The step must fail closed if the fetch fails.)
 2. The ExternalId secret is scoped to **event `manual`** and **image
    `amazon/aws-cli`** in the secret's settings, so a push or PR pipeline, or a
    step using any other image, cannot read it. (Image matching is by name, not
@@ -85,8 +105,9 @@ Woodpecker behaviour: confirm each on the server before relying on it.
    filter used by a plugin step; the phase 3 smoke test must prove a `push`
    pipeline cannot print it.)
 3. Pull-request events never receive deploy secrets (via the event filter in
-   item 2); fork PRs wait for approval (server setting
-   `WOODPECKER_DEFAULT_APPROVAL_MODE=forks`); only billmal071 and
+   item 2); fork PRs are not enabled for these repos (leave "Allow pull
+   requests" off or restrict it to the repo's own branches; there is no
+   approval gate to rely on); only billmal071 and
    Bolt-Silverfox repos can be activated. Both are to be confirmed on the
    server.
 4. Branch protection on `main` of the app repos and on `storytime-devops` stays.
@@ -106,10 +127,10 @@ Woodpecker behaviour: confirm each on the server before relying on it.
    be scheduled onto these instances and reach the instance role's
    credentials; the ExternalId, and nothing else, then stands between that
    step and these five roles. (Unverified: confirm on the server how label
-   matching and repo/organization restrictions behave.) **Recommended:** an
-   organization-scoped agent for Bolt-Silverfox, so that only Bolt-Silverfox
-   repos can be scheduled there. **OWNER DECISION, not yet taken**, and it
-   changes infra-shared, not this repository.
+   matching and repo/organization restrictions behave.) **Optional hardening, not a
+   blocker:** an organization-scoped agent for Bolt-Silverfox, so that only
+   Bolt-Silverfox repos can be scheduled there. It changes infra-shared, not
+   this repository.
 
 If you need GitHub's "only this pinned workflow on this branch" guarantee
 back for production, keep the GitHub OIDC path as the production deployer and
@@ -173,7 +194,7 @@ from it.
 **ExternalId strength and the review hash.** `gha_deploy_trust_review` shows
 each ExternalId as the first 16 hex characters (64 bits) of an unsalted
 sha256. The hash is for **review only** (does it change); it is not a secret
-store. Validation checks length and charset, not entropy, and deliberately does
+store. Validation checks length and charset, that the ExternalIds are distinct from each other, and that the key set is exactly the five services; it does not check entropy, and deliberately does
 not do more (it could reject the live values). So: every ExternalId must come
 from `openssl rand -hex 32`, one per service. Never use a word, a name, an ARN,
 a repo name or any value that already appears in the trust policy (e.g. the
@@ -269,8 +290,9 @@ deploy outage window, not a reconcile.
      update on exactly the five `aws_iam_role.gha_deploy_pipeline` entries,
      and the plan prints a warning that includes the sentence **"The value is
      unchanged."**. That sentence is what distinguishes the marker-only case:
-     present on all five roles => marker only; apply once, the next plan shows
-     no role changes. A warning **without** that sentence, or a role update
+     present on all five roles => marker only; apply that saved plan once
+     (`tofu apply wp.tfplan`), the next plan shows no role
+     changes. A warning **without** that sentence, or a role update
      shown as a diff with no such warning, is **not** the marker case: stop
      and investigate.
    - **Any other update on a `gha_deploy_pipeline` role is stop-and-
@@ -281,8 +303,10 @@ deploy outage window, not a reconcile.
      (ExternalIds) and the `gha_deploy_trust_review` diff (everything else) to
      tell them apart.
 4. **Stop; do not apply unless the plan is clean or expected** (no role changes,
-   or exactly the five marker updates above, plus the new output). Delete
-   `wp.tfplan` afterwards; it is a secret.
+   or exactly the five marker updates above, plus the new output). If it is,
+   apply exactly the reviewed file with `tofu apply wp.tfplan`, then delete
+   `wp.tfplan` (`rm` or `shred -u`); it is a secret. If it is not, delete it
+   without applying.
 
 Prerequisites (for a *fresh* setup only): the infra-shared storytime lane is applied and
 `infra/tofu staging output spot_storytime_role_arn` (run from the infra-shared repository checkout's `infra/` wrapper directory, where the `tofu` helper script lives) printed
@@ -349,7 +373,7 @@ PY
    `storytime_superadmin` (admin), `storytime-waitlist-be` (waitlist-api),
    `storytime-waitlist-fe` (waitlist-web). (Allowed: `WOODPECKER_REPO_OWNERS`
    already lists Bolt-Silverfox.) In each repo's settings leave "Allow pull
-   requests" on only if you want CI on PRs; set "Pipeline approval" to forks.
+   requests" on only if you want CI on PRs; do not enable fork PRs.
 2. In each repo: Settings > Secrets > Add secret:
 
    | Repo | Secret **name** | Value comes from | Available at events | Images |

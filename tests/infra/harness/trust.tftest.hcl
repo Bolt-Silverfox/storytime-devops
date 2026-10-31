@@ -464,7 +464,7 @@ run "external_id_valid_key_with_extra_unknown_key_rejected" {
 }
 
 # Documents (does not fix) the review hash's limits: an ExternalId that equals
-# other policy text -- here the Sid -- makes the split/join replace that text
+# other policy text -- here the principal ARN -- makes the split/join replace that text
 # everywhere in the review. Real IDs come from `openssl rand -hex 32` (docs).
 # No network: the data sources are overridden at the top of this file.
 run "review_weak_external_id_documented_behaviour" {
