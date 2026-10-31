@@ -244,11 +244,123 @@ variable "github_deploy_workflow_ref" {
   }
 }
 
+variable "woodpecker_agent_role_arns" {
+  description = <<-EOT
+    IAM role ARNs (in the CI account, 772641335580) allowed to assume the
+    per-service deploy roles from the shared Woodpecker server's storytime lane,
+    i.e. the instance role of the `lane=heavy-storytime` spot agents
+    (infra-shared: `shared-spot-agent-storytime`).
+
+    EMPTY (the default) adds NOTHING: no second trust statement is rendered, so
+    the roles' trust policies are byte-identical to the GitHub-OIDC-only form.
+
+    When set, every deploy role gains a second statement:
+    sts:AssumeRole by these principals ONLY when `sts:ExternalId` equals that
+    service's value in var.woodpecker_external_ids. The Federated OIDC statement
+    is not touched. See docs/woodpecker.md for the trust model and its limits.
+
+    The principal must EXIST when this is applied (IAM rejects an unknown
+    principal), so apply infra-shared's storytime lane first. IAM stores a role
+    principal as its unique ID: if that role is ever deleted and re-created,
+    re-apply this (taint the roles' trust, or change the list and back) or the
+    trust silently stops matching.
+
+    Role chaining is NOT used: the caller is an EC2 instance profile, not an
+    assumed-role session, so the roles' max_session_duration (7200) applies in
+    full to the one assume-role call a pipeline makes.
+  EOT
+  type        = list(string)
+  default     = []
+
+  validation {
+    condition = alltrue([
+      for a in var.woodpecker_agent_role_arns :
+      can(regex("^arn:aws:iam::772641335580:role/shared-spot-agent-storytime[A-Za-z0-9+=,.@_-]{0,37}$", a))
+    ])
+    error_message = "woodpecker_agent_role_arns entries must be the storytime-lane agent role in the CI account 772641335580: arn:aws:iam::772641335580:role/shared-spot-agent-storytime (optionally with a name suffix while rotating; the whole role name is at most 64 characters). No other role, :root, :user, path or wildcard."
+  }
+
+  validation {
+    condition     = length(var.woodpecker_agent_role_arns) <= 2
+    error_message = "At most two Woodpecker agent roles (current plus one being rotated in)."
+  }
+}
+
+variable "woodpecker_external_ids" {
+  description = <<-EOT
+    service => ExternalId required by the Woodpecker trust statement, keys among
+    api, admin, web, waitlist-api, waitlist-web (the deploy roles' `service`).
+    Generate each with `openssl rand -hex 32`; use a DIFFERENT value per service.
+
+    SENSITIVE and passed via TF_VAR_woodpecker_external_ids or an untracked
+    tfvars file, never committed. NOTE what that does and does not protect: the
+    value is written into the role's trust policy (readable by anyone with
+    iam:GetRole in this account) and sits in Terraform state. It is a
+    confused-deputy guard and a per-service rotation handle, not a standalone
+    secret. The pipeline's secret is the other copy.
+
+    When woodpecker_agent_role_arns is non-empty, every deploy service must have
+    an entry of at least 32 characters (a precondition fails the plan
+    otherwise); a service without one would silently get no Woodpecker trust.
+  EOT
+  type        = map(string)
+  sensitive   = true
+  default     = {}
+
+  validation {
+    condition = alltrue([
+      for k in keys(var.woodpecker_external_ids) :
+      contains(["api", "admin", "web", "waitlist-api", "waitlist-web"], k)
+    ])
+    error_message = "woodpecker_external_ids keys must be among api, admin, web, waitlist-api, waitlist-web."
+  }
+
+  validation {
+    condition     = length(distinct(values(var.woodpecker_external_ids))) == length(values(var.woodpecker_external_ids))
+    error_message = "Each service needs its own distinct ExternalId; do not reuse a value across services."
+  }
+
+  validation {
+    condition = alltrue([
+      for v in values(var.woodpecker_external_ids) : length(v) >= 32 && length(v) <= 128 && can(regex("^[A-Za-z0-9_+=,.@:/-]+$", v))
+    ])
+    error_message = "Each ExternalId must be 32 to 128 characters of [A-Za-z0-9_+=,.@:/-] (AWS's ExternalId charset; openssl rand -hex 32 gives 64)."
+  }
+}
+
+variable "woodpecker_ecr_registry_cache" {
+  description = <<-EOT
+    OPTIONAL, default off. Grants the deploy roles ecr:GetDownloadUrlForLayer on
+    their own repository so a BuildKit `type=registry` layer cache can be READ
+    back (the push set already has BatchGetImage; the cache write path needs no
+    more). The existing GitHub workflow uses type=gha and needs none of this.
+
+    DO NOT turn it on before the repository's lifecycle policy has a rule for
+    the cache tag: cache manifests are images, they count toward
+    ecr_keep_last_images, and an unmanaged cache tag would push real images out
+    of the keep-last window. See docs/woodpecker.md ("ECR registry cache").
+    Note it also lets a role read every layer of its repository, which is why
+    it is not granted by default.
+  EOT
+  type        = bool
+  default     = false
+}
+
 locals {
   deploy_repos = var.manage_github_deploy_roles ? var.github_deploy_repos : {}
 
   # Normalised to a list whether the caller supplied a string or a list.
   deploy_workflow_refs = distinct(flatten([var.github_deploy_workflow_ref]))
+
+  # repo => service, only for services that get the Woodpecker trust statement:
+  # at least one agent role is configured AND the service has an ExternalId.
+  # nonsensitive() reveals only the boolean "is there an entry", never the value;
+  # without it the sensitive map would make the for_each below unusable.
+  woodpecker_trust = {
+    for repo, cfg in local.deploy_repos :
+    repo => cfg.service
+    if length(var.woodpecker_agent_role_arns) > 0 && nonsensitive(lookup(var.woodpecker_external_ids, cfg.service, "") != "")
+  }
 
   # Built from the prefix rather than read off aws_ecr_repository.svc so this
   # file does not require the same workspace to also own ECR. The validation
@@ -272,6 +384,14 @@ resource "terraform_data" "github_deploy_guards" {
     precondition {
       condition     = alltrue([for cfg in var.github_deploy_repos : contains(keys(var.services), cfg.service)])
       error_message = "Every github_deploy_repos service must be a key of var.services, so its ECR repository actually exists."
+    }
+
+    precondition {
+      condition = (
+        length(var.woodpecker_agent_role_arns) == 0 ||
+        alltrue([for cfg in var.github_deploy_repos : nonsensitive(lookup(var.woodpecker_external_ids, cfg.service, "") != "")])
+      )
+      error_message = "woodpecker_agent_role_arns is set, so woodpecker_external_ids needs an entry for EVERY deploy service (api, admin, web, waitlist-api, waitlist-web); a service without one would get no Woodpecker trust at all."
     }
 
     precondition {
@@ -325,13 +445,77 @@ data "aws_iam_policy_document" "gha_deploy_pipeline_assume" {
       values   = local.deploy_workflow_refs
     }
   }
+
+  # SECOND, additive statement: the shared Woodpecker server's storytime lane.
+  # Rendered only when var.woodpecker_agent_role_arns is non-empty and this
+  # service has an ExternalId; otherwise the document is exactly the one above.
+  #
+  # What it binds, honestly: "a step running on the storytime lane (its instance
+  # role) that knows this service's ExternalId". GitHub's statement binds repo +
+  # branch + a SHA-pinned workflow; there is no equivalent claim here. The
+  # mitigations are in Woodpecker (manual-event deploy pipeline, secrets scoped
+  # to event=manual and the aws-cli image) -- see docs/woodpecker.md.
+  #
+  # One assume-role from instance-profile credentials: NOT role chaining, so
+  # max_session_duration on the role applies in full.
+  dynamic "statement" {
+    for_each = contains(keys(local.woodpecker_trust), each.key) ? [1] : []
+
+    content {
+      sid     = "WoodpeckerStorytimeLane"
+      effect  = "Allow"
+      actions = ["sts:AssumeRole"]
+
+      principals {
+        type        = "AWS"
+        identifiers = var.woodpecker_agent_role_arns
+      }
+
+      condition {
+        test     = "StringEquals"
+        variable = "sts:ExternalId"
+        values   = [var.woodpecker_external_ids[each.value.service]]
+      }
+    }
+  }
+}
+
+# Reviewable twin of the (redacted) assume_role_policy of every deploy role.
+#
+# Same rendered JSON as the roles carry, decoded so a plan diffs it per field
+# (principals, Sids, actions, OIDC aud / sub / job_workflow_ref), except that
+# each ExternalId is replaced by "sha256:<first 16 hex of sha256(id)>". A
+# rotation therefore still shows as a changed marker, and no ExternalId reaches
+# the plan, state or `tofu output`. split/join instead of replace(): replace()
+# treats a value that starts and ends with "/" as a regex, and "/" is allowed in
+# an ExternalId. It does not touch the roles' policy, so it changes no IAM.
+output "gha_deploy_trust_review" {
+  description = "repo name => the deploy role's trust document with ExternalIds replaced by a truncated sha256. Non-sensitive on purpose: this is what a plan shows for the trust, because the role's own assume_role_policy is redacted."
+  value = {
+    for repo, d in data.aws_iam_policy_document.gha_deploy_pipeline_assume : repo => jsondecode(
+      contains(keys(local.woodpecker_trust), repo)
+      ? nonsensitive(join(
+        "sha256:${substr(sha256(var.woodpecker_external_ids[local.woodpecker_trust[repo]]), 0, 16)}",
+        split(var.woodpecker_external_ids[local.woodpecker_trust[repo]], d.json),
+      ))
+      : d.json
+    )
+  }
 }
 
 resource "aws_iam_role" "gha_deploy_pipeline" {
-  for_each           = local.deploy_repos
-  name               = "${var.name_prefix}-gha-deploy-${each.value.service}"
-  description        = "Builds ${each.key} and pushes ${var.ecr_repository_prefix}/${each.value.service}, then reconciles the app instance of ${var.github_deploy_target_stack}."
-  assume_role_policy = data.aws_iam_policy_document.gha_deploy_pipeline_assume[each.key].json
+  for_each    = local.deploy_repos
+  name        = "${var.name_prefix}-gha-deploy-${each.value.service}"
+  description = "Builds ${each.key} and pushes ${var.ecr_repository_prefix}/${each.value.service}, then reconciles the app instance of ${var.github_deploy_target_stack}."
+  # sensitive(): the Woodpecker statement embeds the ExternalId. Marking the
+  # variable sensitive does NOT survive aws_iam_policy_document (the rendered
+  # .json is not sensitive), so without this wrapper every plan that changes the
+  # trust prints the ExternalId in plaintext. This is why the attribute itself
+  # must stay redacted. The cost (the trust diff is hidden in full, OIDC
+  # statement included) is paid back by output.gha_deploy_trust_review below: a
+  # NON-sensitive twin of the same document with each ExternalId replaced by a
+  # hash, which `plan` shows as a real diff. Review the OIDC part there.
+  assume_role_policy = sensitive(data.aws_iam_policy_document.gha_deploy_pipeline_assume[each.key].json)
 
   # A build-and-deploy run is a build, a push, and a reconcile poll. On the
   # native arm64 runner that fits inside an hour; an emulated fallback build
@@ -386,6 +570,20 @@ data "aws_iam_policy_document" "gha_deploy_pipeline" {
       "ecr:BatchGetImage",
     ]
     resources = [local.deploy_ecr_repo_arns[each.key]]
+  }
+
+  # OPTIONAL (var.woodpecker_ecr_registry_cache, default off): read layers back
+  # for a BuildKit type=registry cache. Needs a lifecycle rule for the cache tag
+  # first (docs/woodpecker.md); the comment above about type=gha stays true while
+  # this is off.
+  dynamic "statement" {
+    for_each = var.woodpecker_ecr_registry_cache ? [1] : []
+
+    content {
+      sid       = "EcrPullOwnRepositoryForRegistryCache"
+      actions   = ["ecr:GetDownloadUrlForLayer"]
+      resources = [local.deploy_ecr_repo_arns[each.key]]
+    }
   }
 
   # Trigger the reconcile. Scoped by TAG rather than by instance ID, so an
