@@ -77,6 +77,35 @@ mkdoc storytime-gha-deploy-waitlist-web "$FAKE_WWEB"
 if ! out2="$(PATH="$TMP/bin:$PATH" "$SCRIPT" "$TMP/tfvars.json" 2>&1)"; then echo "FAIL: all-SAME must exit 0"; echo "$out2"; fail=1; fi
 [ "$(printf '%s\n' "$out2" | grep -c ' SAME$')" = 5 ] || { echo "FAIL: expected five SAME"; fail=1; }
 
+# isolated failure modes: everything else SAME, one thing wrong
+run_script() { set +e; out3="$(PATH="$TMP/bin:$PATH" "$SCRIPT" "$1" 2>&1)"; rc3=$?; set -e; }
+
+# (a) aws fails for one role, the other four SAME: must NOT exit 0
+mv "$LIVE_DIR/storytime-gha-deploy-web.json" "$TMP/web.json.bak"
+run_script "$TMP/tfvars.json"
+[ "$rc3" -ne 0 ] || { echo "FAIL: an aws failure with the rest SAME exited 0"; fail=1; }
+[ "$(printf '%s\n' "$out3" | grep -c ' SAME$')" = 4 ] || { echo "FAIL: expected four SAME"; fail=1; }
+case "$out3" in *"web            MISSING-LIVE"*) ;; *) echo "FAIL: aws failure must print MISSING-LIVE"; fail=1;; esac
+mv "$TMP/web.json.bak" "$LIVE_DIR/storytime-gha-deploy-web.json"
+
+# (b) tfvars lacks one key: that role prints MISSING-TFVARS, exit non-zero
+python3 -I - "$TMP/tfvars.json" "$TMP/tfvars-nokey.json" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1])); del d["woodpecker_external_ids"]["web"]
+json.dump(d, open(sys.argv[2], "w"))
+PY
+run_script "$TMP/tfvars-nokey.json"
+case "$out3" in *"web            MISSING-TFVARS"*) ;; *) echo "FAIL: missing tfvars key must print MISSING-TFVARS"; echo "$out3"; fail=1;; esac
+[ "$rc3" -ne 0 ] || { echo "FAIL: a missing tfvars key exited 0"; fail=1; }
+
+# (c) malformed live JSON: ERROR path, no content echoed, exit non-zero
+printf '{"Statement": [ not json secret-garbage' > "$LIVE_DIR/storytime-gha-deploy-web.json"
+run_script "$TMP/tfvars.json"
+case "$out3" in *"web            ERROR"*) ;; *) echo "FAIL: malformed live JSON must print ERROR"; echo "$out3"; fail=1;; esac
+case "$out3" in *secret-garbage*|*Traceback*) echo "FAIL: ERROR path leaked content"; fail=1;; esac
+[ "$rc3" -ne 0 ] || { echo "FAIL: malformed live JSON exited 0"; fail=1; }
+mkdoc storytime-gha-deploy-web "$FAKE_WEB"
+
 # unreadable tfvars
 if PATH="$TMP/bin:$PATH" "$SCRIPT" "$TMP/nope.json" >/dev/null 2>&1; then echo "FAIL: missing tfvars must fail"; fail=1; fi
 [ "$fail" = 0 ] && echo "check-external-ids: ok" || exit 1

@@ -51,7 +51,7 @@ Bolt-Silverfox/storytime-*  --push/manual-->  ci.fateround.com (Woodpecker serve
 | --- | --- | --- |
 | Who may assume | a token minted for `repo:Bolt-Silverfox/<repo>:ref:refs/heads/main` | any step that runs on the storytime lane **and** knows the service's ExternalId |
 | Pinned code | `job_workflow_ref` = a reviewed, SHA-pinned reusable workflow | nothing: AWS cannot see which pipeline file ran |
-| Branch | enumerated | nothing in AWS; enforced only in Woodpecker (event filters) |
+| Branch | enumerated | nothing in AWS, and not enforced by the secret filters either (they match event and image, not branch); see mitigation 1 and its gap below |
 | Who can use it | repo write + a merge to main + the pinned workflow | anyone who can edit a pipeline file in an activated repo **and** trigger it, i.e. repo write access |
 
 The ExternalId is a guard against a confused deputy and a handle for rotation;
@@ -170,6 +170,18 @@ from it.
 | `woodpecker_external_ids` | `{}` (sensitive) | service => ExternalId; keys `api admin web waitlist-api waitlist-web`; 32 to 128 chars of `[A-Za-z0-9_+=,.@:/-]` |
 | `woodpecker_ecr_registry_cache` | `false` | optional `ecr:GetDownloadUrlForLayer` on the role's own repository (see below) |
 
+**ExternalId strength and the review hash.** `gha_deploy_trust_review` shows
+each ExternalId as the first 16 hex characters (64 bits) of an unsalted
+sha256. The hash is for **review only** (does it change); it is not a secret
+store. Validation checks length and charset, not entropy, and deliberately does
+not do more (it could reject the live values). So: every ExternalId must come
+from `openssl rand -hex 32`, one per service. Never use a word, a name, an ARN,
+a repo name or any value that already appears in the trust policy (e.g. the
+role ARN or an OIDC `sub`): a guessable ExternalId can be confirmed offline
+from a plan's hash, and an ExternalId equal to other text in the trust document
+would be replaced, wherever that text occurs, by its own hash. The harness test
+`review_weak_external_id_documented_behaviour` pins that behaviour.
+
 The role-name regex on `woodpecker_agent_role_arns` is a **typo guard, not a
 security boundary**: the real boundary is IAM (who can create or modify roles in
 account 772641335580 and which role the ExternalId-conditioned statement
@@ -255,8 +267,12 @@ deploy outage window, not a reconcile.
    - **State does not carry the mark** (the hand-apply was done another way):
      the plan shows `~ assume_role_policy = (sensitive value)` as an in-place
      update on exactly the five `aws_iam_role.gha_deploy_pipeline` entries,
-     with "value unchanged"/identical policy. Apply once; it is a sensitivity
-     marker change only. The next plan shows no role changes.
+     and the plan prints a warning that includes the sentence **"The value is
+     unchanged."**. That sentence is what distinguishes the marker-only case:
+     present on all five roles => marker only; apply once, the next plan shows
+     no role changes. A warning **without** that sentence, or a role update
+     shown as a diff with no such warning, is **not** the marker case: stop
+     and investigate.
    - **Any other update on a `gha_deploy_pipeline` role is stop-and-
      investigate**, as is any create/replace/destroy anywhere. Redaction makes
      a real difference in the ExternalId, a Sid, the principal or the OIDC

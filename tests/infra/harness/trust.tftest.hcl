@@ -462,3 +462,22 @@ run "external_id_valid_key_with_extra_unknown_key_rejected" {
   }
   expect_failures = [var.woodpecker_external_ids]
 }
+
+# Documents (does not fix) the review hash's limits: an ExternalId that equals
+# other policy text -- here the Sid -- makes the split/join replace that text
+# everywhere in the review. Real IDs come from `openssl rand -hex 32` (docs).
+# No network: the data sources are overridden at the top of this file.
+run "review_weak_external_id_documented_behaviour" {
+  command = plan
+  variables {
+    woodpecker_agent_role_arns = ["arn:aws:iam::772641335580:role/shared-spot-agent-storytime"]
+    woodpecker_external_ids = merge(
+      { for s in ["admin", "web", "waitlist-api", "waitlist-web"] : s => "${s}${join("", [for i in range(32) : "x"])}" },
+      { api = "arn:aws:iam::772641335580:role/shared-spot-agent-storytime" }
+    )
+  }
+  assert {
+    condition     = !strcontains(jsonencode(output.gha_deploy_trust_review["storytime_be"]), "role/shared-spot-agent-storytime")
+    error_message = "An ExternalId equal to the principal ARN replaces the principal in the review too (documented limit; never use such a value)."
+  }
+}
