@@ -77,27 +77,54 @@ Woodpecker behaviour: confirm each on the server before relying on it.
    **Decision (owner, sole operator): there is no second-person approval gate**
    for Woodpecker pipelines, so the gap is closed with a control that needs no
    second person. **Design rule, to implement when deploy pipelines are written
-   (not implemented now):** the deploy pipeline's first step must fail unless
-   the event is `manual` **and** the commit is reachable from `origin/main`,
-   for example:
+   (not implemented now):** the deploy pipeline starts with a step named
+   `guard` that fails unless the event is `manual` **and** `CI_COMMIT_SHA`
+   equals the head of `origin/main`:
 
-   ```sh
-   [ "$CI_PIPELINE_EVENT" = manual ] &&
-     git fetch origin main &&
-     git merge-base --is-ancestor "$CI_COMMIT_SHA" origin/main
+   ```yaml
+   - name: guard
+     image: alpine/git          # any image with git and sh
+     commands:
+       - '[ "$CI_PIPELINE_EVENT" = manual ] || exit 1'
+       - git fetch origin main || exit 1
+       - '[ "$CI_COMMIT_SHA" = "$(git rev-parse origin/main)" ] || exit 1'
    ```
 
-   A run of an unmerged branch then stops before any later step can use the
-   deploy secrets. Limits: this guard lives in the pipeline file itself, so the
-   branch author can delete it from their own copy; it protects against
-   mistakes and a stale branch, not against a hostile author with write access.
-   Treat repo write access as deploy access (see above), and keep the guard
-   plus the event/image filter in item 2 as the compensating controls. Do not
-   describe pipeline file changes on non-`main` branches as "code reviewed".
-   (Unverified Woodpecker behaviour, confirm on the server: the variable names
-   `CI_PIPELINE_EVENT` and `CI_COMMIT_SHA`, whether the clone has enough
-   history for `merge-base`, and what a manual run of a non-default branch
-   checks out. The step must fail closed if the fetch fails.)
+   Rules for this to mean anything:
+   - **One command per line, each with `|| exit 1`.** Woodpecker runs the
+     commands with `/bin/sh -e`, but `-e` does not trigger on a non-final
+     element of an `&&` list, so a chained `[ ... ] && git fetch && git
+     merge-base` followed by any other command in the same step fails *open*.
+   - **`guard` is its own step, and every later step must `depends_on:
+     [guard]`** (directly or transitively). Steps without `depends_on` may run
+     in parallel with it. Only steps that depend on it are protected.
+   - **Exact-main-head, not "ancestor of main".** All five repos use merge
+     commits only, so every merged head is an ancestor of `main`;
+     `git merge-base --is-ancestor "$CI_COMMIT_SHA" origin/main` therefore passes
+     for an old merged commit (a silent rollback; reproduced, exit 0). It blocks
+     unmerged commits only. Use the exact-head rule for normal (forward)
+     deploys. A **rollback** needs a separate, documented path (a distinct
+     pipeline or an explicit input naming a previously deployed SHA and
+     checking it against the deploy history), not a loosened guard.
+   - `git fetch origin main` may fail on the private `storytime_superadmin`
+     (a plain `commands` step gets no netrc by default). That fails closed; fix
+     it by giving the guard step credentials (for example the clone netrc
+     if the server exposes it to commands, or a read-only token secret limited
+     to that step), never by removing the guard. Woodpecker v3's default clone
+     depth is 0 (full), but confirm.
+
+   Limits: this guard lives in the pipeline file itself, so the branch author
+   can delete it from their own copy; it protects against mistakes (deploying
+   an unmerged branch), not against a hostile author with write access. Write
+   access here means: whoever can push a branch to the repo, i.e. the owner,
+   Dependabot and any other same-repo branch pusher, GitHub Apps installed with
+   `contents: write`, Claude sessions running with the owner's tokens, and
+   anyone holding a leaked PAT. Treat that set as having deploy access (see
+   above); the guard plus the event/image filter in item 2 are the compensating
+   controls. Do not describe pipeline file changes on non-`main` branches as
+   "code reviewed". (Unverified Woodpecker behaviour, confirm on the server:
+   the variable names `CI_PIPELINE_EVENT` and `CI_COMMIT_SHA`, and what a
+   manual run of a non-default branch checks out. The guard must fail closed.)
 2. The ExternalId secret is scoped to **event `manual`** and **image
    `amazon/aws-cli`** in the secret's settings, so a push or PR pipeline, or a
    step using any other image, cannot read it. (Image matching is by name, not
@@ -105,10 +132,18 @@ Woodpecker behaviour: confirm each on the server before relying on it.
    filter used by a plugin step; the phase 3 smoke test must prove a `push`
    pipeline cannot print it.)
 3. Pull-request events never receive deploy secrets (via the event filter in
-   item 2); fork PRs are not enabled for these repos (leave "Allow pull
-   requests" off or restrict it to the repo's own branches; there is no
-   approval gate to rely on); only billmal071 and
-   Bolt-Silverfox repos can be activated. Both are to be confirmed on the
+   item 2); PR pipelines are governed by two repo settings: `allow_pr`
+   (one boolean, includes fork PRs) and `require_approval`
+   (`none`/`forks`/`pull_requests`/`all_events`; the default is believed to be
+   `forks`, **unverified: read the live value**). Four of the five repos are
+   public (be, fe, waitlist-be, waitlist-fe; superadmin is private), so keep
+   `require_approval` at `forks` or stricter, or leave "Allow pull requests"
+   off. `forks` is a one-person control (the operator approves a stranger's
+   fork PR alone) and is not the rejected second-person gate. Same-repo PRs
+   (for example Dependabot) never need approval in `forks` mode, which is
+   fine only because PR events get no deploy secrets (item 2). `manual` and
+   `cron` events bypass approval in every mode. Only billmal071 and
+   Bolt-Silverfox repos can be activated. All of this is to be confirmed on the
    server.
 4. Branch protection on `main` of the app repos and on `storytime-devops` stays.
    It protects `main`; it does **not** review a pipeline file on another
@@ -194,7 +229,7 @@ from it.
 **ExternalId strength and the review hash.** `gha_deploy_trust_review` shows
 each ExternalId as the first 16 hex characters (64 bits) of an unsalted
 sha256. The hash is for **review only** (does it change); it is not a secret
-store. Validation checks length and charset, that the ExternalIds are distinct from each other, and that the key set is exactly the five services; it does not check entropy, and deliberately does
+store. Validation checks length and charset, that the ExternalIds are distinct from each other, and that every key is one of the five services (completeness is not checked by the variable; it is a plan-time precondition, and only when `woodpecker_agent_role_arns` is non-empty); it does not check entropy, and deliberately does
 not do more (it could reject the live values). So: every ExternalId must come
 from `openssl rand -hex 32`, one per service. Never use a word, a name, an ARN,
 a repo name or any value that already appears in the trust policy (e.g. the
@@ -373,7 +408,8 @@ PY
    `storytime_superadmin` (admin), `storytime-waitlist-be` (waitlist-api),
    `storytime-waitlist-fe` (waitlist-web). (Allowed: `WOODPECKER_REPO_OWNERS`
    already lists Bolt-Silverfox.) In each repo's settings leave "Allow pull
-   requests" on only if you want CI on PRs; do not enable fork PRs.
+   requests" on only if you want CI on PRs, and keep "Pipeline approval"
+   (`require_approval`) at `forks` or stricter (live default unverified).
 2. In each repo: Settings > Secrets > Add secret:
 
    | Repo | Secret **name** | Value comes from | Available at events | Images |
@@ -446,7 +482,15 @@ variables:
   - &repo 772316781095.dkr.ecr.eu-west-1.amazonaws.com/storytime/api
 
 steps:
+  - name: guard                 # design rule in mitigation 1 above; every step below depends_on it
+    image: alpine/git
+    commands:
+      - '[ "$CI_PIPELINE_EVENT" = manual ] || exit 1'
+      - git fetch origin main || exit 1
+      - '[ "$CI_COMMIT_SHA" = "$(git rev-parse origin/main)" ] || exit 1'
+
   - name: assume-role-check     # per-step profile: no credentials file in the shared workspace
+    depends_on: [guard]
     image: *aws_cli
     environment:
       AWS_REGION: eu-west-1
@@ -465,10 +509,12 @@ steps:
       # workspace every later step mounts, and it would hold live credentials.
 
   - name: ecr-login-and-resolve  # ECR password, instance lookup by tag (as "Resolve target instance")
+    depends_on: [guard]
     image: *aws_cli
     commands: [ ... ]
 
   - name: build-push             # buildx arm64, native on the arm64 spot agent
+    depends_on: [guard]
     image: woodpeckerci/plugin-docker-buildx:6.1.2   # the one tag the server allows privileged
     settings:
       repo: *repo
@@ -479,10 +525,12 @@ steps:
       # registry auth: Open item 1
 
   - name: deploy                 # ssm send-command reconcile, poll, health gate, rollback
+    depends_on: [guard]
     image: *aws_cli
     commands: [ ... ]            # Open item 2
 
   - name: promote-and-smoke
+    depends_on: [guard]
     image: *aws_cli
     commands: [ ... ]
 ```
