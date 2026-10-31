@@ -98,9 +98,11 @@ Woodpecker behaviour: confirm each on the server before relying on it.
    - **`guard` is its own step, and every later step must `depends_on:
      [guard]`** (directly or transitively). Steps without `depends_on` may run
      in parallel with it. Only steps that depend on it are protected.
-   - **`guard` must not set `failure: ignore`, and no dependent step may use
-     `when: status: [failure]`** (or `status: [success, failure]`): a step
-     that runs on failure would run after a failed guard.
+   - **`guard` must not set `failure: ignore`, and no step in a deploy pipeline
+     may use a failure-status `when`** (`status: [failure]` or `status:
+     [success, failure]`). The skip-after-failure check is workflow-wide: a
+     step with such a `when` runs after `guard` fails even if it does not
+     depend on `guard`.
    - **Exact-main-head, not "ancestor of main".** All five repos use merge
      commits only, so every merged head is an ancestor of `main`;
      `git merge-base --is-ancestor "$CI_COMMIT_SHA" origin/main` therefore passes
@@ -113,8 +115,8 @@ Woodpecker behaviour: confirm each on the server before relying on it.
      (a plain `commands` step gets no netrc by default). That fails closed; fix
      it by giving the guard step credentials (for example the clone netrc
      if the server exposes it to commands, or a read-only token secret limited
-     to that step), never by removing the guard. Woodpecker v3's default clone
-     depth is 0 (full) is **unverified**; confirm. The guard compares against
+     to that step), never by removing the guard. That default clone
+     depth (reported as 0/full in v3) is unverified; confirm on the server. The guard compares against
      the fully qualified `refs/remotes/origin/main`, because a tag or local branch
      named `origin/main` would win over the short name `origin/main`; if the
      clone has no remote-tracking refspec, use `git fetch origin main` then
