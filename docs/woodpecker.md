@@ -87,7 +87,7 @@ Woodpecker behaviour: confirm each on the server before relying on it.
      commands:
        - '[ "$CI_PIPELINE_EVENT" = manual ] || exit 1'
        - git fetch origin main || exit 1
-       - '[ "$CI_COMMIT_SHA" = "$(git rev-parse origin/main)" ] || exit 1'
+       - '[ "$CI_COMMIT_SHA" = "$(git rev-parse refs/remotes/origin/main)" ] || exit 1'
    ```
 
    Rules for this to mean anything:
@@ -98,6 +98,9 @@ Woodpecker behaviour: confirm each on the server before relying on it.
    - **`guard` is its own step, and every later step must `depends_on:
      [guard]`** (directly or transitively). Steps without `depends_on` may run
      in parallel with it. Only steps that depend on it are protected.
+   - **`guard` must not set `failure: ignore`, and no dependent step may use
+     `when: status: [failure]`** (or `status: [success, failure]`): a step
+     that runs on failure would run after a failed guard.
    - **Exact-main-head, not "ancestor of main".** All five repos use merge
      commits only, so every merged head is an ancestor of `main`;
      `git merge-base --is-ancestor "$CI_COMMIT_SHA" origin/main` therefore passes
@@ -111,7 +114,11 @@ Woodpecker behaviour: confirm each on the server before relying on it.
      it by giving the guard step credentials (for example the clone netrc
      if the server exposes it to commands, or a read-only token secret limited
      to that step), never by removing the guard. Woodpecker v3's default clone
-     depth is 0 (full), but confirm.
+     depth is 0 (full) is **unverified**; confirm. The guard compares against
+     the fully qualified `refs/remotes/origin/main`, because a tag or local branch
+     named `origin/main` would win over the short name `origin/main`; if the
+     clone has no remote-tracking refspec, use `git fetch origin main` then
+     `git rev-parse FETCH_HEAD` instead.
 
    Limits: this guard lives in the pipeline file itself, so the branch author
    can delete it from their own copy; it protects against mistakes (deploying
@@ -482,12 +489,12 @@ variables:
   - &repo 772316781095.dkr.ecr.eu-west-1.amazonaws.com/storytime/api
 
 steps:
-  - name: guard                 # design rule in mitigation 1 above; every step below depends_on it
+  - name: guard                 # design rule in mitigation 1 above; steps are chained, each depends_on the previous, so none runs in parallel
     image: alpine/git
     commands:
       - '[ "$CI_PIPELINE_EVENT" = manual ] || exit 1'
       - git fetch origin main || exit 1
-      - '[ "$CI_COMMIT_SHA" = "$(git rev-parse origin/main)" ] || exit 1'
+      - '[ "$CI_COMMIT_SHA" = "$(git rev-parse refs/remotes/origin/main)" ] || exit 1'
 
   - name: assume-role-check     # per-step profile: no credentials file in the shared workspace
     depends_on: [guard]
@@ -509,12 +516,12 @@ steps:
       # workspace every later step mounts, and it would hold live credentials.
 
   - name: ecr-login-and-resolve  # ECR password, instance lookup by tag (as "Resolve target instance")
-    depends_on: [guard]
+    depends_on: [assume-role-check]
     image: *aws_cli
     commands: [ ... ]
 
   - name: build-push             # buildx arm64, native on the arm64 spot agent
-    depends_on: [guard]
+    depends_on: [ecr-login-and-resolve]
     image: woodpeckerci/plugin-docker-buildx:6.1.2   # the one tag the server allows privileged
     settings:
       repo: *repo
@@ -525,12 +532,12 @@ steps:
       # registry auth: Open item 1
 
   - name: deploy                 # ssm send-command reconcile, poll, health gate, rollback
-    depends_on: [guard]
+    depends_on: [build-push]
     image: *aws_cli
     commands: [ ... ]            # Open item 2
 
   - name: promote-and-smoke
-    depends_on: [guard]
+    depends_on: [deploy]
     image: *aws_cli
     commands: [ ... ]
 ```
