@@ -21,6 +21,9 @@ cp "$HERE"/harness/* "$TMP"/
 # (git ls-files '*.tf') does not treat this partial harness as a root module.
 mv "$TMP/stubs.tf.txt" "$TMP/stubs.tf"
 cp "$ROOT/infra/github-oidc-deploy.tf" "$TMP"/
+# Test against the aws provider version the real stack is locked to, not the
+# newest 5.x: reuse infra/.terraform.lock.hcl (a single source of truth).
+cp "$ROOT/infra/.terraform.lock.hcl" "$TMP"/
 cd "$TMP"
 terraform init -backend=false -input=false -no-color ${PLUGIN_DIR:+-plugin-dir="$PLUGIN_DIR"} >/dev/null
 terraform test -no-color

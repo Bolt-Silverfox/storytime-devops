@@ -480,6 +480,29 @@ data "aws_iam_policy_document" "gha_deploy_pipeline_assume" {
   }
 }
 
+# Reviewable twin of the (redacted) assume_role_policy of every deploy role.
+#
+# Same rendered JSON as the roles carry, decoded so a plan diffs it per field
+# (principals, Sids, actions, OIDC aud / sub / job_workflow_ref), except that
+# each ExternalId is replaced by "sha256:<first 16 hex of sha256(id)>". A
+# rotation therefore still shows as a changed marker, and no ExternalId reaches
+# the plan, state or `tofu output`. split/join instead of replace(): replace()
+# treats a value that starts and ends with "/" as a regex, and "/" is allowed in
+# an ExternalId. It does not touch the roles' policy, so it changes no IAM.
+output "gha_deploy_trust_review" {
+  description = "repo name => the deploy role's trust document with ExternalIds replaced by a truncated sha256. Non-sensitive on purpose: this is what a plan shows for the trust, because the role's own assume_role_policy is redacted."
+  value = {
+    for repo, d in data.aws_iam_policy_document.gha_deploy_pipeline_assume : repo => jsondecode(
+      contains(keys(local.woodpecker_trust), repo)
+      ? nonsensitive(join(
+        "sha256:${substr(sha256(var.woodpecker_external_ids[local.woodpecker_trust[repo]]), 0, 16)}",
+        split(var.woodpecker_external_ids[local.woodpecker_trust[repo]], d.json),
+      ))
+      : d.json
+    )
+  }
+}
+
 resource "aws_iam_role" "gha_deploy_pipeline" {
   for_each    = local.deploy_repos
   name        = "${var.name_prefix}-gha-deploy-${each.value.service}"
@@ -487,8 +510,11 @@ resource "aws_iam_role" "gha_deploy_pipeline" {
   # sensitive(): the Woodpecker statement embeds the ExternalId. Marking the
   # variable sensitive does NOT survive aws_iam_policy_document (the rendered
   # .json is not sensitive), so without this wrapper every plan that changes the
-  # trust prints the ExternalId in plaintext. A side effect: the trust diff is
-  # redacted in full, OIDC statement included; tests/infra pins that statement.
+  # trust prints the ExternalId in plaintext. This is why the attribute itself
+  # must stay redacted. The cost (the trust diff is hidden in full, OIDC
+  # statement included) is paid back by output.gha_deploy_trust_review below: a
+  # NON-sensitive twin of the same document with each ExternalId replaced by a
+  # hash, which `plan` shows as a real diff. Review the OIDC part there.
   assume_role_policy = sensitive(data.aws_iam_policy_document.gha_deploy_pipeline_assume[each.key].json)
 
   # A build-and-deploy run is a build, a push, and a reconcile poll. On the
