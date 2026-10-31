@@ -1,10 +1,15 @@
 # Deploying from the shared Woodpecker server
 
-Status: **draft, nothing here is enabled.** Phase 1 (this PR) only makes the
-deploy roles *able* to trust Woodpecker, and adds nothing until two variables
-are set. Phases 2 and 3 are the owner's runbook and the pipeline port below.
-GitHub Actions (`build-and-deploy.yml`) stays the only deploy path until the
-cutover checklist is done.
+Status: **the trust is LIVE; the Woodpecker pipelines are not.** The
+`WoodpeckerStorytimeLane` trust statement (and `MaxSessionDuration` 7200) was
+already applied by hand to all five `storytime-gha-deploy-*` roles in account
+772316781095. This code is what brings the repository in sync with that live
+state; with the two variables unset it renders nothing. **Read "Reconcile with
+the already-applied state" before running any `tofu` command**: the Phase 1
+runbook further down describes a first-time setup and would overwrite the live
+ExternalIds. Phases 2 and 3 (repo activation, secrets, pipeline port) are not
+done. GitHub Actions (`build-and-deploy.yml`) is still the only deploy path
+until the cutover checklist is done.
 
 ## Architecture
 
@@ -54,28 +59,57 @@ it is not a strong secret: it is visible in the role's trust policy to anyone
 with `iam:GetRole` in 772316781095 and stored in Terraform state. The second
 secret (Woodpecker's copy) is what a pipeline must be able to read.
 
-So **repo write access equals deploy access** for an activated repo. Mitigations,
-all on the Woodpecker side and all required before cutover:
+So **repo write access equals deploy access** for an activated repo. The
+Woodpecker-side controls below are the intended ones. **None of them is in place
+yet** (no repo is activated, no secret exists), and several are unverified
+Woodpecker behaviour: confirm each on the server before relying on it.
 
 1. Deploy pipelines run on the `manual` event only (`when: event: manual`), and
    nothing else triggers them: no push, tag, cron or pull-request deploys.
+   **Gap:** this constrains what a *legitimate* pipeline file does, not what an
+   author of a pipeline file can do. For a manual pipeline the pipeline config
+   comes from the branch chosen at trigger time, and the secret filter works on
+   event and image, not on branch. So anyone with write access who can push a
+   branch containing their own `.woodpecker/*.yaml` can trigger it manually
+   with `image: amazon/aws-cli` and read the ExternalId. (Unverified: confirm
+   on the server whether a manual run of a non-default branch is possible for
+   them.)
+   **OWNER DECISION, not yet taken:** set the approval mode to `all_events`
+   (every pipeline waits for a maintainer's approval), or put an equivalent
+   second-person gate in front of manual runs, for these five repos. Until it
+   is decided, do not describe pipeline file changes as "code reviewed".
 2. The ExternalId secret is scoped to **event `manual`** and **image
    `amazon/aws-cli`** in the secret's settings, so a push or PR pipeline, or a
    step using any other image, cannot read it. (Image matching is by name, not
    tag, and I have not verified how Woodpecker treats a secret with an image
    filter used by a plugin step; the phase 3 smoke test must prove a `push`
    pipeline cannot print it.)
-3. Pull-request events never receive deploy secrets; fork PRs wait for approval
-   (server setting `WOODPECKER_DEFAULT_APPROVAL_MODE=forks`); only
-   billmal071 and Bolt-Silverfox repos can be activated.
-4. Branch protection on `main` of the app repos and on `storytime-devops` stays;
-   a pipeline file change is a code review.
+3. Pull-request events never receive deploy secrets (via the event filter in
+   item 2); fork PRs wait for approval (server setting
+   `WOODPECKER_DEFAULT_APPROVAL_MODE=forks`); only billmal071 and
+   Bolt-Silverfox repos can be activated. Both are to be confirmed on the
+   server.
+4. Branch protection on `main` of the app repos and on `storytime-devops` stays.
+   It protects `main`; it does **not** review a pipeline file on another
+   branch that is run manually (see the gap in item 1).
 5. Rotate the ExternalIds (below) after any change of who has write access, and
    on a schedule.
 6. A step on the lane can also read the Woodpecker agent secret from SSM (the
    instance role needs it at boot) and shares the instance role with every other
    step. Treat every step on this lane as trusted-as-deploy. Do not run
    third-party code or untrusted PRs on it.
+7. **The agent is global on a shared server.** The lane's agent is a *global*
+   agent of the shared Woodpecker server (infra-shared
+   `modules/spot-lane/main.tf:55`, label filter `!lane=heavy-storytime`), not
+   an agent scoped to this organization. Any repo activated on that server, in
+   any organization, whose pipeline sets `labels: lane: heavy-storytime` could
+   be scheduled onto these instances and reach the instance role's
+   credentials; the ExternalId, and nothing else, then stands between that
+   step and these five roles. (Unverified: confirm on the server how label
+   matching and repo/organization restrictions behave.) **Recommended:** an
+   organization-scoped agent for Bolt-Silverfox, so that only Bolt-Silverfox
+   repos can be scheduled there. **OWNER DECISION, not yet taken**, and it
+   changes infra-shared, not this repository.
 
 If you need GitHub's "only this pinned workflow on this branch" guarantee
 back for production, keep the GitHub OIDC path as the production deployer and
@@ -83,31 +117,64 @@ use Woodpecker for CI only. That is a legitimate end state.
 
 ## What this PR adds (Terraform, `infra/github-oidc-deploy.tf`)
 
-All additive; with the defaults below nothing in any plan changes
+Additive; with the defaults below no role's trust document changes
 (`tests/infra/run-tests.sh` proves it: trust policies keep exactly the one OIDC
-statement).
+statement). The one visible addition to a plan is the new output
+`gha_deploy_trust_review` (below). The rendered policy JSON of the roles is
+byte-identical to what the hand-applied roles carry.
 
-**Plans redact the trust policy.** The ExternalId is written into the role's
-trust policy, and marking the variable `sensitive` does not survive
-`aws_iam_policy_document` (its rendered `.json` is plain), so a plain diff of
-`assume_role_policy` would print it. The role therefore sets
-`assume_role_policy = sensitive(...)`: `tofu plan` shows the attribute as
-`(sensitive value)` and reveals neither the ExternalId nor the rest of the trust
-document. The cost is that you can no longer eyeball "the OIDC statement did not
-change" in the plan diff; that check now comes from `tests/infra/run-tests.sh`,
-which pins the whole Federated statement (principal, `aud`, `sub`,
-`job_workflow_ref`) against a literal expectation, asserts the policy is marked
-sensitive, and runs in CI (`lint` workflow). With the defaults the rendered IAM
-policy is unchanged. Wrapping the attribute in `sensitive()` may still make the
-first plan after this lands show the five roles as an in-place update; that is
-metadata only (the policy text is identical) and cannot be verified by reading
-the redacted diff, so rely on the test and on the resource list.
+**Plans redact the trust policy, and `gha_deploy_trust_review` is how you
+review it.** The ExternalId is written into the role's trust policy, and marking
+the variable `sensitive` does not survive `aws_iam_policy_document` (its rendered
+`.json` is plain), so a plain diff of `assume_role_policy` would print it. The
+role therefore sets `assume_role_policy = sensitive(...)`: `tofu plan` shows the
+attribute as `(sensitive value)`. That also hides any change to the OIDC
+statement, so the stack has a **non-sensitive output**,
+`gha_deploy_trust_review` (repo => trust document, decoded), identical to the
+rendered policy except that every ExternalId is replaced by
+`sha256:<first 16 hex of sha256(id)>`. A plan shows a field-level diff of
+principals, Sids, actions and the OIDC `aud` / `sub` / `job_workflow_ref` there,
+and a rotation shows up as a changed `sha256:` marker. No ExternalId reaches
+the plan, the saved plan's outputs or `tofu output`.
+
+How to review a trust change in a plan:
+
+1. Read the `Changes to Outputs:` block: every changed line of
+   `gha_deploy_trust_review` is a real change to the trust document. For an
+   OIDC change check the new `sub` (repo and branch) and each
+   `job_workflow_ref` (`...build-and-deploy.yml@<40-hex>`, an SHA you have
+   reviewed, no branch ref).
+2. The five `aws_iam_role.gha_deploy_pipeline` entries may show
+   `~ assume_role_policy = (sensitive value)`; that is the redacted twin of the
+   same change and tells you nothing by itself. **If a role updates in place
+   and `gha_deploy_trust_review` did not change, treat it as stop-and-
+   investigate** (except the one-time marker case in "Reconcile" below, which
+   is the very first plan after this lands).
+3. `tests/infra/run-tests.sh` pins the default OIDC statement literally and
+   proves the review output moves when the branch, the workflow SHA list or the
+   repo set changes, and never contains an ExternalId.
+
+(`tofu state show` / `tofu show` on the data source
+`data.aws_iam_policy_document.gha_deploy_pipeline_assume[...]` *does* print the
+ExternalId, because its `.json` is not sensitive. Do not run them where the
+output is logged.)
+
+What the review output cannot see: a change to the ExternalId that keeps the
+same hash prefix (not a realistic collision), or anything outside the trust
+document. It covers the same JSON the role is created with, so it cannot drift
+from it.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `woodpecker_agent_role_arns` | `[]` | the lane's instance role ARN; only `role/shared-spot-agent-storytime` (optionally with a name suffix while rotating, role name at most 64 characters) in account 772641335580 (max 2: current + one being rotated in) |
 | `woodpecker_external_ids` | `{}` (sensitive) | service => ExternalId; keys `api admin web waitlist-api waitlist-web`; 32 to 128 chars of `[A-Za-z0-9_+=,.@:/-]` |
 | `woodpecker_ecr_registry_cache` | `false` | optional `ecr:GetDownloadUrlForLayer` on the role's own repository (see below) |
+
+The role-name regex on `woodpecker_agent_role_arns` is a **typo guard, not a
+security boundary**: the real boundary is IAM (who can create or modify roles in
+account 772641335580 and which role the ExternalId-conditioned statement
+names). The regex stops an accidental `:root`, other account or wildcard from
+being applied; it does not prove the named role is the lane's role.
 
 When `woodpecker_agent_role_arns` is non-empty each of the five roles gets a
 second trust statement `sts:AssumeRole` from those principals, only when
@@ -139,12 +206,78 @@ Before turning `woodpecker_ecr_registry_cache` on:
 
 ## Owner runbook
 
-Prerequisites: the infra-shared storytime lane is applied and
+### Reconcile with the already-applied state (do this FIRST)
+
+The Woodpecker trust is already live (applied by hand in 772316781095). The
+repository now carries the same code, so the goal of the first `tofu plan` is
+to prove that state and code agree, **not** to change anything.
+
+**Do NOT run "Phase 1" below as written.** Step 1 there generates *new*
+ExternalIds (`openssl rand -hex 32`); applying a plan built from them would
+overwrite the live ExternalIds on all five roles and silently break any
+Woodpecker secret already set from the old values. Never regenerate. Reuse the
+existing ones: the owner keeps them in
+`~/.config/storytime/woodpecker.tfvars.json` (keys `woodpecker_agent_role_arns`
+and `woodpecker_external_ids`; do not print or paste it). If that file is
+missing, stop and ask the owner; recreating the values is a rotation, with a
+deploy outage window, not a reconcile.
+
+1. **Check the tfvars match what is live**, printing only a verdict per role:
+
+   ```sh
+   AWS_PROFILE=<read-only profile for 772316781095> AWS_REGION=eu-west-1 \
+     scripts/check-woodpecker-external-ids.sh
+   ```
+
+   It calls only `aws iam get-role`, hashes the live ExternalId and the tfvars
+   value, and prints `SAME`, `DIFFERENT`, `MISSING-LIVE` or `MISSING-TFVARS` per
+   service; never a value or a hash. Exit 0 only when all five are `SAME`.
+   (`tests/infra/check-external-ids-test.sh` covers it with fake data.) Anything
+   but five `SAME`: stop. Do not plan or apply; find out which copy is right.
+2. **Plan against the shared workspace with those tfvars** (OpenTofu, as
+   everywhere below; the saved-plan warning in Phase 1 step 2 applies):
+
+   ```sh
+   cd infra && tofu workspace select shared
+   tofu plan -var-file=terraform.shared.tfvars -var-file=$HOME/.config/storytime/woodpecker.tfvars.json -out=wp.tfplan
+   ```
+
+3. **What the plan should show.** Redaction hides the policy text, so the
+   expectations are about the resource list:
+   - `Changes to Outputs: + gha_deploy_trust_review = {...}` appears once (new
+     output). Review it: five repos, each with the OIDC statement you expect
+     and the `WoodpeckerStorytimeLane` statement from
+     `role/shared-spot-agent-storytime` with `sha256:` markers. It is not an
+     IAM change.
+   - **State already carries the sensitive mark** on `assume_role_policy`
+     (the hand-apply ran this code or equivalent): the roles show **no
+     changes**.
+   - **State does not carry the mark** (the hand-apply was done another way):
+     the plan shows `~ assume_role_policy = (sensitive value)` as an in-place
+     update on exactly the five `aws_iam_role.gha_deploy_pipeline` entries,
+     with "value unchanged"/identical policy. Apply once; it is a sensitivity
+     marker change only. The next plan shows no role changes.
+   - **Any other update on a `gha_deploy_pipeline` role is stop-and-
+     investigate**, as is any create/replace/destroy anywhere. Redaction makes
+     a real difference in the ExternalId, a Sid, the principal or the OIDC
+     statement look exactly like the harmless marker change above, so the
+     redacted diff can never be taken as proof of "metadata only". Use step 1
+     (ExternalIds) and the `gha_deploy_trust_review` diff (everything else) to
+     tell them apart.
+4. **Stop; do not apply unless the plan is clean or expected** (no role changes,
+   or exactly the five marker updates above, plus the new output). Delete
+   `wp.tfplan` afterwards; it is a secret.
+
+Prerequisites (for a *fresh* setup only): the infra-shared storytime lane is applied and
 `infra/tofu staging output spot_storytime_role_arn` (run from the infra-shared repository checkout's `infra/` wrapper directory, where the `tofu` helper script lives) printed
 `arn:aws:iam::772641335580:role/shared-spot-agent-storytime` (call it
-`$LANE_ROLE`). Phases 1 and 2 change nothing about how storytime deploys today.
+`$LANE_ROLE`). Reconcile and Phase 2 change nothing about how storytime deploys today.
 
-### Phase 1: trust (this PR merged first)
+### Phase 1: trust (first-time setup only; NOT for the current live state)
+
+Skip this section: the trust is already applied. It is kept for rebuilding the
+trust from scratch (new account or after a deliberate rotation of all five).
+Its step 1 creates new ExternalIds.
 
 1. Generate one ExternalId per service and a tfvars file, never printing them
    (run in a shell, outside the repo checkout):
@@ -187,10 +320,10 @@ PY
    format/version and lock the other out. (CI uses Terraform only for
    `fmt`/`validate`/`tflint`, with `-backend=false`, so it never touches state.)
 
-   Expected: 5 `aws_iam_role.gha_deploy_pipeline` **updated in place** (trust
-   policy only), nothing else. The `assume_role_policy` change is shown as
-   `(sensitive value)` (see "Plans redact the trust policy"); check the
-   resource list, not the diff text. Anything else: stop. Apply it.
+   Expected on a fresh setup: 5 `aws_iam_role.gha_deploy_pipeline` **updated in
+   place** (trust policy), nothing else, with the new trust visible in
+   `gha_deploy_trust_review` (the role's own `assume_role_policy` shows
+   `(sensitive value)`). Anything else: stop. Apply it.
 3. Verify, from a step later (phase 2 check) or by hand with the lane role.
 
 ### Phase 2: activate repos and secrets in Woodpecker (still no deploys)
@@ -222,7 +355,11 @@ PY
    secret and lives in the pipeline file.
 3. Rotation: generate a new value for one service, `tofu apply` with it,
    update that repo's secret. Between the two the deploy fails closed. (There is
-   no overlap window per service; schedule it outside a deploy.)
+   no overlap window per service; schedule it outside a deploy. **Follow-up:**
+   `woodpecker_external_ids` is a `map(string)`, so a rotation cannot accept the
+   old and new value at once. Moving to `map(list(string))` would give an
+   overlap window but is an interface change against the live state, so it is
+   deliberately not part of this PR.)
 4. Prove it before any real deploy: a manual pipeline on `storytime-waitlist-fe`
    with the single `assume-role-check` step in the sketch below (profile
    assume, then `sts get-caller-identity`), expect `storytime-gha-deploy-waitlist-web`. Then

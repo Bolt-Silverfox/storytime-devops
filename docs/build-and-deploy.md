@@ -389,6 +389,17 @@ mismatch fails assume-role. With the list, the sequence has no broken state:
    stale SHAs in the list: each one is privileged code that can still assume the
    role.
 
+**Verifying the OIDC part in the plan.** The roles' `assume_role_policy` is
+redacted in plans (`(sensitive value)`, because the trust can carry a Woodpecker
+ExternalId; see `docs/woodpecker.md`), so the role diff cannot be read. Read the
+`Changes to Outputs:` block instead: `gha_deploy_trust_review` is a
+non-sensitive twin of each role's trust document. For step 2 you must see, per
+role, exactly one added `token.actions.githubusercontent.com:job_workflow_ref`
+value `...build-and-deploy.yml@<N>` and nothing else changed; for step 4 exactly
+the old SHA removed. Check that `<N>` is the SHA you reviewed (40 hex, no
+branch ref), and that `sub` and `aud` are unchanged. A role update with no
+matching change in `gha_deploy_trust_review` is stop-and-investigate.
+
 ### Rollout to automatic deploys
 
 1. Merge this PR (changes nothing for callers: they pin the old SHA).

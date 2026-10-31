@@ -27,3 +27,5 @@ cp "$ROOT/infra/.terraform.lock.hcl" "$TMP"/
 cd "$TMP"
 terraform init -backend=false -input=false -no-color ${PLUGIN_DIR:+-plugin-dir="$PLUGIN_DIR"} >/dev/null
 terraform test -no-color
+# offline check of scripts/check-woodpecker-external-ids.sh (fake aws, fake ids)
+"$HERE/check-external-ids-test.sh"
