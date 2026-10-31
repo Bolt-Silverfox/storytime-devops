@@ -174,10 +174,10 @@ Woodpecker behaviour: confirm each on the server before relying on it.
    step and these five roles. (Unverified: confirm on the server how label
    matching and repo/organization restrictions behave.) **Prerequisite for
    deploy, not for CI:** CI-only runs do not need this, because CI uses its own
-   CI-only lane with no AWS access (infra-shared PR #10; not re-verified here).
+   CI-only lane with no AWS access (proposed in https://github.com/billmal071/infra-shared/pull/10, unmerged and not yet applied; verify after the owner applies it).
    But before any deploy pipeline is enabled on this deploy lane, its agents
-   must be restricted so only the deploy repos (Bolt-Silverfox, the five
-   activated repos) can be scheduled there, for example an organization-scoped
+   must be restricted so only the repos that have deploy pipelines can be
+   scheduled there, for example an organization-scoped
    agent. The owner dropped the second-person gate, not this isolation. It
    changes infra-shared, not this repository.
 
