@@ -57,6 +57,15 @@ ${join(", ", [for h in r.hostnames : "https://${h}"])} {
 		max_size ${r.max_body_size}
 	}
 
+%{ if r.service == "api" ~}
+	# TEMPORARY: remove after storytime_be #717 is deployed and
+	# BULL_BOARD_USER/BULL_BOARD_PASSWORD are set.
+	@bullboard path_regexp bullboard (?i)^/+api/+v1/+admin/+queues
+	handle @bullboard {
+		respond 404
+	}
+
+%{ endif ~}
 %{ if !r.sse ~}
 	encode zstd gzip
 %{ else ~}
